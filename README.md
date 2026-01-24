@@ -45,6 +45,10 @@ If `home-agent` isn’t on your PATH (common in containers), use:
 python3 -m home_agent.cli --help
 ```
 
+## Deploy
+
+- Docker stack: see `docs/DOCKER_DEPLOY.md`
+
 ## Run the stack (service-based)
 
 Always-on infrastructure:

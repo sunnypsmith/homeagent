@@ -1,0 +1,125 @@
+services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: home-mqtt
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+  db:
+    image: timescale/timescaledb:2.16.1-pg16
+    container_name: home-db
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      POSTGRES_DB: homeagent
+      POSTGRES_USER: homeagent
+      POSTGRES_PASSWORD: change_me
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+
+  # One container per process (recommended).
+  sonos-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-sonos-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "sonos-gateway"]
+    depends_on: [mqtt, db]
+
+  time-trigger:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-time-trigger
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "time-trigger"]
+    depends_on: [mqtt, db]
+
+  event-recorder:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-event-recorder
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "event-recorder"]
+    depends_on: [mqtt, db]
+
+  wakeup-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-wakeup-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "wakeup-agent"]
+    depends_on: [mqtt, db]
+
+  morning-briefing-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-morning-briefing-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "morning-briefing-agent"]
+    depends_on: [mqtt, db]
+
+  hourly-chime-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-hourly-chime-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "hourly-chime-agent"]
+    depends_on: [mqtt, db]
+
+  fixed-announcement-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-fixed-announcement-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "fixed-announcement-agent"]
+    depends_on: [mqtt, db]
+
+  camect-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-camect-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "camect-agent"]
+    depends_on: [mqtt, db]
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:
+  timescaledb_data:
+
