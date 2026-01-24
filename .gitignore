@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Packaging/build artifacts
+*.egg-info/
+dist/
+build/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

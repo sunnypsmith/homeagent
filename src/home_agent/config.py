@@ -1,0 +1,361 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Optional
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _strip_quotes(s: str) -> str:
+    s = (s or "").strip()
+    if len(s) >= 2 and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+        s = s[1:-1].strip()
+    return s
+
+
+def _env_files() -> tuple[str, str]:
+    """
+    Allow running CLI commands from subdirectories (e.g. /workspace/scripts).
+    We first check for a local .env, then fall back to the repo-root .env.
+    """
+    repo_root_env = str(Path(__file__).resolve().parents[2] / ".env")
+    return (".env", repo_root_env)
+
+
+class SonosSettings(BaseSettings):
+    # Needs env_file here too because this class is instantiated separately from AppSettings.
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Comma-delimited list of speaker IPs for announcements (v1: treat each target individually).
+    # Keep this as a string because pydantic-settings tries to JSON-decode List[str] from .env.
+    announce_targets: str = Field(default="", alias="SONOS_ANNOUNCE_TARGETS")
+    default_volume: int = Field(default=50, alias="SONOS_DEFAULT_VOLUME")
+    announce_concurrency: int = Field(default=3, alias="SONOS_ANNOUNCE_CONCURRENCY")
+
+    @field_validator("announce_targets", mode="before")
+    @classmethod
+    def _normalize_announce_targets(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return _strip_quotes(str(v))
+
+    @property
+    def announce_target_ips(self) -> List[str]:
+        s = (self.announce_targets or "").strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in s.split(",")]
+        return [p for p in parts if p]
+
+class ElevenLabsSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    api_key: Optional[str] = Field(default=None, alias="ELEVENLABS_API_KEY")
+    voice_id: str = Field(default="Wq15xSaY3gWvazBRaGEU", alias="ELEVENLABS_VOICE_ID")
+    base_url: str = Field(default="https://api.elevenlabs.io/v1", alias="ELEVENLABS_BASE_URL")
+    timeout_seconds: float = Field(default=30, alias="ELEVENLABS_TIMEOUT_SECONDS")
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def _normalize_api_key(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = _strip_quotes(str(v))
+        if not s:
+            return None
+        return s or None
+
+    @field_validator("voice_id", mode="before")
+    @classmethod
+    def _normalize_voice_id(cls, v: object) -> str:
+        return _strip_quotes(str(v))
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def _normalize_base_url(cls, v: object) -> str:
+        return _strip_quotes(str(v)).rstrip("/")
+
+
+class MqttSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    host: str = Field(default="127.0.0.1", alias="MQTT_HOST")
+    port: int = Field(default=1883, alias="MQTT_PORT")
+    username: Optional[str] = Field(default=None, alias="MQTT_USERNAME")
+    password: Optional[str] = Field(default=None, alias="MQTT_PASSWORD")
+    base_topic: str = Field(default="homeagent", alias="MQTT_BASE_TOPIC")
+
+    @field_validator("host", "base_topic", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v))
+
+    @field_validator("username", "password", mode="before")
+    @classmethod
+    def _norm_opt(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = _strip_quotes(str(v))
+        return s or None
+
+
+class DbSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    host: str = Field(default="127.0.0.1", alias="DB_HOST")
+    port: int = Field(default=5432, alias="DB_PORT")
+    name: str = Field(default="homeagent", alias="DB_NAME")
+    user: str = Field(default="homeagent", alias="DB_USER")
+    password: str = Field(default="change_me", alias="DB_PASSWORD")
+    sslmode: str = Field(default="disable", alias="DB_SSLMODE")
+
+    @field_validator("host", "name", "user", "password", "sslmode", mode="before")
+    @classmethod
+    def _norm(cls, v: object) -> str:
+        return _strip_quotes(str(v))
+
+    @property
+    def conninfo(self) -> str:
+        # psycopg3 connection string
+        return (
+            "host=%s port=%d dbname=%s user=%s password=%s sslmode=%s"
+            % (self.host, self.port, self.name, self.user, self.password, self.sslmode)
+        )
+
+
+class WeatherSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    provider: str = Field(default="open_meteo", alias="WEATHER_PROVIDER")
+    latitude: Optional[float] = Field(default=None, alias="WEATHER_LAT")
+    longitude: Optional[float] = Field(default=None, alias="WEATHER_LON")
+    units: str = Field(default="imperial", alias="WEATHER_UNITS")  # imperial|metric
+    timeout_seconds: float = Field(default=10, alias="WEATHER_TIMEOUT_SECONDS")
+
+    @field_validator("provider", "units", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip().lower()
+
+class LLMSettings(BaseSettings):
+    # Needs env_file here too because this class is instantiated separately from AppSettings.
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    base_url: str = Field(default="https://api.openai.com/v1", alias="LLM_BASE_URL")
+    api_key: Optional[str] = Field(default=None, alias="LLM_API_KEY")
+    model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    timeout_seconds: float = Field(default=30, alias="LLM_TIMEOUT_SECONDS")
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def _normalize_base_url(cls, v: object) -> str:
+        # pydantic-settings may preserve quotes depending on dotenv parsing; normalize here.
+        return _strip_quotes(str(v))
+
+
+class LLMFallbackSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    base_url: str = Field(default="", alias="LLM_FALLBACK_BASE_URL")
+    api_key: Optional[str] = Field(default=None, alias="LLM_FALLBACK_API_KEY")
+    model: str = Field(default="", alias="LLM_FALLBACK_MODEL")
+    timeout_seconds: float = Field(default=30, alias="LLM_FALLBACK_TIMEOUT_SECONDS")
+
+    @field_validator("base_url", "model", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def _norm_opt(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = _strip_quotes(str(v)).strip()
+        return s or None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url and self.api_key and self.model)
+
+
+class QuietHoursSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=True, alias="QUIET_HOURS_ENABLED")
+
+    # Times are local to HOME_AGENT_TIMEZONE.
+    # Quiet windows cross midnight (e.g. 21:00 -> 05:50).
+    weekday_start: str = Field(default="21:00", alias="QUIET_HOURS_WEEKDAY_START")
+    weekday_end: str = Field(default="05:50", alias="QUIET_HOURS_WEEKDAY_END")
+    weekend_start: str = Field(default="21:00", alias="QUIET_HOURS_WEEKEND_START")
+    weekend_end: str = Field(default="06:50", alias="QUIET_HOURS_WEEKEND_END")
+
+    @field_validator("weekday_start", "weekday_end", "weekend_start", "weekend_end", mode="before")
+    @classmethod
+    def _norm_time(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
+class CamectSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="CAMECT_ENABLED")
+    host: str = Field(default="", alias="CAMECT_HOST")  # e.g. 10.1.2.150:443
+    username: str = Field(default="", alias="CAMECT_USERNAME")
+    password: Optional[str] = Field(default=None, alias="CAMECT_PASSWORD")
+
+    # Comma-delimited list of camera names to include (match Camect camera "name" values).
+    camera_names: str = Field(default="", alias="CAMECT_CAMERA_NAMES")
+
+    # Optional per-camera filters.
+    # Format examples:
+    #   "Front_Garage:vehicle;Front_Door:person"
+    #   "Front_Garage=vehicle,Front_Door=person"
+    # If provided, this overrides CAMECT_CAMERA_NAMES + CAMECT_EVENT_FILTER behavior.
+    camera_rules: str = Field(default="", alias="CAMECT_CAMERA_RULES")
+
+    # Filter token(s) (v1): "vehicle" is the common use case. We match this against event text fields.
+    event_filter: str = Field(default="vehicle", alias="CAMECT_EVENT_FILTER")
+
+    throttle_seconds: int = Field(default=120, alias="CAMECT_THROTTLE_SECONDS")
+    debug: bool = Field(default=False, alias="CAMECT_DEBUG")
+    status_interval_seconds: int = Field(default=60, alias="CAMECT_STATUS_INTERVAL_SECONDS")
+    stale_warning_seconds: int = Field(default=300, alias="CAMECT_STALE_WARNING_SECONDS")
+    announce_template: str = Field(
+        default="{kind} detected at {camera}.",
+        alias="CAMECT_ANNOUNCE_TEMPLATE",
+    )
+
+    @field_validator(
+        "host",
+        "username",
+        "camera_names",
+        "camera_rules",
+        "event_filter",
+        "announce_template",
+        mode="before",
+    )
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def _norm_opt(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = _strip_quotes(str(v)).strip()
+        return s or None
+
+    @property
+    def camera_name_list(self) -> List[str]:
+        s = (self.camera_names or "").strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in s.split(",")]
+        return [p for p in parts if p]
+
+    @property
+    def camera_rules_map(self) -> Dict[str, str]:
+        """
+        Parse CAMECT_CAMERA_RULES into {camera_name: filter_token}.
+        """
+        raw = (self.camera_rules or "").strip()
+        if not raw:
+            return {}
+        # Allow separators ; or ,
+        items: List[str] = []
+        for chunk in raw.split(";"):
+            for part in chunk.split(","):
+                p = part.strip()
+                if p:
+                    items.append(p)
+
+        out: Dict[str, str] = {}
+        for item in items:
+            if ":" in item:
+                k, v = item.split(":", 1)
+            elif "=" in item:
+                k, v = item.split("=", 1)
+            else:
+                continue
+            cam = k.strip()
+            tok = v.strip()
+            if cam and tok:
+                out[cam] = tok
+        return out
+
+
+class AppSettings(BaseSettings):
+    """
+    Single place for config. Reads environment variables (and .env if present).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    name: str = Field(default="home-agent", alias="HOME_AGENT_NAME")
+    log_level: str = Field(default="INFO", alias="HOME_AGENT_LOG_LEVEL")
+    timezone: str = Field(default="UTC", alias="HOME_AGENT_TIMEZONE")
+
+    llm: LLMSettings = LLMSettings()
+    llm_fallback: LLMFallbackSettings = LLMFallbackSettings()
+    sonos: SonosSettings = SonosSettings()
+    elevenlabs: ElevenLabsSettings = ElevenLabsSettings()
+    mqtt: MqttSettings = MqttSettings()
+    db: DbSettings = DbSettings()
+    weather: WeatherSettings = WeatherSettings()
+    quiet_hours: QuietHoursSettings = QuietHoursSettings()
+    camect: CamectSettings = CamectSettings()
+
