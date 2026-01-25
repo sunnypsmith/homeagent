@@ -50,6 +50,17 @@ In your `.env`, you can set a default announcement volume:
 SONOS_DEFAULT_VOLUME=50
 ```
 
+## Prevent clipped endings (tail padding)
+
+Some Sonos devices can cut off the last words of an announcement when playback ends and we restore the prior queue/state.
+You can add a small “tail padding” delay (in seconds):
+
+```bash
+SONOS_TAIL_PADDING_SECONDS=3.0
+```
+
+If you still hear clipping, try `5.0`–`10.0` and restart `home-agent sonos-gateway`.
+
 ## Test TTS -> Sonos end-to-end
 
 Once you’ve set:

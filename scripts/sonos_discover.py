@@ -54,10 +54,10 @@ def main() -> int:
 Notes:
   - SSDP mode requires multicast/UPnP to work on your network.
   - Subnet mode probes http://<ip>:1400/xml/device_description.xml and does not rely on multicast.
-  - This script updates ONLY SONOS_SPEAKER_IP in your env file (it does not print or modify other keys).
+  - This script updates ONLY SONOS_ANNOUNCE_TARGETS in your env file (it does not print or modify other keys).
 """
     parser = argparse.ArgumentParser(
-        description="Discover Sonos devices and (optionally) write SONOS_SPEAKER_IP to an env file.",
+        description="Discover Sonos devices and (optionally) write SONOS_ANNOUNCE_TARGETS to an env file.",
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

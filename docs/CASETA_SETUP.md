@@ -32,10 +32,17 @@ You should get three files:
 CASETA_ENABLED=true
 CASETA_HOST=10.1.2.116
 CASETA_PORT=8081
-CASETA_CA_CERT_PATH=/home/ml/.config/pylutron_caseta/10.1.2.116-bridge.crt
-CASETA_CERT_PATH=/home/ml/.config/pylutron_caseta/10.1.2.116.crt
-CASETA_KEY_PATH=/home/ml/.config/pylutron_caseta/10.1.2.116.key
+CASETA_CA_CERT_PATH=~/.config/pylutron_caseta/10.1.2.116-bridge.crt
+CASETA_CERT_PATH=~/.config/pylutron_caseta/10.1.2.116.crt
+CASETA_KEY_PATH=~/.config/pylutron_caseta/10.1.2.116.key
 ```
+
+Notes:
+- Those paths must be valid **from the process that runs** `home-agent caseta-agent`.
+- If you’re running via Docker Compose, it’s usually easiest to mount your cert directory into the container (e.g. `/certs`) and set:
+  - `CASETA_CA_CERT_PATH=/certs/<BRIDGE_IP>-bridge.crt`
+  - `CASETA_CERT_PATH=/certs/<BRIDGE_IP>.crt`
+  - `CASETA_KEY_PATH=/certs/<BRIDGE_IP>.key`
 
 ## Run
 

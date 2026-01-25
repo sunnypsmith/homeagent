@@ -23,7 +23,7 @@ All messages on MQTT use the same JSON envelope:
 
 ### Agents (examples)
 - **`wakeup-agent`**: consumes `time.cron.wakeup_call` and emits `announce.request`
-- **`morning-briefing-agent`**: consumes `time.cron.morning_briefing`, calls LLM + weather, emits `announce.request`
+- **`morning-briefing-agent`**: consumes `time.cron.morning_briefing`, calls LLM + weather (+ optional calendar ICS), emits `announce.request`
 - **`hourly-chime-agent`**: consumes `time.cron.hourly_chime` and emits `announce.request`
 - **`fixed-announcement-agent`**: consumes `time.cron.fixed_announcement` and emits `announce.request` using `data.text`
 
@@ -57,13 +57,15 @@ Pluggable unit of behavior. A module’s `start(ctx)` typically:
 `integrations/llm.py` is an OpenAI-compatible `/v1/chat/completions` client.
 
 ### Sonos
-`integrations/sonos.py` intentionally starts as:
-- a safe **stub** (prints/logs what it would say)
-- an optional **SoCo** integration skeleton
+Sonos output is handled by the dedicated `sonos-gateway` service:
+- subscribes to `homeagent/announce/request`
+- generates TTS audio (ElevenLabs)
+- hosts the audio over HTTP on the LAN
+- plays it on Sonos (SoCo), then restores the previous state
 
-For “true speech on Sonos”, the common production pipeline is:
+The common “true speech on Sonos” pipeline is:
 1) call a TTS API to generate audio bytes
 2) host audio on a local HTTP endpoint
 3) have Sonos play the audio URL (and restore the previous queue/state)
 
-This repo is structured so that pipeline can live as its own module/integration.
+Quiet hours are **hard-enforced** in `sonos-gateway`.

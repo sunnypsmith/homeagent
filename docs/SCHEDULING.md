@@ -19,6 +19,12 @@ Examples:
 home-agent seed-schedules
 ```
 
+## Trigger a morning briefing now (for testing)
+
+```bash
+home-agent trigger-morning-briefing
+```
+
 ## Fixed announcements
 
 Fixed announcements are schedules with:

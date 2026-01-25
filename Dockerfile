@@ -13,9 +13,10 @@ COPY src ./src
 COPY scripts ./scripts
 COPY docs ./docs
 
-# Install (include Sonos extra so discovery/playback works)
+# Install extras used by the service stack.
+# (Sonos playback, Camect, Caséta, Calendar ICS parsing)
 RUN python -m pip install --upgrade pip \
-  && python -m pip install ".[sonos]"
+  && python -m pip install ".[sonos,camect,caseta,gcal]"
 
 CMD ["home-agent", "run"]
 

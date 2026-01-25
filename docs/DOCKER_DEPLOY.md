@@ -27,9 +27,12 @@ cp .env.example .env
 Key fields:
 - `MQTT_HOST`, `DB_HOST` (with host networking, `127.0.0.1` is fine)
 - `SONOS_ANNOUNCE_TARGETS`, `ELEVENLABS_API_KEY`
+- `SONOS_TAIL_PADDING_SECONDS` (optional; helps prevent clipped endings)
 - quiet hours: `QUIET_HOURS_*`
+- calendar (optional): `GCAL_*`
 - Camect (optional): `CAMECT_*`
 - Caséta + camera lighting (optional): `CASETA_*`, `CAMERA_LIGHTING_*`
+  - If you run `caseta-agent` via Compose, also set `CASETA_CERTS_DIR` (host path) so the certs can be mounted into the container at `/certs`.
 
 ## 2) Start the stack
 
@@ -38,6 +41,11 @@ From repo root:
 ```bash
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
+
+Notes:
+- `deploy/docker-compose.yml` is written to pick up values from your **repo-root** `.env` (when you run the command from repo root).
+- The TimescaleDB container uses `${DB_NAME}`, `${DB_USER}`, `${DB_PASSWORD}` from `.env` for its initial bootstrap.
+- If you enable Caséta, update `CASETA_CERTS_DIR` in your shell environment (or `.env`) to a host directory containing the `lap-pair` generated certs.
 
 Check status:
 

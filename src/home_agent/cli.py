@@ -20,6 +20,8 @@ from home_agent.services.hourly_house_check_agent import main as hourly_house_ch
 from home_agent.services.morning_briefing_agent import main as morning_briefing_agent_main
 from home_agent.services.seed_schedules import SeedSchedule, seed_default_schedules, upsert_schedules
 from home_agent.services.caseta_agent import main as caseta_agent_main
+from home_agent.services.camect_agent import main as camect_agent_main
+from home_agent.services.camera_lighting_agent import main as camera_lighting_agent_main
 from home_agent.services.sonos_gateway import main as sonos_gateway_main
 from home_agent.services.time_trigger import main as time_trigger_main
 from home_agent.services.wakeup_agent import main as wakeup_agent_main
@@ -190,6 +192,17 @@ def hourly_house_check_agent() -> None:
 def caseta_agent() -> None:
     """Run Lutron Caséta agent (LEAP bridge -> MQTT commands/events)."""
     raise SystemExit(caseta_agent_main())
+
+@app.command("camect-agent")
+def camect_agent() -> None:
+    """Run Camect agent (Camect hub -> MQTT camera/event + optional announce.request)."""
+    raise SystemExit(camect_agent_main())
+
+
+@app.command("camera-lighting-agent")
+def camera_lighting_agent() -> None:
+    """Run camera -> lighting agent (camera events -> Caséta lights)."""
+    raise SystemExit(camera_lighting_agent_main())
 
 
 @app.command("fixed-announcement-agent")

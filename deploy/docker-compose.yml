@@ -15,9 +15,10 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      POSTGRES_DB: homeagent
-      POSTGRES_USER: homeagent
-      POSTGRES_PASSWORD: change_me
+      # Keep DB settings in sync with your repo-root .env
+      POSTGRES_DB: ${DB_NAME:-homeagent}
+      POSTGRES_USER: ${DB_USER:-homeagent}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me}
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
 
@@ -116,6 +117,36 @@ services:
     volumes:
       - ../.env:/workspace/.env:ro
     command: ["home-agent", "camect-agent"]
+    depends_on: [mqtt, db]
+
+  # Optional: Lutron Caséta (requires pairing certs; see docs/CASETA_SETUP.md)
+  caseta-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-caseta-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+      # Mount your `lap-pair` cert directory into the container (read-only),
+      # then set CASETA_*_PATH in `.env` to point at /certs/*.crt|*.key.
+      # Example (host path): CASETA_CERTS_DIR=/seaside/homeagent/caseta-certs
+      - ${CASETA_CERTS_DIR:-./caseta-certs}:/certs:ro
+    command: ["home-agent", "caseta-agent"]
+    depends_on: [mqtt, db]
+
+  # Optional: camera -> lighting automation (requires camect-agent + caseta-agent)
+  camera-lighting-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-camera-lighting-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "camera-lighting-agent"]
     depends_on: [mqtt, db]
 
 volumes:
