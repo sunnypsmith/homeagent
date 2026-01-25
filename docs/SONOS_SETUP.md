@@ -50,6 +50,19 @@ In your `.env`, you can set a default announcement volume:
 SONOS_DEFAULT_VOLUME=50
 ```
 
+## Per-speaker volumes (recommended for mixed Sonos models)
+
+Different Sonos products can be louder/quieter at the same volume number.
+You can override volume **per target speaker IP**:
+
+```bash
+SONOS_SPEAKER_VOLUMES=10.1.2.58:35,10.1.2.72:45
+```
+
+Notes:
+- Volumes are clamped to `0..100`.
+- If an announcement includes `data.volume`, that value overrides per-speaker volumes for that one announcement.
+
 ## Prevent clipped endings (tail padding)
 
 Some Sonos devices can cut off the last words of an announcement when playback ends and we restore the prior queue/state.

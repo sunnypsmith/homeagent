@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import psycopg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -17,6 +17,7 @@ from home_agent.bus.envelope import make_event
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
+from home_agent.db import DbConnectInfo, DbManager
 
 
 @dataclass(frozen=True)
@@ -82,8 +83,14 @@ async def run_time_trigger() -> None:
     await mqttc.connect()
     log.info("mqtt_connected", host=settings.mqtt.host, port=settings.mqtt.port)
 
-    conn = psycopg.connect(settings.db.conninfo, autocommit=True)
-    log.info("db_connected", host=settings.db.host, db=settings.db.name)
+    db = DbManager(
+        conninfo=settings.db.conninfo,
+        log_info=DbConnectInfo(host=settings.db.host, port=settings.db.port, dbname=settings.db.name, user=settings.db.user),
+        connect_timeout_seconds=10.0,
+        reconnect_max_wait_seconds=60.0,
+    )
+    db.ensure_connected()
+    log.info("db_connected", host=db.log_info.host, db=db.log_info.dbname)
 
     scheduler = AsyncIOScheduler()
     scheduler.start()
@@ -92,6 +99,8 @@ async def run_time_trigger() -> None:
     loop = asyncio.get_running_loop()
 
     def _stop() -> None:
+        # Visible marker that shutdown was requested (useful if we hang during cleanup).
+        log.warning("shutdown_requested")
         stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -166,30 +175,59 @@ async def run_time_trigger() -> None:
         )
 
     def load_schedules() -> List[ScheduleRow]:
-        rows: List[ScheduleRow] = []
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, name, enabled, kind, timezone, spec, mqtt_topic, event_type, data
-                FROM schedules
-                ORDER BY id ASC
-                """
-            )
-            for r in cur.fetchall():
-                rows.append(
-                    ScheduleRow(
-                        id=int(r[0]),
-                        name=str(r[1]),
-                        enabled=bool(r[2]),
-                        kind=str(r[3]),
-                        timezone=str(r[4]),
-                        spec=str(r[5]),
-                        mqtt_topic=str(r[6]),
-                        event_type=str(r[7]),
-                        data=dict(r[8] or {}),
-                    )
+        def _do(conn) -> List[ScheduleRow]:
+            rows: List[ScheduleRow] = []
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, enabled, kind, timezone, spec, mqtt_topic, event_type, data
+                    FROM schedules
+                    ORDER BY id ASC
+                    """
                 )
-        return rows
+                for r in cur.fetchall():
+                    rows.append(
+                        ScheduleRow(
+                            id=int(r[0]),
+                            name=str(r[1]),
+                            enabled=bool(r[2]),
+                            kind=str(r[3]),
+                            timezone=str(r[4]),
+                            spec=str(r[5]),
+                            mqtt_topic=str(r[6]),
+                            event_type=str(r[7]),
+                            data=dict(r[8] or {}),
+                        )
+                    )
+            return rows
+
+        return db.run(_do, retries=1)
+
+    last_reload_started_at = 0.0
+    last_reload_finished_at = 0.0
+    reload_inflight = False
+
+    def load_schedules_daemon() -> "asyncio.Future[List[ScheduleRow]]":
+        """
+        Run a blocking DB fetch on a daemon thread.
+
+        Why: asyncio's default executor uses non-daemon threads and `asyncio.run()`
+        will wait for them at shutdown. If a DB call hangs, Ctrl-C can wedge the
+        process. A daemon thread avoids that shutdown hang.
+        """
+        fut: "asyncio.Future[List[ScheduleRow]]" = loop.create_future()
+
+        def _worker() -> None:
+            try:
+                rows = load_schedules()
+            except Exception as e:
+                loop.call_soon_threadsafe(fut.set_exception, e)
+                return
+            loop.call_soon_threadsafe(fut.set_result, rows)
+
+        t = threading.Thread(target=_worker, daemon=True, name="time-trigger-db-load")
+        t.start()
+        return fut
 
     async def reload_loop() -> None:
         """
@@ -197,30 +235,87 @@ async def run_time_trigger() -> None:
         """
         while not stop_event.is_set():
             try:
-                schedules = await loop.run_in_executor(None, load_schedules)
+                nonlocal last_reload_started_at, last_reload_finished_at
+                nonlocal reload_inflight
+
+                if reload_inflight:
+                    log.warning("schedules_reload_skipped", reason="previous_reload_still_running")
+                    # Sleep, but wake immediately on shutdown (Ctrl-C/SIGTERM).
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                reload_inflight = True
+                last_reload_started_at = loop.time()
+                # Load schedules in a worker thread (psycopg is blocking).
+                schedules = await load_schedules_daemon()
                 # Replace all jobs based on current DB view.
                 for s in schedules:
                     add_or_replace_job(s)
                 log.info("schedules_loaded", count=len(schedules))
+                last_reload_finished_at = loop.time()
+                reload_inflight = False
             except Exception:
+                reload_inflight = False
                 log.exception("schedules_reload_failed")
-            await asyncio.sleep(60)
+            # Sleep, but wake immediately on shutdown (Ctrl-C/SIGTERM).
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                pass
 
     reload_task = asyncio.create_task(reload_loop())
+
+    async def status_loop() -> None:
+        """
+        Periodic liveness signal so we can tell whether the service is running or hung.
+        """
+        while not stop_event.is_set():
+            await asyncio.sleep(10.0)
+            st = mqttc.stats()
+            now = loop.time()
+            reload_age = None
+            if last_reload_finished_at > 0:
+                reload_age = round(now - last_reload_finished_at, 1)
+            reload_runtime = None
+            if last_reload_started_at > 0 and last_reload_finished_at < last_reload_started_at:
+                reload_runtime = round(now - last_reload_started_at, 1)
+            log.info(
+                "status",
+                mqtt_connected=bool(st.get("connected", 0)),
+                mqtt_queue_size=st.get("queue_size"),
+                mqtt_queue_max=st.get("queue_maxsize"),
+                mqtt_dropped_total=st.get("dropped_total"),
+                schedules_last_reload_age_seconds=reload_age,
+                schedules_reload_runtime_seconds=reload_runtime,
+            )
+
+    status_task = asyncio.create_task(status_loop())
 
     try:
         await stop_event.wait()
     finally:
+        log.info("shutdown_start")
         reload_task.cancel()
+        status_task.cancel()
         try:
             scheduler.shutdown(wait=False)
         except Exception:
             pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+        log.info("shutdown_db_close")
+        db.close()
+        log.info("shutdown_mqtt_close")
         await mqttc.close()
+        # If the process still doesn't exit, log remaining threads to help debug.
+        try:
+            threads = []
+            for t in threading.enumerate():
+                threads.append({"name": t.name, "daemon": bool(t.daemon), "alive": bool(t.is_alive())})
+            log.info("shutdown_done", threads=threads)
+        except Exception:
+            log.info("shutdown_done")
 
 
 def main() -> int:

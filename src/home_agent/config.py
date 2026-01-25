@@ -37,6 +37,9 @@ class SonosSettings(BaseSettings):
     default_volume: int = Field(default=50, alias="SONOS_DEFAULT_VOLUME")
     announce_concurrency: int = Field(default=3, alias="SONOS_ANNOUNCE_CONCURRENCY")
     tail_padding_seconds: float = Field(default=3.0, alias="SONOS_TAIL_PADDING_SECONDS")
+    # Optional per-speaker volume overrides.
+    # Format: "10.1.2.58:35,10.1.2.72:45" (comma/semicolon delimited)
+    speaker_volumes: str = Field(default="", alias="SONOS_SPEAKER_VOLUMES")
 
     @field_validator("announce_targets", mode="before")
     @classmethod
@@ -47,11 +50,109 @@ class SonosSettings(BaseSettings):
 
     @property
     def announce_target_ips(self) -> List[str]:
-        s = (self.announce_targets or "").strip()
-        if not s:
-            return []
-        parts = [p.strip() for p in s.split(",")]
-        return [p for p in parts if p]
+        """
+        Comma-delimited list of speaker IPs for announcements.
+
+        For convenience, each entry may optionally include a volume override:
+          "10.1.2.58:35,10.1.2.72:45"
+
+        In that case, the IP portion is used as the target, and the volume is treated
+        as a per-speaker override (see `speaker_volume_map`).
+        """
+        ips, _ = _parse_sonos_targets(self.announce_targets or "")
+        return ips
+
+    @property
+    def speaker_volume_map(self) -> Dict[str, int]:
+        """
+        Per-speaker volume overrides keyed by IP.
+        Example: SONOS_SPEAKER_VOLUMES="10.1.2.58:35,10.1.2.72:45"
+        """
+        # Start with any embedded ip:vol in SONOS_ANNOUNCE_TARGETS (convenience).
+        _, embedded = _parse_sonos_targets(self.announce_targets or "")
+
+        # Then apply explicit overrides from SONOS_SPEAKER_VOLUMES (recommended).
+        explicit = _parse_sonos_speaker_volumes(self.speaker_volumes or "")
+
+        out: Dict[str, int] = dict(embedded)
+        out.update(explicit)
+        return out
+
+
+def _parse_sonos_targets(raw_targets: str) -> tuple[List[str], Dict[str, int]]:
+    """
+    Parse SONOS_ANNOUNCE_TARGETS.
+
+    Supported formats:
+      - "10.1.2.58,10.1.2.72"
+      - "10.1.2.58:35,10.1.2.72:45"  (ip + per-speaker volume)
+    """
+    s = _strip_quotes(str(raw_targets or "")).strip()
+    if not s:
+        return ([], {})
+
+    ips: List[str] = []
+    vols: Dict[str, int] = {}
+    for part in s.split(","):
+        item = part.strip()
+        if not item:
+            continue
+
+        ip = item
+        vol: Optional[int] = None
+
+        if ":" in item:
+            left, right = item.rsplit(":", 1)
+            left = left.strip()
+            right = right.strip()
+            if left and right:
+                try:
+                    vv = int(float(right))
+                    vv = max(0, min(100, vv))
+                    ip = left
+                    vol = vv
+                except Exception:
+                    # Treat as plain IP string if volume isn't parseable.
+                    ip = item
+                    vol = None
+
+        if ip:
+            ips.append(ip)
+            if vol is not None:
+                vols[ip] = vol
+
+    return (ips, vols)
+
+
+def _parse_sonos_speaker_volumes(raw: str) -> Dict[str, int]:
+    """
+    Parse SONOS_SPEAKER_VOLUMES.
+    Format: "10.1.2.58:35,10.1.2.72:45" (comma/semicolon delimited)
+    """
+    s = _strip_quotes(str(raw or "")).strip()
+    if not s:
+        return {}
+
+    out: Dict[str, int] = {}
+    # allow comma or semicolon separators
+    for chunk in s.replace(";", ",").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            continue
+        ip, vol_s = item.split(":", 1)
+        ip = ip.strip()
+        vol_s = vol_s.strip()
+        if not ip or not vol_s:
+            continue
+        try:
+            vol = int(float(vol_s))
+        except Exception:
+            continue
+        vol = max(0, min(100, vol))
+        out[ip] = vol
+    return out
 
 
 class ElevenLabsSettings(BaseSettings):

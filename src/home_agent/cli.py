@@ -88,7 +88,11 @@ def tts_test(
         timeout_seconds=settings.elevenlabs.timeout_seconds,
     )
     host = AudioHost()
-    player = SonosPlayback(speaker_ips=targets, default_volume=settings.sonos.default_volume)
+    player = SonosPlayback(
+        speaker_ips=targets,
+        default_volume=settings.sonos.default_volume,
+        speaker_volume_map=settings.sonos.speaker_volume_map,
+    )
 
     import asyncio
 
@@ -105,6 +109,86 @@ def tts_test(
             volume=volume,
             title="Home Agent TTS Test",
             concurrency=concurrency if concurrency is not None else settings.sonos.announce_concurrency,
+        )
+
+    asyncio.run(run_once())
+
+
+@app.command("sonos-tone-test")
+def sonos_tone_test(
+    seconds: float = typer.Option(1.0, "--seconds", help="Tone duration in seconds (default: 1.0)"),
+    frequency: int = typer.Option(880, "--frequency", help="Tone frequency in Hz (default: 880)"),
+    volume: int = typer.Option(None, "--volume", help="Optional volume override (0-100)"),
+    concurrency: int = typer.Option(None, "--concurrency", help="Parallel Sonos playback concurrency"),
+    tail_padding_seconds: float = typer.Option(
+        1.0,
+        "--tail-padding-seconds",
+        help="Extra seconds to wait before restoring Sonos state (default: 1.0; overrides SONOS_TAIL_PADDING_SECONDS)",
+    ),
+) -> None:
+    """
+    Play a short generated tone on SONOS_ANNOUNCE_TARGETS (no TTS required).
+    """
+    settings = AppSettings()
+    configure_logging(settings.log_level)
+
+    targets = settings.sonos.announce_target_ips
+    if not targets:
+        raise typer.BadParameter("Set SONOS_ANNOUNCE_TARGETS in .env first")
+
+    host = AudioHost()
+    player = SonosPlayback(
+        speaker_ips=targets,
+        default_volume=settings.sonos.default_volume,
+        speaker_volume_map=settings.sonos.speaker_volume_map,
+    )
+
+    import asyncio
+    import io
+    import math
+    import struct
+    import wave
+
+    def _tone_wav_bytes(*, duration_s: float, frequency_hz: int) -> bytes:
+        sample_rate = 44100
+        n_samples = int(sample_rate * max(0.05, float(duration_s)))
+        amplitude = 0.85
+        fade_samples = int(sample_rate * 0.02)  # ~20ms
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(sample_rate)
+
+            frames = bytearray()
+            for i in range(n_samples):
+                t = float(i) / float(sample_rate)
+                fade = 1.0
+                if fade_samples > 0:
+                    fade = min(1.0, i / fade_samples, (n_samples - 1 - i) / fade_samples)
+                v = float(fade) * amplitude * math.sin(2.0 * math.pi * float(frequency_hz) * t)
+                frames += struct.pack("<h", int(v * 32767.0))
+
+            wf.writeframes(frames)
+        return buf.getvalue()
+
+    async def run_once() -> None:
+        data = _tone_wav_bytes(duration_s=seconds, frequency_hz=frequency)
+        hosted = host.host_bytes(
+            data=data,
+            filename="tone_test.wav",
+            content_type="audio/wav",
+            route_to_ip=targets[0],
+        )
+        await player.play_url(
+            url=hosted.url,
+            volume=volume,
+            title="Home Agent tone test",
+            concurrency=concurrency if concurrency is not None else settings.sonos.announce_concurrency,
+            tail_padding_seconds=float(tail_padding_seconds),
+            expected_duration_seconds=float(seconds),
+            done_timeout_seconds=max(3.0, float(seconds) + 5.0),
         )
 
     asyncio.run(run_once())

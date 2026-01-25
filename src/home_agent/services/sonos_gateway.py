@@ -67,7 +67,11 @@ async def run_sonos_gateway() -> None:
         timeout_seconds=settings.elevenlabs.timeout_seconds,
     )
     host = AudioHost()
-    player = SonosPlayback(speaker_ips=targets, default_volume=settings.sonos.default_volume)
+    player = SonosPlayback(
+        speaker_ips=targets,
+        default_volume=settings.sonos.default_volume,
+        speaker_volume_map=settings.sonos.speaker_volume_map,
+    )
 
     mqttc = MqttClient(
         host=settings.mqtt.host,
@@ -193,7 +197,11 @@ async def run_sonos_gateway() -> None:
                 player2 = (
                     player
                     if play_targets == targets
-                    else SonosPlayback(speaker_ips=play_targets, default_volume=settings.sonos.default_volume)
+                    else SonosPlayback(
+                        speaker_ips=play_targets,
+                        default_volume=settings.sonos.default_volume,
+                        speaker_volume_map=settings.sonos.speaker_volume_map,
+                    )
                 )
                 await player2.play_url(
                     url=hosted.url,

@@ -5,11 +5,10 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import psycopg
-
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
+from home_agent.db import DbConnectInfo, DbManager
 
 
 def _parse_ts(value: object) -> Optional[datetime]:
@@ -49,8 +48,14 @@ async def run_event_recorder() -> None:
     mqttc.subscribe(topic)
     log.info("subscribed", topic=topic)
 
-    conn = psycopg.connect(settings.db.conninfo, autocommit=True)
-    log.info("db_connected", host=settings.db.host, db=settings.db.name)
+    db = DbManager(
+        conninfo=settings.db.conninfo,
+        log_info=DbConnectInfo(host=settings.db.host, port=settings.db.port, dbname=settings.db.name, user=settings.db.user),
+        connect_timeout_seconds=10.0,
+        reconnect_max_wait_seconds=60.0,
+    )
+    db.ensure_connected()
+    log.info("db_connected", host=db.log_info.host, db=db.log_info.dbname)
 
     insert_sql = """
         INSERT INTO events (ts, topic, source, type, id, trace_id, payload)
@@ -78,19 +83,22 @@ async def run_event_recorder() -> None:
         trace_id: Optional[str],
         payload_json: str,
     ) -> None:
-        with conn.cursor() as cur:
-            cur.execute(
-                insert_sql,
-                (
-                    ts,
-                    mqtt_topic,
-                    source,
-                    typ,
-                    event_id,
-                    trace_id,
-                    payload_json,
-                ),
-            )
+        def _do(conn) -> None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    insert_sql,
+                    (
+                        ts,
+                        mqtt_topic,
+                        source,
+                        typ,
+                        event_id,
+                        trace_id,
+                        payload_json,
+                    ),
+                )
+
+        db.run(_do, retries=1)
 
     async def stats_reporter() -> None:
         while True:
@@ -155,10 +163,7 @@ async def run_event_recorder() -> None:
                 log.exception("insert_failed", topic=msg.topic)
     finally:
         reporter_task.cancel()
-        try:
-            conn.close()
-        except Exception:
-            pass
+        db.close()
         await mqttc.close()
 
 

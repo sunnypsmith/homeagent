@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from time import sleep
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 class SonosPlayback:
-    def __init__(self, *, speaker_ips: List[str], default_volume: int) -> None:
+    def __init__(
+        self,
+        *,
+        speaker_ips: List[str],
+        default_volume: int,
+        speaker_volume_map: Optional[Dict[str, int]] = None,
+    ) -> None:
         try:
             from soco import SoCo  # type: ignore
             from soco.snapshot import Snapshot  # type: ignore
@@ -17,6 +24,7 @@ class SonosPlayback:
         self._Snapshot = Snapshot
         self._speaker_ips = list(speaker_ips)
         self._default_volume = default_volume
+        self._speaker_volume_map = dict(speaker_volume_map or {})
 
     async def play_url(
         self,
@@ -26,6 +34,8 @@ class SonosPlayback:
         title: str = "Home Agent",
         concurrency: int = 3,
         tail_padding_seconds: float = 3.0,
+        expected_duration_seconds: Optional[float] = None,
+        done_timeout_seconds: float = 25.0,
     ) -> None:
         """
         v1: play on each configured target (coordinator-aware), in parallel with a limit.
@@ -39,16 +49,31 @@ class SonosPlayback:
         sem = asyncio.Semaphore(max(1, int(concurrency)))
         loop = asyncio.get_running_loop()
 
-        async def run_one(spk) -> None:
+        async def run_one(item: "_ResolvedTarget") -> None:
             async with sem:
                 await loop.run_in_executor(
-                    None, self._play_url_blocking, spk, url, volume, title, float(tail_padding_seconds)
+                    None,
+                    self._play_url_blocking,
+                    item.device,
+                    url,
+                    volume if volume is not None else item.volume,
+                    title,
+                    float(tail_padding_seconds),
+                    float(expected_duration_seconds) if expected_duration_seconds is not None else None,
+                    float(done_timeout_seconds),
                 )
 
-        await asyncio.gather(*(run_one(spk) for spk in targets))
+        await asyncio.gather(*(run_one(t) for t in targets))
 
     def _play_url_blocking(
-        self, spk, url: str, volume: Optional[int], title: str, tail_padding_seconds: float
+        self,
+        spk,
+        url: str,
+        volume: Optional[int],
+        title: str,
+        tail_padding_seconds: float,
+        expected_duration_seconds: Optional[float],
+        done_timeout_seconds: float,
     ) -> None:
         snap = self._Snapshot(spk)
         try:
@@ -59,7 +84,12 @@ class SonosPlayback:
                 pass
             spk.play_uri(url, title=title, start=True)
             _wait_for_playing(spk, timeout_seconds=2.0)
-            _wait_for_done_or_timeout(spk, timeout_seconds=25.0)
+            if expected_duration_seconds is not None and expected_duration_seconds > 0:
+                # For known short clips (e.g., test tones), Sonos can keep reporting PLAYING
+                # for a while. Sleeping is both faster and avoids long "done" polling.
+                sleep(max(0.2, float(expected_duration_seconds) + 0.75))
+            else:
+                _wait_for_done_or_timeout(spk, timeout_seconds=float(done_timeout_seconds))
             # Sonos can report "not playing" a fraction early; add a small grace delay
             # so the last words aren't clipped before we restore the snapshot.
             if tail_padding_seconds and tail_padding_seconds > 0:
@@ -79,7 +109,7 @@ class SonosPlayback:
         De-duplicate coordinators while preserving order.
         """
         seen: Set[str] = set()
-        out: List[object] = []
+        out: List[_ResolvedTarget] = []
         for ip in self._speaker_ips:
             d = self._SoCo(ip)
             try:
@@ -91,8 +121,24 @@ class SonosPlayback:
             if key in seen:
                 continue
             seen.add(key)
-            out.append(coord)
+            # Prefer a per-speaker override:
+            # - match by configured target ip first
+            # - then coordinator ip (in case user configured that)
+            vol = self._speaker_volume_map.get(ip)
+            if vol is None:
+                vol = self._speaker_volume_map.get(str(key))
+            if vol is None:
+                vol = int(self._default_volume)
+            vol = max(0, min(100, int(vol)))
+            out.append(_ResolvedTarget(device=coord, volume=vol, key=str(key)))
         return out
+
+
+@dataclass(frozen=True)
+class _ResolvedTarget:
+    device: object
+    volume: int
+    key: str
 
 
 def _wait_for_playing(soco_device, timeout_seconds: float) -> None:
