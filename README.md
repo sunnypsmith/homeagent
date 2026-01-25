@@ -23,6 +23,16 @@ Optional Sonos support:
 pip install -e ".[sonos]"
 ```
 
+Optional integrations:
+
+```bash
+# Cameras (Camect)
+pip install -e ".[camect]"
+
+# Lighting (Lutron Caséta)
+pip install -e ".[caseta]"
+```
+
 ### 2) Configure
 
 Copy `.env.example` to `.env` and edit:
@@ -69,6 +79,58 @@ Always-on agents (examples):
 Quiet hours:
 - enforced in **`home-agent sonos-gateway`** (nothing plays during quiet hours)
 - configure via `QUIET_HOURS_*` in `.env`
+
+## Setup checklists (most common)
+
+### Sonos announcements (TTS → speakers)
+
+- Set `SONOS_ANNOUNCE_TARGETS` (see `docs/SONOS_SETUP.md`)
+- Set `ELEVENLABS_API_KEY`
+- Run:
+  - `home-agent sonos-gateway`
+- Test:
+
+```bash
+home-agent tts-test "Hello from the home agent"
+```
+
+### Camect camera events
+
+- Configure `CAMECT_*` in `.env` (see `docs/CAMECT_SETUP.md`)
+- Run:
+  - `home-agent camect-agent`
+- Watch events:
+
+```bash
+mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -t 'homeagent/camera/event' -v
+```
+
+### Lutron Caséta control + device IDs
+
+- Pair once (generates TLS certs):
+
+```bash
+lap-pair <BRIDGE_IP>
+```
+
+- Configure `CASETA_*` in `.env` (see `docs/CASETA_SETUP.md`)
+- Run:
+  - `home-agent caseta-agent`
+- Find device IDs (from retained snapshot `lutron.devices`):
+
+```bash
+mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -t 'homeagent/lutron/event' -v
+```
+
+### Camera → lighting automation (Camect → Caséta)
+
+- Configure `CAMECT_*` and `CASETA_*`
+- Configure `CAMERA_LIGHTING_*` (supports lists for camera names, object tokens, and device IDs)
+  - See `docs/CAMERA_LIGHTING.md`
+- Run:
+  - `home-agent camect-agent`
+  - `home-agent caseta-agent`
+  - `home-agent camera-lighting-agent`
 
 ## Schedules
 
@@ -122,6 +184,13 @@ python3 scripts/sonos_discover.py --subnet 192.168.1.0/24 --write
 ```
 
 More details: see `docs/SONOS_SETUP.md`.
+
+## Integrations setup guides
+
+- Sonos: `docs/SONOS_SETUP.md`
+- Camect cameras: `docs/CAMECT_SETUP.md`
+- Lutron Caséta: `docs/CASETA_SETUP.md`
+- Camera → lighting automation: `docs/CAMERA_LIGHTING.md`
 
 If you want “true TTS”, the usual pattern is:
 1) call a TTS API to generate audio, 2) host it (local HTTP), 3) tell Sonos to play the URL.

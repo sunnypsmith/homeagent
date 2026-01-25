@@ -29,6 +29,7 @@ Key fields:
 - `SONOS_ANNOUNCE_TARGETS`, `ELEVENLABS_API_KEY`
 - quiet hours: `QUIET_HOURS_*`
 - Camect (optional): `CAMECT_*`
+- Caséta + camera lighting (optional): `CASETA_*`, `CAMERA_LIGHTING_*`
 
 ## 2) Start the stack
 
