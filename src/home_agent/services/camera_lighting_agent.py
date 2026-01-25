@@ -79,6 +79,43 @@ def _expand_detected_obj_tokens(tokens: set[str]) -> set[str]:
     return out
 
 
+def _parse_camera_name_list(s: str) -> set[str]:
+    """
+    Parse comma/semicolon-delimited camera names into a normalized set.
+    We compare names case-insensitively.
+    """
+    raw = (s or "").strip()
+    if not raw:
+        return set()
+    out: set[str] = set()
+    for chunk in raw.split(";"):
+        for part in chunk.split(","):
+            name = part.strip()
+            if name:
+                out.add(name.lower())
+    return out
+
+
+def _parse_device_id_list(s: str) -> list[str]:
+    """
+    Parse comma/semicolon-delimited device ids into a stable list of strings.
+    """
+    raw = (s or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw.split(";"):
+        for part in chunk.split(","):
+            dev = part.strip()
+            if not dev:
+                continue
+            if dev not in seen:
+                out.append(dev)
+                seen.add(dev)
+    return out
+
+
 def _as_tz(dt: Optional[datetime], tz: ZoneInfo) -> Optional[datetime]:
     if dt is None:
         return None
@@ -152,10 +189,14 @@ async def run_camera_lighting_agent() -> None:
     mqttc.subscribe(sub_topic)
     log.info("subscribed", topic=sub_topic)
 
-    target_cam = (settings.camera_lighting.camera_name or "").strip()
+    target_cam_raw = (settings.camera_lighting.camera_name or "").strip()
+    target_cams = _parse_camera_name_list(target_cam_raw)
     target_obj_raw = (settings.camera_lighting.detected_obj or "").strip()
     target_objs = _expand_detected_obj_tokens(_parse_token_list(target_obj_raw))
-    device_id = (settings.camera_lighting.caseta_device_id or "").strip()
+    device_ids = _parse_device_id_list(settings.camera_lighting.caseta_device_id or "")
+    if not device_ids:
+        log.error("missing_config", key="CAMERA_LIGHTING_CASETA_DEVICE_ID")
+        return
     duration = max(1, int(settings.camera_lighting.duration_seconds))
     min_retrigger = max(0, int(settings.camera_lighting.min_retrigger_seconds))
 
@@ -176,7 +217,7 @@ async def run_camera_lighting_agent() -> None:
         # Dark if before sunrise or after sunset.
         return now < sunrise or now > sunset
 
-    async def schedule_off(*, key: str) -> None:
+    async def schedule_off(*, device_id: str) -> None:
         try:
             await asyncio.sleep(float(duration))
             evt = make_event(
@@ -187,39 +228,39 @@ async def run_camera_lighting_agent() -> None:
             mqttc.publish_json(cmd_topic, evt)
             log.info("lights_off", device_id=device_id, reason="timer_elapsed")
         finally:
-            timers.pop(key, None)
+            timers.pop(device_id, None)
 
     def trigger_lights(*, reason: str) -> None:
         now_mono = time.monotonic()
-        key = device_id
-        t = timers.get(key)
+        for device_id in device_ids:
+            t = timers.get(device_id)
 
-        # Extend timer: cancel existing off task.
-        if t and t.off_task:
-            try:
-                t.off_task.cancel()
-            except Exception:
-                pass
+            # Extend timer: cancel existing off task.
+            if t and t.off_task:
+                try:
+                    t.off_task.cancel()
+                except Exception:
+                    pass
 
-        # Only send "on" if we haven't just sent one.
-        should_send_on = True
-        if t and (now_mono - float(t.last_on_sent_at)) < float(min_retrigger):
-            should_send_on = False
+            # Only send "on" if we haven't just sent one (per device).
+            should_send_on = True
+            if t and (now_mono - float(t.last_on_sent_at)) < float(min_retrigger):
+                should_send_on = False
 
-        if should_send_on:
-            evt = make_event(
-                source="camera-lighting-agent",
-                typ="lutron.command",
-                data={"action": "on", "device_id": device_id},
-            )
-            mqttc.publish_json(cmd_topic, evt)
-            log.info("lights_on", device_id=device_id, reason=reason)
-            last_on = now_mono
-        else:
-            last_on = t.last_on_sent_at if t else now_mono
+            if should_send_on:
+                evt = make_event(
+                    source="camera-lighting-agent",
+                    typ="lutron.command",
+                    data={"action": "on", "device_id": device_id},
+                )
+                mqttc.publish_json(cmd_topic, evt)
+                log.info("lights_on", device_id=device_id, reason=reason)
+                last_on = now_mono
+            else:
+                last_on = t.last_on_sent_at if t else now_mono
 
-        off_task = asyncio.create_task(schedule_off(key=key))
-        timers[key] = _LightTimer(off_task=off_task, last_on_sent_at=last_on)
+            off_task = asyncio.create_task(schedule_off(device_id=device_id))
+            timers[device_id] = _LightTimer(off_task=off_task, last_on_sent_at=last_on)
 
     try:
         while True:
@@ -240,7 +281,7 @@ async def run_camera_lighting_agent() -> None:
                 continue
 
             cam_name = str(data.get("camera_name") or "").strip()
-            if cam_name != target_cam:
+            if target_cams and cam_name.lower() not in target_cams:
                 continue
 
             evt_obj = ""
