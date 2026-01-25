@@ -9,14 +9,12 @@ from home_agent.integrations.sonos_playback import SonosPlayback
 from home_agent.integrations.tts_elevenlabs import ElevenLabsTTSClient
 from home_agent.main import main
 from home_agent.services.event_recorder import main as event_recorder_main
-from home_agent.services.camect_agent import main as camect_agent_main
-from home_agent.services.camera_lighting_agent import main as camera_lighting_agent_main
-from home_agent.services.caseta_agent import main as caseta_agent_main
 from home_agent.services.fixed_announcement_agent import main as fixed_announcement_agent_main
 from home_agent.services.hourly_chime_agent import main as hourly_chime_agent_main
 from home_agent.services.hourly_house_check_agent import main as hourly_house_check_agent_main
 from home_agent.services.morning_briefing_agent import main as morning_briefing_agent_main
 from home_agent.services.seed_schedules import SeedSchedule, seed_default_schedules, upsert_schedules
+from home_agent.services.caseta_agent import main as caseta_agent_main
 from home_agent.services.sonos_gateway import main as sonos_gateway_main
 from home_agent.services.time_trigger import main as time_trigger_main
 from home_agent.services.wakeup_agent import main as wakeup_agent_main
@@ -39,9 +37,8 @@ def sonos_discover(
     write: bool = typer.Option(False, "--write", help="Actually update the env file"),
 ) -> None:
     """
-    Discover Sonos devices on your LAN and (optionally) write SONOS_SPEAKER_IP to the env file.
+    Discover Sonos devices on your LAN and (optionally) write SONOS_ANNOUNCE_TARGETS to the env file.
     """
-    # Keep the logic in a standalone script too (scripts/sonos_discover.py).
     from subprocess import run  # nosec
     import sys
 
@@ -105,60 +102,59 @@ def tts_test(
 
     asyncio.run(run_once())
 
+
 @app.command("sonos-gateway")
 def sonos_gateway() -> None:
     """Run Sonos/TTS gateway (MQTT -> play announcements)."""
     raise SystemExit(sonos_gateway_main())
+
 
 @app.command("event-recorder")
 def event_recorder() -> None:
     """Run event recorder (MQTT -> TimescaleDB events table)."""
     raise SystemExit(event_recorder_main())
 
+
 @app.command("time-trigger")
 def time_trigger() -> None:
     """Run time trigger service (DB schedules -> MQTT time events)."""
     raise SystemExit(time_trigger_main())
+
 
 @app.command("wakeup-agent")
 def wakeup_agent() -> None:
     """Run wakeup call agent (time event -> announce.request)."""
     raise SystemExit(wakeup_agent_main())
 
+
 @app.command("morning-briefing-agent")
 def morning_briefing_agent() -> None:
     """Run morning briefing agent (time event -> LLM -> announce.request)."""
     raise SystemExit(morning_briefing_agent_main())
+
 
 @app.command("hourly-chime-agent")
 def hourly_chime_agent() -> None:
     """Run hourly chime agent (time event -> announce.request)."""
     raise SystemExit(hourly_chime_agent_main())
 
+
 @app.command("hourly-house-check-agent")
 def hourly_house_check_agent() -> None:
     """Run hourly house check agent (stub) (time event -> house.check.request)."""
     raise SystemExit(hourly_house_check_agent_main())
-
-@app.command("camect-agent")
-def camect_agent() -> None:
-    """Run Camect camera events agent (Camect -> MQTT -> announce.request)."""
-    raise SystemExit(camect_agent_main())
 
 @app.command("caseta-agent")
 def caseta_agent() -> None:
     """Run Lutron Caséta agent (LEAP bridge -> MQTT commands/events)."""
     raise SystemExit(caseta_agent_main())
 
-@app.command("camera-lighting-agent")
-def camera_lighting_agent() -> None:
-    """Run camera->lighting automation (Camect camera events -> Caséta commands)."""
-    raise SystemExit(camera_lighting_agent_main())
 
 @app.command("fixed-announcement-agent")
 def fixed_announcement_agent() -> None:
     """Run fixed announcement agent (scheduled time event -> announce.request)."""
     raise SystemExit(fixed_announcement_agent_main())
+
 
 @app.command("seed-schedules")
 def seed_schedules(
@@ -194,6 +190,7 @@ def seed_schedules(
         raise SystemExit(0)
 
     typer.echo("Seeded %d schedules." % len(schedules))
+
 
 @app.command("add-fixed-announcement")
 def add_fixed_announcement(
@@ -261,6 +258,74 @@ def add_fixed_announcement(
             pass
 
     typer.echo("Upserted fixed announcement schedule: %s" % name)
+
+
+@app.command("add-caseta-scene")
+def add_caseta_scene(
+    name: str = typer.Option(..., "--name", help="Unique schedule name (used for upsert)"),
+    at: str = typer.Option(..., "--at", help="Local time HH:MM (in HOME_AGENT_TIMEZONE)"),
+    days: str = typer.Option(
+        "*",
+        "--days",
+        help="Cron day-of-week field (e.g. '*', 'mon-fri', 'sat,sun')",
+    ),
+    scene_name: str = typer.Option(None, "--scene-name", help="Scene name (e.g. Daytime)"),
+    scene_id: str = typer.Option(None, "--scene-id", help="Scene id (e.g. 2)"),
+    enabled: bool = typer.Option(True, "--enabled/--disabled", help="Enable/disable the schedule"),
+) -> None:
+    """
+    Create/update a scheduled Caséta scene activation.
+
+    This writes a schedule row that publishes a `lutron.command` directly to the
+    `homeagent/lutron/command` topic. The `caseta-agent` executes it.
+    """
+    settings = AppSettings()
+    configure_logging(settings.log_level)
+
+    parts = (at or "").strip().split(":")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise typer.BadParameter("--at must be HH:MM", param_hint="--at")
+    hh = int(parts[0])
+    mm = int(parts[1])
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise typer.BadParameter("--at must be valid HH:MM", param_hint="--at")
+
+    if (not scene_name) and (not scene_id):
+        raise typer.BadParameter("Provide --scene-name or --scene-id")
+
+    dow = (days or "").strip() or "*"
+    spec = "%d %d * * %s" % (mm, hh, dow)
+
+    data = {"action": "scene"}
+    if scene_id is not None and str(scene_id).strip():
+        data["scene_id"] = str(scene_id).strip()
+    if scene_name is not None and str(scene_name).strip():
+        data["scene_name"] = str(scene_name).strip()
+
+    s = SeedSchedule(
+        name=name,
+        enabled=bool(enabled),
+        kind="cron",
+        timezone=settings.timezone,
+        spec=spec,
+        mqtt_topic="%s/lutron/command" % settings.mqtt.base_topic,
+        event_type="lutron.command",
+        data=data,
+    )
+
+    import psycopg
+
+    conn = psycopg.connect(settings.db.conninfo, autocommit=True)
+    try:
+        upsert_schedules(conn, [s])
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    typer.echo("Upserted Caséta scene schedule: %s" % name)
+
 
 @app.command("list-fixed-announcements")
 def list_fixed_announcements(

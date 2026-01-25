@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,7 +24,6 @@ def _env_files() -> tuple[str, str]:
 
 
 class SonosSettings(BaseSettings):
-    # Needs env_file here too because this class is instantiated separately from AppSettings.
     model_config = SettingsConfigDict(
         env_prefix="",
         env_file=_env_files(),
@@ -52,6 +51,7 @@ class SonosSettings(BaseSettings):
             return []
         parts = [p.strip() for p in s.split(",")]
         return [p for p in parts if p]
+
 
 class ElevenLabsSettings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -163,8 +163,8 @@ class WeatherSettings(BaseSettings):
     def _norm_str(cls, v: object) -> str:
         return _strip_quotes(str(v)).strip().lower()
 
+
 class LLMSettings(BaseSettings):
-    # Needs env_file here too because this class is instantiated separately from AppSettings.
     model_config = SettingsConfigDict(
         env_prefix="",
         env_file=_env_files(),
@@ -180,7 +180,6 @@ class LLMSettings(BaseSettings):
     @field_validator("base_url", mode="before")
     @classmethod
     def _normalize_base_url(cls, v: object) -> str:
-        # pydantic-settings may preserve quotes depending on dotenv parsing; normalize here.
         return _strip_quotes(str(v))
 
 
@@ -224,9 +223,6 @@ class QuietHoursSettings(BaseSettings):
     )
 
     enabled: bool = Field(default=True, alias="QUIET_HOURS_ENABLED")
-
-    # Times are local to HOME_AGENT_TIMEZONE.
-    # Quiet windows cross midnight (e.g. 21:00 -> 05:50).
     weekday_start: str = Field(default="21:00", alias="QUIET_HOURS_WEEKDAY_START")
     weekday_end: str = Field(default="05:50", alias="QUIET_HOURS_WEEKDAY_END")
     weekend_start: str = Field(default="21:00", alias="QUIET_HOURS_WEEKEND_START")
@@ -250,28 +246,14 @@ class CamectSettings(BaseSettings):
     host: str = Field(default="", alias="CAMECT_HOST")  # e.g. 10.1.2.150:443
     username: str = Field(default="", alias="CAMECT_USERNAME")
     password: Optional[str] = Field(default=None, alias="CAMECT_PASSWORD")
-
-    # Comma-delimited list of camera names to include (match Camect camera "name" values).
     camera_names: str = Field(default="", alias="CAMECT_CAMERA_NAMES")
-
-    # Optional per-camera filters.
-    # Format examples:
-    #   "Front_Garage:vehicle;Front_Door:person"
-    #   "Front_Garage=vehicle,Front_Door=person"
-    # If provided, this overrides CAMECT_CAMERA_NAMES + CAMECT_EVENT_FILTER behavior.
     camera_rules: str = Field(default="", alias="CAMECT_CAMERA_RULES")
-
-    # Filter token(s) (v1): "vehicle" is the common use case. We match this against event text fields.
     event_filter: str = Field(default="vehicle", alias="CAMECT_EVENT_FILTER")
-
     throttle_seconds: int = Field(default=120, alias="CAMECT_THROTTLE_SECONDS")
     debug: bool = Field(default=False, alias="CAMECT_DEBUG")
     status_interval_seconds: int = Field(default=60, alias="CAMECT_STATUS_INTERVAL_SECONDS")
     stale_warning_seconds: int = Field(default=300, alias="CAMECT_STALE_WARNING_SECONDS")
-    announce_template: str = Field(
-        default="{kind} detected at {camera}.",
-        alias="CAMECT_ANNOUNCE_TEMPLATE",
-    )
+    announce_template: str = Field(default="{kind} detected at {camera}.", alias="CAMECT_ANNOUNCE_TEMPLATE")
 
     @field_validator(
         "host",
@@ -304,22 +286,10 @@ class CamectSettings(BaseSettings):
 
     @property
     def camera_rules_map(self) -> Dict[str, str]:
-        """
-        Parse CAMECT_CAMERA_RULES into {camera_name: filter_token}.
-        """
         raw = (self.camera_rules or "").strip()
         if not raw:
             return {}
-        # Support:
-        # - "Front_Garage:vehicle;Front_Door:person"
-        # - "Front_Garage=vehicle,Front_Door=person"
-        #
-        # Also support multi-token lists per camera by allowing commas inside the
-        # value portion, e.g.:
-        #   "Front_Garage:vehicle,car,truck;Front_Door:person,people"
-        #
-        # We therefore split on ';' always, and only split on ',' when the comma
-        # appears to separate a new "camera[:=]value" rule (not value tokens).
+
         items: List[str] = []
 
         def _split_rules(s: str) -> List[str]:
@@ -336,8 +306,6 @@ class CamectSettings(BaseSettings):
                     i += 1
                     continue
                 if ch == ",":
-                    # Look ahead: if the remainder looks like it starts a new rule
-                    # (contains ':' or '=' before the next separator), treat as rule sep.
                     j = i + 1
                     while j < len(s) and s[j].isspace():
                         j += 1
@@ -352,7 +320,6 @@ class CamectSettings(BaseSettings):
                         buf = []
                         i += 1
                         continue
-                    # Otherwise, comma is part of the value token list.
                 buf.append(ch)
                 i += 1
             tail = "".join(buf).strip()
@@ -373,7 +340,6 @@ class CamectSettings(BaseSettings):
             else:
                 continue
             cam = k.strip()
-            # Allow empty token meaning "no filter" for this camera.
             tok = v.strip() if isinstance(v, str) else ""
             if cam:
                 out[cam] = tok
@@ -389,10 +355,8 @@ class CasetaSettings(BaseSettings):
     )
 
     enabled: bool = Field(default=False, alias="CASETA_ENABLED")
-    host: str = Field(default="", alias="CASETA_HOST")  # bridge IP
+    host: str = Field(default="", alias="CASETA_HOST")
     port: int = Field(default=8081, alias="CASETA_PORT")
-
-    # TLS material generated by `lap-pair`
     ca_cert_path: str = Field(default="", alias="CASETA_CA_CERT_PATH")
     cert_path: str = Field(default="", alias="CASETA_CERT_PATH")
     key_path: str = Field(default="", alias="CASETA_KEY_PATH")
@@ -413,16 +377,10 @@ class CameraLightingSettings(BaseSettings):
 
     enabled: bool = Field(default=False, alias="CAMERA_LIGHTING_ENABLED")
     only_dark: bool = Field(default=True, alias="CAMERA_LIGHTING_ONLY_DARK")
-
-    # Trigger
     camera_name: str = Field(default="Front_Garage", alias="CAMERA_LIGHTING_CAMERA_NAME")
     detected_obj: str = Field(default="vehicle", alias="CAMERA_LIGHTING_DETECTED_OBJ")
-
-    # Action (Caséta)
     caseta_device_id: str = Field(default="10", alias="CAMERA_LIGHTING_CASETA_DEVICE_ID")
     duration_seconds: int = Field(default=600, alias="CAMERA_LIGHTING_DURATION_SECONDS")
-
-    # Avoid spamming on repeated alerts; still extends the timer.
     min_retrigger_seconds: int = Field(default=30, alias="CAMERA_LIGHTING_MIN_RETRIGGER_SECONDS")
 
     @field_validator("camera_name", "detected_obj", "caseta_device_id", mode="before")
@@ -432,10 +390,6 @@ class CameraLightingSettings(BaseSettings):
 
 
 class AppSettings(BaseSettings):
-    """
-    Single place for config. Reads environment variables (and .env if present).
-    """
-
     model_config = SettingsConfigDict(
         env_prefix="",
         env_file=_env_files(),

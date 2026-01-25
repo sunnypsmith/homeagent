@@ -43,24 +43,22 @@ CASETA_KEY_PATH=/home/ml/.config/pylutron_caseta/10.1.2.116.key
 home-agent caseta-agent
 ```
 
-On startup, the agent publishes a retained snapshot event:
+On startup, the agent publishes retained snapshot events:
 - topic: `homeagent/lutron/event`
-- type: `lutron.devices`
-- data: `{ count, devices: [...] }`
+- type: `lutron.devices` (devices list)
+- type: `lutron.scenes` (scenes list; Caséta scenes are virtual buttons)
 
-## Find device IDs
+## Scenes (virtual buttons)
 
-Subscribe and look for the device name you want:
+You can list scenes directly via the LEAP CLI:
 
 ```bash
-mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -t 'homeagent/lutron/event' -v
+leap "<BRIDGE_IP>/virtualbutton"
 ```
 
-Example names look like:
-- `Office_Main Lights`
-- `Front Porch_Pendants`
-
-The corresponding `device_id` is what you use for commands/automations.
+Example:
+- `Bedtime` is `/virtualbutton/1` (scene_id `1`)
+- `Daytime` is `/virtualbutton/2` (scene_id `2`)
 
 ## Test control via MQTT
 
@@ -68,46 +66,43 @@ Publish a command event to:
 - topic: `homeagent/lutron/command`
 - type: `lutron.command`
 
-Turn on:
+Activate a scene by id:
 
 ```bash
 mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t 'homeagent/lutron/command' -m '{
-  "id":"test-on-1",
+  "id":"test-scene-1",
   "ts":"2026-01-01T00:00:00Z",
   "source":"manual",
   "type":"lutron.command",
-  "trace_id":"test-on-1",
-  "data":{"action":"on","device_id":"29"}
+  "trace_id":"test-scene-1",
+  "data":{"action":"scene","scene_id":"2"}
 }'
 ```
 
-Turn off:
+Activate a scene by name:
 
 ```bash
 mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t 'homeagent/lutron/command' -m '{
-  "id":"test-off-1",
+  "id":"test-scene-2",
   "ts":"2026-01-01T00:00:00Z",
   "source":"manual",
   "type":"lutron.command",
-  "trace_id":"test-off-1",
-  "data":{"action":"off","device_id":"29"}
+  "trace_id":"test-scene-2",
+  "data":{"action":"scene","scene_name":"Daytime"}
 }'
 ```
 
-Set dim level (0-100):
+## Schedule a scene (Daytime example)
+
+Weekdays at 6:00am:
 
 ```bash
-mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t 'homeagent/lutron/command' -m '{
-  "id":"test-level-1",
-  "ts":"2026-01-01T00:00:00Z",
-  "source":"manual",
-  "type":"lutron.command",
-  "trace_id":"test-level-1",
-  "data":{"action":"level","device_id":"29","level":50}
-}'
+home-agent add-caseta-scene --name caseta_daytime_weekday_0600 --at 06:00 --days mon-fri --scene-name Daytime
 ```
 
-The agent will publish:
-- `lutron.command.ack` on success
-- `lutron.command.error` on failure
+Weekends at 7:00am:
+
+```bash
+home-agent add-caseta-scene --name caseta_daytime_weekend_0700 --at 07:00 --days sat,sun --scene-name Daytime
+```
 
