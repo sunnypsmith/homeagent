@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 import httpx
@@ -25,6 +26,13 @@ class TodayForecast:
     temp_unit: str
     precip_unit: str
     wind_unit: str
+
+
+@dataclass(frozen=True)
+class SunTimes:
+    sunrise: Optional[datetime]
+    sunset: Optional[datetime]
+    timezone: str
 
 
 class OpenMeteoClient:
@@ -120,4 +128,40 @@ class OpenMeteoClient:
             precip_unit=str(units.get("precipitation_sum") or ""),
             wind_unit=str(units.get("wind_speed_10m_max") or ""),
         )
+
+    async def sun_times_today(self) -> SunTimes:
+        """
+        Fetch today's sunrise/sunset times.
+        Returned datetimes are parsed from Open-Meteo's ISO strings (may be timezone-naive).
+        """
+        params = {
+            "latitude": self._lat,
+            "longitude": self._lon,
+            "daily": "sunrise,sunset",
+            "timezone": "auto",
+        }
+
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        tzname = str(data.get("timezone") or "UTC")
+        daily = data.get("daily") or {}
+
+        def dt0(key: str) -> Optional[datetime]:
+            arr = daily.get(key)
+            if not isinstance(arr, list) or not arr:
+                return None
+            v = arr[0]
+            if not isinstance(v, str) or not v.strip():
+                return None
+            s = v.strip()
+            # Open-Meteo returns local timestamps, often without offset.
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        return SunTimes(sunrise=dt0("sunrise"), sunset=dt0("sunset"), timezone=tzname)
 

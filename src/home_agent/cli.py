@@ -10,6 +10,8 @@ from home_agent.integrations.tts_elevenlabs import ElevenLabsTTSClient
 from home_agent.main import main
 from home_agent.services.event_recorder import main as event_recorder_main
 from home_agent.services.camect_agent import main as camect_agent_main
+from home_agent.services.camera_lighting_agent import main as camera_lighting_agent_main
+from home_agent.services.caseta_agent import main as caseta_agent_main
 from home_agent.services.fixed_announcement_agent import main as fixed_announcement_agent_main
 from home_agent.services.hourly_chime_agent import main as hourly_chime_agent_main
 from home_agent.services.hourly_house_check_agent import main as hourly_house_check_agent_main
@@ -142,6 +144,16 @@ def hourly_house_check_agent() -> None:
 def camect_agent() -> None:
     """Run Camect camera events agent (Camect -> MQTT -> announce.request)."""
     raise SystemExit(camect_agent_main())
+
+@app.command("caseta-agent")
+def caseta_agent() -> None:
+    """Run Lutron Caséta agent (LEAP bridge -> MQTT commands/events)."""
+    raise SystemExit(caseta_agent_main())
+
+@app.command("camera-lighting-agent")
+def camera_lighting_agent() -> None:
+    """Run camera->lighting automation (Camect camera events -> Caséta commands)."""
+    raise SystemExit(camera_lighting_agent_main())
 
 @app.command("fixed-announcement-agent")
 def fixed_announcement_agent() -> None:
