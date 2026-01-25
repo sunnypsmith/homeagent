@@ -36,6 +36,7 @@ class SonosSettings(BaseSettings):
     announce_targets: str = Field(default="", alias="SONOS_ANNOUNCE_TARGETS")
     default_volume: int = Field(default=50, alias="SONOS_DEFAULT_VOLUME")
     announce_concurrency: int = Field(default=3, alias="SONOS_ANNOUNCE_CONCURRENCY")
+    tail_padding_seconds: float = Field(default=3.0, alias="SONOS_TAIL_PADDING_SECONDS")
 
     @field_validator("announce_targets", mode="before")
     @classmethod
@@ -162,6 +163,31 @@ class WeatherSettings(BaseSettings):
     @classmethod
     def _norm_str(cls, v: object) -> str:
         return _strip_quotes(str(v)).strip().lower()
+
+
+class GCalSettings(BaseSettings):
+    """
+    Google Calendar via ICS feed (no OAuth).
+
+    Use the calendar's "Secret address in iCal format" URL and treat it like a password.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="GCAL_ENABLED")
+    ics_url: str = Field(default="", alias="GCAL_ICS_URL")
+    poll_seconds: int = Field(default=600, alias="GCAL_POLL_SECONDS")
+    lookahead_days: int = Field(default=2, alias="GCAL_LOOKAHEAD_DAYS")
+
+    @field_validator("ics_url", mode="before")
+    @classmethod
+    def _norm_url(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
 
 
 class LLMSettings(BaseSettings):
@@ -408,6 +434,7 @@ class AppSettings(BaseSettings):
     mqtt: MqttSettings = MqttSettings()
     db: DbSettings = DbSettings()
     weather: WeatherSettings = WeatherSettings()
+    gcal: GCalSettings = GCalSettings()
     quiet_hours: QuietHoursSettings = QuietHoursSettings()
     camect: CamectSettings = CamectSettings()
     caseta: CasetaSettings = CasetaSettings()

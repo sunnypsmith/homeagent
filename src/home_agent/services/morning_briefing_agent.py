@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 from home_agent.bus.envelope import make_event
 from home_agent.bus.mqtt_client import MqttClient
@@ -10,6 +12,7 @@ from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 from home_agent.integrations.llm import LLMClient
 from home_agent.integrations.llm_router import LLMRouter
+from home_agent.integrations.gcal_ics import GoogleCalendarIcsClient
 from home_agent.integrations.weather_open_meteo import OpenMeteoClient
 
 
@@ -104,6 +107,64 @@ def _format_precip_phrase(value: float, unit: str) -> str:
     return "%.2f %s" % (round(float(value), 2), _spoken_precip_unit(unit))
 
 
+def _spoken_ampm(dt: datetime) -> str:
+    h = int(dt.hour)
+    return "P M" if h >= 12 else "A M"
+
+
+def _spoken_hour_minute(dt: datetime) -> str:
+    h24 = int(dt.hour)
+    h = h24 % 12
+    if h == 0:
+        h = 12
+    m = int(dt.minute)
+    if m == 0:
+        return "%d %s" % (h, _spoken_ampm(dt))
+    return "%d:%02d %s" % (h, m, _spoken_ampm(dt))
+
+
+def _spoken_time(dt: datetime) -> str:
+    """
+    Spoken-friendly time like "9 15 A M" or "2 P M".
+    """
+    h24 = int(dt.hour)
+    h = h24 % 12
+    if h == 0:
+        h = 12
+    m = int(dt.minute)
+    if m == 0:
+        return "%d %s" % (h, _spoken_ampm(dt))
+    return "%d %d %s" % (h, m, _spoken_ampm(dt))
+
+
+def _calendar_payload(events: list[object], *, now_local: datetime) -> Dict[str, Any]:
+    """
+    Build a compact JSON payload for the LLM so it can narrate reliably.
+    """
+    out: Dict[str, Any] = {"date": now_local.date().isoformat(), "events": []}
+
+    items: list[Dict[str, Any]] = []
+    for e in events[:10]:
+        try:
+            title = str(getattr(e, "title", "") or "").strip()
+            if not title:
+                continue
+            all_day = bool(getattr(e, "all_day", False))
+            start = getattr(e, "start", None)
+            item: Dict[str, Any] = {"title": title, "all_day": all_day}
+            if isinstance(start, datetime):
+                item["start_iso"] = start.isoformat()
+                item["start_speech"] = _spoken_time(start)
+                item["start_display"] = _spoken_hour_minute(start)
+            items.append(item)
+        except Exception:
+            continue
+
+    out["events"] = items
+    out["event_count"] = len(items)
+    return out
+
+
 async def run_morning_briefing_agent() -> None:
     settings = AppSettings()
     configure_logging(settings.log_level)
@@ -159,6 +220,11 @@ async def run_morning_briefing_agent() -> None:
             units=settings.weather.units,
             timeout_seconds=settings.weather.timeout_seconds,
         )
+
+    tz = ZoneInfo(settings.timezone)
+    gcal_client: Optional[GoogleCalendarIcsClient] = None
+    if settings.gcal.enabled and settings.gcal.ics_url:
+        gcal_client = GoogleCalendarIcsClient(ics_url=settings.gcal.ics_url, timeout_seconds=20.0)
 
     try:
         while True:
@@ -216,8 +282,31 @@ async def run_morning_briefing_agent() -> None:
                 except Exception:
                     log.warning("weather_failed")
 
-            today = datetime.now().strftime("%A, %B %d").replace(" 0", " ")
+            now_local = datetime.now(tz=tz)
+            today = now_local.strftime("%A, %B %d").replace(" 0", " ")
             weekend_note = "It is the weekend." if variant == "weekend" else "It is a weekday."
+
+            # Always provide JSON, even if empty, so the LLM has deterministic input.
+            calendar_json = json.dumps({"date": now_local.date().isoformat(), "events": [], "event_count": 0}, ensure_ascii=False)
+            if gcal_client is not None:
+                try:
+                    events = await gcal_client.fetch_events(
+                        tz=tz,
+                        start_date=now_local.date(),
+                        days=max(1, int(settings.gcal.lookahead_days)),
+                        max_events=20,
+                    )
+                    # Only speak events starting today.
+                    today_events = [
+                        e
+                        for e in events
+                        if isinstance(getattr(e, "start", None), datetime)
+                        and e.start.date() == now_local.date()
+                    ]
+                    calendar_json = json.dumps(_calendar_payload(today_events, now_local=now_local), ensure_ascii=False)
+                except Exception as e:
+                    # Do not log the ICS URL; treat it like a bearer secret.
+                    log.warning("gcal_failed", error=str(e))
 
             system = (
                 "You are a home morning-briefing generator. "
@@ -227,13 +316,18 @@ async def run_morning_briefing_agent() -> None:
                 f"Today is {today}. {weekend_note}\n\n"
                 "Generate a morning briefing for the Smith Family.\n"
                 "Requirements:\n"
-                "- 3 to 6 sentences total.\n"
+                "- 4 to 7 sentences total.\n"
                 "- Mention today's day.\n"
                 "- Do not suggest activities.\n"
                 "- If a forecast sentence is provided, include it verbatim as its own sentence.\n"
+                "- Use the calendar JSON to narrate today's schedule.\n"
+                "- Only mention calendar events that appear in the calendar JSON. Do not invent.\n"
+                "- Keep event titles verbatim.\n"
+                "- If there are zero events, say there are no calendar events today.\n"
                 '- End with exactly: "Mind how you go."\n'
                 "- Do not use bullet characters.\n\n"
                 f"Forecast sentence (use verbatim, or omit if blank):\n{weather_sentence}\n"
+                f"Calendar JSON (do not repeat verbatim; use it to narrate):\n{calendar_json}\n"
             )
 
             try:

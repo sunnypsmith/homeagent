@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import typer
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging
+from home_agent.bus.envelope import make_event
+from home_agent.bus.mqtt_client import MqttClient
 from home_agent.integrations.audio_host import AudioHost
 from home_agent.integrations.sonos_playback import SonosPlayback
 from home_agent.integrations.tts_elevenlabs import ElevenLabsTTSClient
@@ -131,6 +136,43 @@ def wakeup_agent() -> None:
 def morning_briefing_agent() -> None:
     """Run morning briefing agent (time event -> LLM -> announce.request)."""
     raise SystemExit(morning_briefing_agent_main())
+
+@app.command("trigger-morning-briefing")
+def trigger_morning_briefing() -> None:
+    """Publish a time event to trigger the morning briefing immediately."""
+    settings = AppSettings()
+    configure_logging(settings.log_level)
+
+    tz = ZoneInfo(settings.timezone)
+    now_local = datetime.now(tz=tz)
+    # Saturday=5, Sunday=6
+    variant = "weekend" if now_local.weekday() >= 5 else "weekday"
+
+    topic = f"{settings.mqtt.base_topic}/time/cron/morning_briefing"
+    evt = make_event(
+        source="manual",
+        typ="time.cron.morning_briefing",
+        data={"variant": variant, "manual": True},
+    )
+
+    import asyncio
+
+    async def _run() -> None:
+        mqttc = MqttClient(
+            host=settings.mqtt.host,
+            port=settings.mqtt.port,
+            username=settings.mqtt.username,
+            password=settings.mqtt.password,
+            client_id="homeagent-trigger-morning-briefing",
+        )
+        await mqttc.connect()
+        try:
+            mqttc.publish_json(topic, evt)
+        finally:
+            await mqttc.close()
+
+    asyncio.run(_run())
+    typer.echo("Published %s to %s" % (evt["type"], topic))
 
 
 @app.command("hourly-chime-agent")

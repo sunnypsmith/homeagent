@@ -200,6 +200,7 @@ async def run_sonos_gateway() -> None:
                     volume=volume,
                     title="Home Agent",
                     concurrency=concurrency,
+                    tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
                 )
                 log.info("announce_done")
             except Exception:
