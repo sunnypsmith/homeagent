@@ -173,6 +173,21 @@ async def run_time_trigger() -> None:
             name=s.name,
             replace_existing=True,
         )
+        # Debug visibility: show that the schedule was registered and when it will run next.
+        try:
+            job = scheduler.get_job(job_id)
+            nrt = getattr(job, "next_run_time", None) if job is not None else None
+            log.debug(
+                "schedule_registered",
+                schedule=s.name,
+                job_id=job_id,
+                kind=s.kind,
+                spec=s.spec,
+                timezone=s.timezone,
+                next_run_time=str(nrt) if nrt is not None else None,
+            )
+        except Exception:
+            pass
 
     def load_schedules() -> List[ScheduleRow]:
         def _do(conn) -> List[ScheduleRow]:
@@ -206,6 +221,9 @@ async def run_time_trigger() -> None:
     last_reload_started_at = 0.0
     last_reload_finished_at = 0.0
     reload_inflight = False
+    last_schedules_count: int = 0
+    last_schedules_enabled: int = 0
+    last_schedules_sample: list[str] = []
 
     def load_schedules_daemon() -> "asyncio.Future[List[ScheduleRow]]":
         """
@@ -237,6 +255,7 @@ async def run_time_trigger() -> None:
             try:
                 nonlocal last_reload_started_at, last_reload_finished_at
                 nonlocal reload_inflight
+                nonlocal last_schedules_count, last_schedules_enabled, last_schedules_sample
 
                 if reload_inflight:
                     log.warning("schedules_reload_skipped", reason="previous_reload_still_running")
@@ -254,7 +273,16 @@ async def run_time_trigger() -> None:
                 # Replace all jobs based on current DB view.
                 for s in schedules:
                     add_or_replace_job(s)
-                log.info("schedules_loaded", count=len(schedules))
+                last_schedules_count = int(len(schedules))
+                last_schedules_enabled = int(sum(1 for s in schedules if s.enabled))
+                # Keep log output compact: sample a few names for visibility.
+                last_schedules_sample = [s.name for s in schedules[:8]]
+                log.info(
+                    "schedules_loaded",
+                    count=last_schedules_count,
+                    enabled=last_schedules_enabled,
+                    sample=last_schedules_sample,
+                )
                 last_reload_finished_at = loop.time()
                 reload_inflight = False
             except Exception:
@@ -288,6 +316,9 @@ async def run_time_trigger() -> None:
                 mqtt_queue_size=st.get("queue_size"),
                 mqtt_queue_max=st.get("queue_maxsize"),
                 mqtt_dropped_total=st.get("dropped_total"),
+                schedules_reload_inflight=bool(reload_inflight),
+                schedules_loaded_count=last_schedules_count,
+                schedules_enabled_count=last_schedules_enabled,
                 schedules_last_reload_age_seconds=reload_age,
                 schedules_reload_runtime_seconds=reload_runtime,
             )

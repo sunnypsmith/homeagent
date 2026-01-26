@@ -20,6 +20,7 @@ All messages on MQTT use the same JSON envelope:
   - **Quiet hours are enforced here** (announcements are suppressed during quiet hours).
 - **`time-trigger`**: loads schedules from Postgres (`schedules` table) and publishes time events to MQTT
 - **`event-recorder`**: subscribes to MQTT topics and records all events to TimescaleDB (`events` table)
+- **`ui-gateway`** (optional): simple LAN web UI with buttons that publish MQTT `announce.request` events
 
 ### Agents (examples)
 - **`wakeup-agent`**: consumes `time.cron.wakeup_call` and emits `announce.request`

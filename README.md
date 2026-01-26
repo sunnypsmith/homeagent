@@ -35,6 +35,7 @@ pip install -e ".[sonos]"   # Sonos discovery + playback
 pip install -e ".[gcal]"    # Calendar ICS parsing (Google/iCloud)
 pip install -e ".[camect]"  # Camect hub integration
 pip install -e ".[caseta]"  # Lutron Caséta integration (+ CLI tools)
+pip install -e ".[ui]"      # Simple LAN web UI (buttons -> MQTT announce.request)
 ```
 
 ## Quick start (Docker / recommended on Linux)
@@ -68,6 +69,7 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent sonos-gateway`: MQTT `announce.request` -> TTS -> play on Sonos
 - `home-agent time-trigger`: DB schedules -> MQTT time events
 - `home-agent event-recorder`: MQTT events -> TimescaleDB
+- `home-agent ui-gateway`: simple LAN web UI (buttons -> MQTT announce.request)
 - `home-agent wakeup-agent`: time event -> announce.request
 - `home-agent morning-briefing-agent`: time event -> weather + LLM (+ optional calendar ICS) -> announce.request
 - `home-agent hourly-chime-agent`: time event -> announce.request
@@ -112,6 +114,29 @@ mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t 'homeagent/announce/request' -m
 ```bash
 home-agent trigger-morning-briefing
 ```
+
+### Simple LAN web UI (buttons)
+
+Enable the UI service (example LAN IP):
+
+```bash
+UI_ENABLED=true
+UI_BIND_HOST=10.1.1.111
+UI_PORT=8001
+UI_TITLE=Smith Home Agent
+UI_ACTION_1=dinner|Call to Dinner|Dinner time. Please come to the table.
+UI_ACTION_2=kids_up|Kids Upstairs|Kids, please come upstairs.
+```
+
+Run it:
+
+```bash
+home-agent ui-gateway
+```
+
+Then open on your iPhone:
+
+- `http://10.1.1.111:8001/`
 
 ### Fixed announcements (DB-backed schedules)
 

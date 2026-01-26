@@ -46,6 +46,7 @@ async def run_event_recorder() -> None:
     )
     await mqttc.connect()
     mqttc.subscribe(topic)
+    log.info("mqtt_connected", host=settings.mqtt.host, port=settings.mqtt.port)
     log.info("subscribed", topic=topic)
 
     db = DbManager(
@@ -73,6 +74,9 @@ async def run_event_recorder() -> None:
         "last_topic": None,
         "last_type": None,
     }
+    last_insert_ok_at = 0.0
+    last_insert_err_at = 0.0
+    last_insert_err_kind: Optional[str] = None
 
     def insert_row(
         ts: datetime,
@@ -120,7 +124,35 @@ async def run_event_recorder() -> None:
             stats["json_ok"] = 0
             stats["json_err"] = 0
 
+    async def status_loop() -> None:
+        """
+        High-signal liveness output so we can quickly tell if the recorder is healthy.
+        """
+        nonlocal last_insert_ok_at, last_insert_err_at, last_insert_err_kind
+        while True:
+            await asyncio.sleep(10)
+            now = loop.time()
+            mqtt_stats = mqttc.stats()
+
+            ok_age = round(now - last_insert_ok_at, 1) if last_insert_ok_at > 0 else None
+            err_age = round(now - last_insert_err_at, 1) if last_insert_err_at > 0 else None
+
+            log.info(
+                "status",
+                mqtt_connected=bool(mqtt_stats.get("connected", 0)),
+                mqtt_queue_size=mqtt_stats.get("queue_size"),
+                mqtt_queue_max=mqtt_stats.get("queue_maxsize"),
+                mqtt_dropped_total=mqtt_stats.get("dropped_total"),
+                db_connected=db.is_connected(),
+                last_insert_ok_age_seconds=ok_age,
+                last_insert_err_age_seconds=err_age,
+                last_insert_err_kind=last_insert_err_kind,
+                last_topic=stats.get("last_topic"),
+                last_type=stats.get("last_type"),
+            )
+
     reporter_task = asyncio.create_task(stats_reporter())
+    status_task = asyncio.create_task(status_loop())
 
     try:
         while True:
@@ -158,11 +190,15 @@ async def run_event_recorder() -> None:
             try:
                 await loop.run_in_executor(None, insert_row, ts, msg.topic, source, typ, event_id, trace_id, payload_json)
                 stats["insert_ok"] += 1
+                last_insert_ok_at = loop.time()
             except Exception:
                 stats["insert_err"] += 1
+                last_insert_err_at = loop.time()
+                last_insert_err_kind = "insert_failed"
                 log.exception("insert_failed", topic=msg.topic)
     finally:
         reporter_task.cancel()
+        status_task.cancel()
         db.close()
         await mqttc.close()
 

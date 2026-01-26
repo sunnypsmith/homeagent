@@ -56,6 +56,20 @@ class DbManager:
     def log_info(self) -> DbConnectInfo:
         return self._log_info
 
+    def is_connected(self) -> bool:
+        """
+        Best-effort connection indicator for status logs.
+        """
+        if self._closing.is_set():
+            return False
+        if self._lock.acquire(timeout=0.1):
+            try:
+                return bool(self._conn is not None and not self._conn.closed)
+            finally:
+                self._lock.release()
+        # If we can't acquire quickly, assume "unknown / likely connected".
+        return True
+
     def close(self) -> None:
         # Make shutdown non-blocking: if a DB op is in progress on another thread,
         # we prefer to exit cleanly rather than hang waiting for a lock.
@@ -128,14 +142,17 @@ class DbManager:
         """
         Run a DB operation and reconnect on transient connection failures.
         """
-        # We serialize access. Our current workloads are small, and this avoids
-        # thread-safety surprises when used from run_in_executor threads.
         if self._closing.is_set():
             raise RuntimeError("db_closing")
 
+        # Ensure a connection exists (ensure_connected() does not hold the lock while
+        # sleeping/connecting).
+        self.ensure_connected()
+
         # Serialize operations so we don't share a connection concurrently across threads.
         with self._lock:
-            self.ensure_connected()
+            if self._closing.is_set():
+                raise RuntimeError("db_closing")
             assert self._conn is not None
             conn = self._conn
 
@@ -144,12 +161,18 @@ class DbManager:
             except (psycopg.OperationalError, psycopg.InterfaceError):
                 if retries <= 0 or self._closing.is_set():
                     raise
+                # Drop the bad connection.
                 try:
                     conn.close()
                 except Exception:
                     pass
                 self._conn = None
-                self.ensure_connected()
-                assert self._conn is not None
-                return fn(self._conn)
+
+        # Reconnect and retry once outside the lock.
+        self.ensure_connected()
+        with self._lock:
+            if self._closing.is_set():
+                raise RuntimeError("db_closing")
+            assert self._conn is not None
+            return fn(self._conn)
 

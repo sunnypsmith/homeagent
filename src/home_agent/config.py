@@ -516,6 +516,106 @@ class CameraLightingSettings(BaseSettings):
         return _strip_quotes(str(v)).strip()
 
 
+class UiSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="UI_ENABLED")
+    bind_host: str = Field(default="127.0.0.1", alias="UI_BIND_HOST")
+    port: int = Field(default=8001, alias="UI_PORT")
+    title: str = Field(default="Home Agent", alias="UI_TITLE")
+    # Format: "id|Label|Text|targets(optional)|volume(optional)|concurrency(optional);..."
+    actions: str = Field(default="", alias="UI_ACTIONS")
+    # Alternative, easier-to-edit format: one action per env var line.
+    # (We define a finite set to keep parsing simple and dotenv-friendly.)
+    action_1: str = Field(default="", alias="UI_ACTION_1")
+    action_2: str = Field(default="", alias="UI_ACTION_2")
+    action_3: str = Field(default="", alias="UI_ACTION_3")
+    action_4: str = Field(default="", alias="UI_ACTION_4")
+    action_5: str = Field(default="", alias="UI_ACTION_5")
+    action_6: str = Field(default="", alias="UI_ACTION_6")
+    action_7: str = Field(default="", alias="UI_ACTION_7")
+    action_8: str = Field(default="", alias="UI_ACTION_8")
+    action_9: str = Field(default="", alias="UI_ACTION_9")
+    action_10: str = Field(default="", alias="UI_ACTION_10")
+    action_11: str = Field(default="", alias="UI_ACTION_11")
+    action_12: str = Field(default="", alias="UI_ACTION_12")
+    action_13: str = Field(default="", alias="UI_ACTION_13")
+    action_14: str = Field(default="", alias="UI_ACTION_14")
+    action_15: str = Field(default="", alias="UI_ACTION_15")
+    action_16: str = Field(default="", alias="UI_ACTION_16")
+    action_17: str = Field(default="", alias="UI_ACTION_17")
+    action_18: str = Field(default="", alias="UI_ACTION_18")
+    action_19: str = Field(default="", alias="UI_ACTION_19")
+    action_20: str = Field(default="", alias="UI_ACTION_20")
+
+    @field_validator("bind_host", "title", "actions", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+    def actions_list(self) -> List[Dict[str, object]]:
+        # Prefer per-line UI_ACTION_N entries when present.
+        per_line: List[str] = []
+        for i in range(1, 21):
+            v = getattr(self, f"action_{i}", "") or ""
+            v = _strip_quotes(str(v)).strip()
+            if v:
+                per_line.append(v)
+        if per_line:
+            return _parse_ui_action_entries(per_line)
+
+        # Otherwise fall back to the single-string UI_ACTIONS value.
+        raw = _strip_quotes(self.actions or "").strip()
+        if not raw:
+            return [
+                {"id": "dinner", "label": "Call to Dinner", "text": "Dinner time. Please come to the table."},
+                {"id": "kids_up", "label": "Kids Upstairs", "text": "Kids, please come upstairs."},
+            ]
+
+        entries = [c.strip() for c in raw.split(";") if c.strip()]
+        return _parse_ui_action_entries(entries)
+
+
+def _parse_ui_action_entries(entries: List[str]) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    for item in entries:
+        parts = [p.strip() for p in str(item).split("|")]
+        if len(parts) < 3:
+            continue
+        action_id, label, text = parts[0], parts[1], parts[2]
+        if not action_id or not label or not text:
+            continue
+
+        data: Dict[str, object] = {"id": action_id, "label": label, "text": text}
+
+        if len(parts) >= 4 and parts[3]:
+            t = [p.strip() for p in str(parts[3]).split(",")]
+            t = [p for p in t if p]
+            if t:
+                data["targets"] = t
+
+        if len(parts) >= 5 and parts[4]:
+            try:
+                v = int(float(parts[4]))
+                data["volume"] = max(0, min(100, v))
+            except Exception:
+                pass
+
+        if len(parts) >= 6 and parts[5]:
+            try:
+                c = int(float(parts[5]))
+                data["concurrency"] = max(1, c)
+            except Exception:
+                pass
+
+        out.append(data)
+    return out
+
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="",
@@ -540,4 +640,5 @@ class AppSettings(BaseSettings):
     camect: CamectSettings = CamectSettings()
     caseta: CasetaSettings = CasetaSettings()
     camera_lighting: CameraLightingSettings = CameraLightingSettings()
+    ui: UiSettings = UiSettings()
 

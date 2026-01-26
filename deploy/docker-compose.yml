@@ -149,6 +149,19 @@ services:
     command: ["home-agent", "camera-lighting-agent"]
     depends_on: [mqtt, db]
 
+  # Optional: simple LAN web UI (buttons -> MQTT announce.request)
+  ui-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: home-ui-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../.env:/workspace/.env:ro
+    command: ["home-agent", "ui-gateway"]
+    depends_on: [mqtt]
+
 volumes:
   mosquitto_data:
   mosquitto_log:

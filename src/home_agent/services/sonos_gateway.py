@@ -81,6 +81,7 @@ async def run_sonos_gateway() -> None:
         client_id="homeagent-sonos-gateway",
     )
     await mqttc.connect()
+    log.info("mqtt_connected", host=settings.mqtt.host, port=settings.mqtt.port)
 
     topic = "%s/announce/request" % settings.mqtt.base_topic
     mqttc.subscribe(topic)
@@ -89,9 +90,56 @@ async def run_sonos_gateway() -> None:
     tz = ZoneInfo(settings.timezone)
     suppressed_topic = "%s/announce/suppressed" % settings.mqtt.base_topic
 
+    loop = asyncio.get_running_loop()
+    last_request_at = 0.0
+    last_ok_at = 0.0
+    last_err_at = 0.0
+    last_err_kind: str | None = None
+    suppressed_total = 0
+    ok_total = 0
+    err_total = 0
+
+    async def status_loop() -> None:
+        nonlocal last_request_at, last_ok_at, last_err_at, last_err_kind
+        while True:
+            await asyncio.sleep(10.0)
+            now = loop.time()
+            mqtt_stats = mqttc.stats()
+            host_stats = host.stats()
+
+            req_age = round(now - last_request_at, 1) if last_request_at > 0 else None
+            ok_age = round(now - last_ok_at, 1) if last_ok_at > 0 else None
+            err_age = round(now - last_err_at, 1) if last_err_at > 0 else None
+
+            log.info(
+                "status",
+                mqtt_connected=bool(mqtt_stats.get("connected", 0)),
+                mqtt_queue_size=mqtt_stats.get("queue_size"),
+                mqtt_queue_max=mqtt_stats.get("queue_maxsize"),
+                mqtt_dropped_total=mqtt_stats.get("dropped_total"),
+                # sonos-gateway does not connect to DB (event-recorder does)
+                db_connected=None,
+                announce_targets=len(targets),
+                speaker_volume_overrides=len(settings.sonos.speaker_volume_map),
+                quiet_hours_enabled=bool(settings.quiet_hours.enabled),
+                audio_host_started=bool(host_stats.get("started")),
+                audio_host_base_url=host_stats.get("base_url"),
+                audio_host_active_files=host_stats.get("active_files"),
+                last_request_age_seconds=req_age,
+                last_ok_age_seconds=ok_age,
+                last_err_age_seconds=err_age,
+                ok_total=ok_total,
+                err_total=err_total,
+                suppressed_total=suppressed_total,
+                last_err_kind=last_err_kind,
+            )
+
+    status_task = asyncio.create_task(status_loop())
+
     try:
         while True:
             msg = await mqttc.next_message()
+            last_request_at = loop.time()
             try:
                 payload: Dict[str, Any] = msg.json()
             except Exception:
@@ -149,6 +197,7 @@ async def run_sonos_gateway() -> None:
                     quiet = True
 
                 if quiet:
+                    suppressed_total += 1
                     log.warning(
                         "announce_suppressed",
                         id=event_id,
@@ -210,10 +259,16 @@ async def run_sonos_gateway() -> None:
                     concurrency=concurrency,
                     tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
                 )
+                ok_total += 1
+                last_ok_at = loop.time()
                 log.info("announce_done")
             except Exception:
+                err_total += 1
+                last_err_at = loop.time()
+                last_err_kind = "announce_failed"
                 log.exception("announce_failed")
     finally:
+        status_task.cancel()
         await mqttc.close()
 
 

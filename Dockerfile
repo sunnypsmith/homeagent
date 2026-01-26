@@ -14,9 +14,9 @@ COPY scripts ./scripts
 COPY docs ./docs
 
 # Install extras used by the service stack.
-# (Sonos playback, Camect, Caséta, Calendar ICS parsing)
+# (Sonos playback, Camect, Caséta, Calendar ICS parsing, Web UI)
 RUN python -m pip install --upgrade pip \
-  && python -m pip install ".[sonos,camect,caseta,gcal]"
+  && python -m pip install ".[sonos,camect,caseta,gcal,ui]"
 
 CMD ["home-agent", "run"]
 

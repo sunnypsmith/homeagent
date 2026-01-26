@@ -24,6 +24,7 @@ from home_agent.services.camect_agent import main as camect_agent_main
 from home_agent.services.camera_lighting_agent import main as camera_lighting_agent_main
 from home_agent.services.sonos_gateway import main as sonos_gateway_main
 from home_agent.services.time_trigger import main as time_trigger_main
+from home_agent.services.ui_gateway import main as ui_gateway_main
 from home_agent.services.wakeup_agent import main as wakeup_agent_main
 
 app = typer.Typer(no_args_is_help=True)
@@ -212,6 +213,12 @@ def time_trigger() -> None:
     raise SystemExit(time_trigger_main())
 
 
+@app.command("ui-gateway")
+def ui_gateway() -> None:
+    """Run simple LAN web UI (buttons -> MQTT announce.request)."""
+    raise SystemExit(ui_gateway_main())
+
+
 @app.command("wakeup-agent")
 def wakeup_agent() -> None:
     """Run wakeup call agent (time event -> announce.request)."""
@@ -250,6 +257,39 @@ def trigger_morning_briefing() -> None:
             username=settings.mqtt.username,
             password=settings.mqtt.password,
             client_id="homeagent-trigger-morning-briefing",
+        )
+        await mqttc.connect()
+        try:
+            mqttc.publish_json(topic, evt)
+        finally:
+            await mqttc.close()
+
+    asyncio.run(_run())
+    typer.echo("Published %s to %s" % (evt["type"], topic))
+
+
+@app.command("trigger-hourly-chime")
+def trigger_hourly_chime() -> None:
+    """Publish a time event to trigger the hourly chime immediately."""
+    settings = AppSettings()
+    configure_logging(settings.log_level)
+
+    topic = f"{settings.mqtt.base_topic}/time/cron/hourly_chime"
+    evt = make_event(
+        source="manual",
+        typ="time.cron.hourly_chime",
+        data={"manual": True},
+    )
+
+    import asyncio
+
+    async def _run() -> None:
+        mqttc = MqttClient(
+            host=settings.mqtt.host,
+            port=settings.mqtt.port,
+            username=settings.mqtt.username,
+            password=settings.mqtt.password,
+            client_id="homeagent-trigger-hourly-chime",
         )
         await mqttc.connect()
         try:

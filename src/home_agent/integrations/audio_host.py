@@ -73,6 +73,18 @@ class AudioHost:
         url = f"{self._base_url}/{unique}"
         return HostedAudio(url=url, content_type=content_type)
 
+    def stats(self) -> dict[str, object]:
+        """
+        Lightweight status for heartbeats/logging.
+        """
+        with self._lock:
+            return {
+                "started": bool(self._httpd is not None and self._base_url is not None),
+                "base_url": self._base_url,
+                "active_files": int(len(self._expires_at)),
+                "ttl_seconds": float(self._ttl_seconds),
+            }
+
     def close(self) -> None:
         """
         Best-effort shutdown (mostly used in short-lived CLI commands).

@@ -33,6 +33,7 @@ Key fields:
 - Camect (optional): `CAMECT_*`
 - Caséta + camera lighting (optional): `CASETA_*`, `CAMERA_LIGHTING_*`
   - If you run `caseta-agent` via Compose, also set `CASETA_CERTS_DIR` (host path) so the certs can be mounted into the container at `/certs`.
+- Web UI (optional): `UI_*` (bind to your LAN IP, e.g. `UI_BIND_HOST=10.1.1.111`, `UI_PORT=8001`)
 
 ## 2) Start the stack
 

@@ -104,6 +104,13 @@ tmux send-keys -t "$SESSION:2.1" "$(cmd caseta 'HOME_AGENT_LOG_LEVEL=INFO home-a
 tmux send-keys -t "$SESSION:2.2" "$(cmd camera-lighting 'HOME_AGENT_LOG_LEVEL=INFO home-agent camera-lighting-agent')" C-m
 tmux send-keys -t "$SESSION:2.3" "cd /workspace" C-m
 
+#
+# Window 3: ui (single pane)
+#
+tmux new-window -t "$SESSION:3" -n ui
+tmux select-pane -t "$SESSION:3.0" -T "ui-gateway"
+tmux send-keys -t "$SESSION:3.0" "$(cmd ui-gateway 'HOME_AGENT_LOG_LEVEL=INFO home-agent ui-gateway')" C-m
+
 tmux select-window -t "$SESSION:0"
 exec tmux attach -t "$SESSION"
 
