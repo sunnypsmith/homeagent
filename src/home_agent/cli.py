@@ -25,6 +25,7 @@ from home_agent.services.camera_lighting_agent import main as camera_lighting_ag
 from home_agent.services.sonos_gateway import main as sonos_gateway_main
 from home_agent.services.time_trigger import main as time_trigger_main
 from home_agent.services.ui_gateway import main as ui_gateway_main
+from home_agent.services.monitor_tui import main as monitor_main
 from home_agent.services.wakeup_agent import main as wakeup_agent_main
 
 app = typer.Typer(no_args_is_help=True)
@@ -217,6 +218,16 @@ def time_trigger() -> None:
 def ui_gateway() -> None:
     """Run simple LAN web UI (buttons -> MQTT announce.request)."""
     raise SystemExit(ui_gateway_main())
+
+
+@app.command("monitor")
+def monitor(
+    topic: str = typer.Option(None, "--topic", help="MQTT topic filter (default: <base>/#)"),
+    refresh: float = typer.Option(0.5, "--refresh", help="UI refresh seconds (default: 0.5)"),
+    rows: int = typer.Option(20, "--rows", help="Max rows in services table (default: 20)"),
+) -> None:
+    """Terminal dashboard (MQTT activity + process/container hints)."""
+    raise SystemExit(monitor_main(topic=topic, refresh_seconds=float(refresh), max_rows=int(rows)))
 
 
 @app.command("wakeup-agent")

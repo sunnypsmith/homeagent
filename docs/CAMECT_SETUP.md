@@ -57,6 +57,18 @@ Notes:
 CAMECT_THROTTLE_SECONDS=120
 CAMECT_ANNOUNCE_TEMPLATE=Your attention please. A {kind} was detected at {camera}.
 
+# Optional: comma-delimited list of recipients to email snapshot images to (empty disables)
+CAMECT_EMAIL_ALERT_PICS_TO=you@example.com
+
+# Global SMTP (required if CAMECT_EMAIL_ALERT_PICS_TO is set)
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=you@example.com
+SMTP_PASSWORD=APP_PASSWORD_OR_SMTP_PASSWORD
+SMTP_FROM=Home Agent <you@example.com>
+SMTP_USE_STARTTLS=true
+SMTP_USE_SSL=false
+
 # Debug/observability:
 CAMECT_DEBUG=false
 CAMECT_STATUS_INTERVAL_SECONDS=60

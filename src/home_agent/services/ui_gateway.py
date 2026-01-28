@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -14,6 +15,25 @@ def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[
     # Single-file, dependency-free UI (no external assets) for iPhone.
     # Big touch targets, safe-area padding, and a simple “toast” area.
     cards = []
+    # Built-in controls.
+    cards.append(
+        """
+        <form method="post" action="/mute/60" class="card">
+          <button type="submit" class="btn btn-danger" aria-label="Mute Sonos announcements for 1 hour">
+            <span class="label">Mute (1 hour)</span>
+          </button>
+        </form>
+        """
+    )
+    cards.append(
+        """
+        <form method="post" action="/unmute" class="card">
+          <button type="submit" class="btn btn-subtle" aria-label="Unmute Sonos announcements">
+            <span class="label">Unmute</span>
+          </button>
+        </form>
+        """
+    )
     for a in actions:
         aid = str(a.get("id") or "").strip()
         label = str(a.get("label") or "").strip()
@@ -109,6 +129,15 @@ def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[
         -webkit-tap-highlight-color: transparent;
         transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
       }}
+      .btn-danger {{
+        border-color: rgba(251,113,133,0.35);
+        background: linear-gradient(180deg, rgba(251,113,133,0.18), rgba(255,255,255,0.03));
+      }}
+      .btn-subtle {{
+        border-color: rgba(255,255,255,0.06);
+        background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+        color: rgba(255,255,255,0.84);
+      }}
       .btn:active {{
         transform: scale(0.98);
         background: linear-gradient(180deg, var(--card2), rgba(255,255,255,0.04));
@@ -131,7 +160,7 @@ def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[
     <div class="wrap">
       <header>
         <h1>{title}</h1>
-        <div class="sub">Tap an action</div>
+        <div class="sub">Tap a button</div>
       </header>
       <div class="grid">
         {cards_html}
@@ -214,6 +243,34 @@ async def run_ui_gateway() -> None:
         mqttc.publish_json(topic, evt)
         log.info("action_triggered", action=action_id)
         return RedirectResponse(url="/?toast=" + quote("Sent: " + str(a.get("label") or action_id)), status_code=303)
+
+    @app.post("/mute/{minutes}")
+    async def mute(minutes: int) -> RedirectResponse:
+        mins = int(minutes)
+        if mins <= 0:
+            return RedirectResponse(url="/?toast=" + quote("Minutes must be > 0"), status_code=303)
+
+        now = datetime.now(timezone.utc)
+        muted_until = now + timedelta(minutes=mins)
+        data: Dict[str, Any] = {
+            "duration_minutes": mins,
+            "muted_until_unix": int(muted_until.timestamp()),
+        }
+
+        topic = f"{settings.mqtt.base_topic}/announce/mute"
+        evt = make_event(source="ui-gateway", typ="announce.mute", data=data)
+        mqttc.publish_json(topic, evt, retain=True)
+        log.info("mute_requested", minutes=mins, muted_until=str(muted_until))
+        return RedirectResponse(url="/?toast=" + quote(f"Muted for {mins} minutes"), status_code=303)
+
+    @app.post("/unmute")
+    async def unmute() -> RedirectResponse:
+        data: Dict[str, Any] = {"muted_until_unix": 0}
+        topic = f"{settings.mqtt.base_topic}/announce/mute"
+        evt = make_event(source="ui-gateway", typ="announce.mute", data=data)
+        mqttc.publish_json(topic, evt, retain=True)
+        log.info("unmute_requested")
+        return RedirectResponse(url="/?toast=" + quote("Unmuted"), status_code=303)
 
     config = uvicorn.Config(
         app,

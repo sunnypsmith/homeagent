@@ -80,6 +80,21 @@ docker exec -it home-time-trigger home-agent seed-schedules
 
 ## Common examples
 
+### Global SMTP (optional)
+
+Used by modules that send email (e.g. Camect snapshot-to-email).
+
+```bash
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=you@example.com
+SMTP_PASSWORD=APP_PASSWORD_OR_SMTP_PASSWORD
+SMTP_FROM=Home Agent <you@example.com>
+SMTP_USE_STARTTLS=true
+SMTP_USE_SSL=false
+SMTP_TIMEOUT_SECONDS=20
+```
+
 ### Sonos discovery (writes `SONOS_ANNOUNCE_TARGETS`)
 
 ```bash
@@ -176,6 +191,7 @@ CAMECT_HOST=10.1.2.150:443
 CAMECT_USERNAME=admin
 CAMECT_PASSWORD=YOUR_PASSWORD
 CAMECT_CAMERA_RULES="Front_Garage:vehicle,car,truck,van,suv;Front_Door:person,people,human"
+CAMECT_EMAIL_ALERT_PICS_TO=you@example.com
 
 # Camera lighting (turn on selected Caséta devices for 10 minutes, only when dark)
 CAMERA_LIGHTING_ENABLED=true

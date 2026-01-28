@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from zoneinfo import ZoneInfo
@@ -89,6 +89,9 @@ async def run_sonos_gateway() -> None:
 
     tz = ZoneInfo(settings.timezone)
     suppressed_topic = "%s/announce/suppressed" % settings.mqtt.base_topic
+    mute_topic = "%s/announce/mute" % settings.mqtt.base_topic
+    mqttc.subscribe(mute_topic)
+    log.info("subscribed", topic=mute_topic)
 
     loop = asyncio.get_running_loop()
     last_request_at = 0.0
@@ -98,14 +101,21 @@ async def run_sonos_gateway() -> None:
     suppressed_total = 0
     ok_total = 0
     err_total = 0
+    muted_until_unix = 0
 
     async def status_loop() -> None:
-        nonlocal last_request_at, last_ok_at, last_err_at, last_err_kind
+        nonlocal last_request_at, last_ok_at, last_err_at, last_err_kind, muted_until_unix
         while True:
             await asyncio.sleep(10.0)
             now = loop.time()
             mqtt_stats = mqttc.stats()
             host_stats = host.stats()
+            now_unix = int(datetime.now(timezone.utc).timestamp())
+            muted_remaining_s = max(0, int(muted_until_unix) - now_unix) if muted_until_unix else 0
+            if muted_until_unix and muted_remaining_s <= 0:
+                # Avoid confusing "stale" mute timestamps in logs after expiry.
+                muted_until_unix = 0
+                log.info("mute_expired")
 
             req_age = round(now - last_request_at, 1) if last_request_at > 0 else None
             ok_age = round(now - last_ok_at, 1) if last_ok_at > 0 else None
@@ -122,6 +132,9 @@ async def run_sonos_gateway() -> None:
                 announce_targets=len(targets),
                 speaker_volume_overrides=len(settings.sonos.speaker_volume_map),
                 quiet_hours_enabled=bool(settings.quiet_hours.enabled),
+                muted=bool(muted_until_unix and muted_remaining_s > 0),
+                muted_remaining_seconds=muted_remaining_s if muted_until_unix else None,
+                muted_until_unix=int(muted_until_unix) if muted_until_unix else None,
                 audio_host_started=bool(host_stats.get("started")),
                 audio_host_base_url=host_stats.get("base_url"),
                 audio_host_active_files=host_stats.get("active_files"),
@@ -166,9 +179,6 @@ async def run_sonos_gateway() -> None:
             if not (isinstance(typ, str) and typ):
                 log.warning("bad_event", reason="missing_type", id=event_id)
                 continue
-            if typ != "announce.request":
-                log.warning("bad_event", reason="unexpected_type", id=event_id, type=typ)
-                continue
             if not (isinstance(trace_id, str) and trace_id):
                 log.warning("bad_event", reason="missing_trace_id", id=event_id)
                 continue
@@ -176,10 +186,71 @@ async def run_sonos_gateway() -> None:
                 log.warning("bad_event", reason="missing_data", id=event_id)
                 continue
 
+            # Announce mute control. Intended to be published as a retained message so
+            # it survives sonos-gateway restarts (broker replays retained on subscribe).
+            if typ == "announce.mute":
+                mtu = data.get("muted_until_unix")
+                if isinstance(mtu, bool):
+                    mtu = None
+                if isinstance(mtu, str) and mtu.isdigit():
+                    mtu = int(mtu)
+                if isinstance(mtu, int):
+                    muted_until_unix = max(0, int(mtu))
+                    if muted_until_unix:
+                        dt_utc = datetime.fromtimestamp(muted_until_unix, tz=timezone.utc)
+                        dt_local = dt_utc.astimezone(tz)
+                        log.warning(
+                            "mute_set",
+                            id=event_id,
+                            trace_id=trace_id,
+                            source=source,
+                            muted_until_unix=muted_until_unix,
+                            muted_until_utc=str(dt_utc),
+                            muted_until_local=str(dt_local),
+                        )
+                    else:
+                        log.info("mute_cleared", id=event_id, trace_id=trace_id, source=source)
+                else:
+                    log.warning("bad_event", reason="missing_muted_until_unix", id=event_id)
+                continue
+
+            if typ != "announce.request":
+                log.warning("bad_event", reason="unexpected_type", id=event_id, type=typ)
+                continue
+
             text = str(data.get("text") or "").strip()
             if not text:
                 log.warning("bad_event", reason="missing_text", id=event_id)
                 continue
+
+            # Hard stop: never play anything while muted.
+            if muted_until_unix:
+                now_unix = int(datetime.now(timezone.utc).timestamp())
+                if now_unix < int(muted_until_unix):
+                    suppressed_total += 1
+                    log.warning(
+                        "announce_suppressed",
+                        id=event_id,
+                        trace_id=trace_id,
+                        source=source,
+                        reason="mute",
+                        muted_until_unix=int(muted_until_unix),
+                        local_time=str(datetime.now(tz=tz)),
+                    )
+                    suppressed = make_event(
+                        source="sonos-gateway",
+                        typ="announce.suppressed",
+                        trace_id=trace_id,
+                        data={
+                            "reason": "mute",
+                            "muted_until_unix": int(muted_until_unix),
+                            "original_event_id": event_id,
+                            "original_source": source,
+                            "text_len": len(text),
+                        },
+                    )
+                    mqttc.publish_json(suppressed_topic, suppressed)
+                    continue
 
             # Hard stop: never play anything during quiet hours.
             if settings.quiet_hours.enabled:

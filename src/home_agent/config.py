@@ -361,6 +361,45 @@ class QuietHoursSettings(BaseSettings):
         return _strip_quotes(str(v)).strip()
 
 
+class SmtpSettings(BaseSettings):
+    """
+    Global SMTP settings (used by any module needing outbound email).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    host: str = Field(default="", alias="SMTP_HOST")
+    port: int = Field(default=587, alias="SMTP_PORT")
+    username: Optional[str] = Field(default=None, alias="SMTP_USERNAME")
+    password: Optional[str] = Field(default=None, alias="SMTP_PASSWORD")
+    from_addr: str = Field(default="", alias="SMTP_FROM")
+    use_starttls: bool = Field(default=True, alias="SMTP_USE_STARTTLS")
+    use_ssl: bool = Field(default=False, alias="SMTP_USE_SSL")
+    timeout_seconds: float = Field(default=20.0, alias="SMTP_TIMEOUT_SECONDS")
+
+    @field_validator("host", "from_addr", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+    @field_validator("username", "password", mode="before")
+    @classmethod
+    def _norm_opt(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = _strip_quotes(str(v)).strip()
+        return s or None
+
+    @property
+    def enabled(self) -> bool:
+        return bool((self.host or "").strip()) and bool((self.from_addr or "").strip())
+
+
 class CamectSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="",
@@ -381,6 +420,8 @@ class CamectSettings(BaseSettings):
     status_interval_seconds: int = Field(default=60, alias="CAMECT_STATUS_INTERVAL_SECONDS")
     stale_warning_seconds: int = Field(default=300, alias="CAMECT_STALE_WARNING_SECONDS")
     announce_template: str = Field(default="{kind} detected at {camera}.", alias="CAMECT_ANNOUNCE_TEMPLATE")
+    # Optional: comma-delimited list of recipients to email snapshot images to (empty disables).
+    email_alert_pics_to: str = Field(default="", alias="CAMECT_EMAIL_ALERT_PICS_TO")
 
     @field_validator(
         "host",
@@ -389,6 +430,7 @@ class CamectSettings(BaseSettings):
         "camera_rules",
         "event_filter",
         "announce_template",
+        "email_alert_pics_to",
         mode="before",
     )
     @classmethod
@@ -471,6 +513,14 @@ class CamectSettings(BaseSettings):
             if cam:
                 out[cam] = tok
         return out
+
+    @property
+    def email_alert_pics_to_list(self) -> List[str]:
+        s = (self.email_alert_pics_to or "").strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in s.split(",")]
+        return [p for p in parts if p]
 
 
 class CasetaSettings(BaseSettings):
@@ -637,6 +687,7 @@ class AppSettings(BaseSettings):
     weather: WeatherSettings = WeatherSettings()
     gcal: GCalSettings = GCalSettings()
     quiet_hours: QuietHoursSettings = QuietHoursSettings()
+    smtp: SmtpSettings = SmtpSettings()
     camect: CamectSettings = CamectSettings()
     caseta: CasetaSettings = CasetaSettings()
     camera_lighting: CameraLightingSettings = CameraLightingSettings()

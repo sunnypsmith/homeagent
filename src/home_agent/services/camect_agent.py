@@ -10,6 +10,7 @@ from home_agent.bus.envelope import make_event
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
+from home_agent.integrations.smtp_mailer import EmailAttachment, SmtpMailer
 
 
 def _iter_strings(obj: Any, *, _depth: int = 0, _max_depth: int = 6) -> Iterable[str]:
@@ -172,6 +173,69 @@ def _spoken_kind_from_event(evt: Dict[str, Any], token: str) -> str:
     return _spoken_kind(first)
 
 
+def _extract_ts_ms(evt: Dict[str, Any]) -> Optional[int]:
+    """
+    Best-effort: extract an event timestamp in milliseconds (for snapshot APIs that support it).
+    Many Camect events don't include this; returning None is fine (we'll fetch "latest").
+    """
+    cand = _find_first_key_in_tree(
+        evt,
+        (
+            "ts_ms",
+            "timestamp_ms",
+            "time_ms",
+            "event_ts_ms",
+            "TsMs",
+            "TS_MS",
+        ),
+    )
+    if isinstance(cand, bool):
+        return None
+    if isinstance(cand, int):
+        return int(cand) if cand > 0 else None
+    if isinstance(cand, str):
+        s = cand.strip()
+        if s.isdigit():
+            v = int(s)
+            return v if v > 0 else None
+    return None
+
+
+def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]) -> bytes:
+    """
+    Try multiple call signatures for camect-py snapshot APIs.
+    Returns raw JPEG bytes.
+    """
+    if not cam_id:
+        raise ValueError("missing_cam_id")
+
+    snap = getattr(hub, "snapshot_camera", None)
+    if snap is None:
+        raise RuntimeError("camect_snapshot_not_supported")
+
+    # Try with timestamp if present, otherwise fall back to latest snapshot.
+    if ts_ms is not None:
+        try:
+            return snap(cam_id, ts_ms)  # type: ignore[misc]
+        except TypeError:
+            pass
+        try:
+            return snap(cam_id, ts_ms=ts_ms)  # type: ignore[misc]
+        except TypeError:
+            pass
+        try:
+            return snap(cam_id=cam_id, ts_ms=ts_ms)  # type: ignore[misc]
+        except TypeError:
+            pass
+
+    # Fallback: no timestamp
+    try:
+        return snap(cam_id)  # type: ignore[misc]
+    except TypeError:
+        pass
+    return snap(cam_id=cam_id)  # type: ignore[misc]
+
+
 @dataclass(frozen=True)
 class CameraMap:
     id_to_name: Dict[str, str]
@@ -283,6 +347,8 @@ async def run_camect_agent() -> None:
 
     event_topic = "%s/camera/event" % settings.mqtt.base_topic
     announce_topic = "%s/announce/request" % settings.mqtt.base_topic
+    snapshot_emailed_topic = "%s/camera/snapshot/emailed" % settings.mqtt.base_topic
+    snapshot_failed_topic = "%s/camera/snapshot/failed" % settings.mqtt.base_topic
 
     loop = asyncio.get_running_loop()
     q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue(maxsize=1000)
@@ -316,7 +382,15 @@ async def run_camect_agent() -> None:
     log.info("camect_listener_registered")
 
     last_announce_by_cam: Dict[str, float] = {}
+    last_email_by_cam: Dict[str, float] = {}
     throttle = max(0, int(settings.camect.throttle_seconds))
+    mailer = SmtpMailer(settings.smtp)
+    email_to = list(settings.camect.email_alert_pics_to_list or [])
+    if email_to and not mailer.enabled:
+        log.warning(
+            "email_enabled_but_smtp_missing",
+            hint="Set SMTP_HOST + SMTP_FROM (+ credentials) in .env, or clear CAMECT_EMAIL_ALERT_PICS_TO",
+        )
 
     async def status_loop() -> None:
         nonlocal last_event_at, last_callback_at
@@ -422,16 +496,111 @@ async def run_camect_agent() -> None:
             )
             mqttc.publish_json(event_topic, camera_event)
 
-            # Announce with throttle (per camera name/id).
             throttle_key = cam_name or cam_id or "unknown"
+            spoken_camera = cam_name or cam_id or "camera"
+            kind = _spoken_kind_from_event(evt, token)
+
+            # Optionally email a snapshot image (JPEG) for this event.
+            if email_to and mailer.enabled:
+                email_key = throttle_key
+                now2 = time.monotonic()
+                last2 = last_email_by_cam.get(email_key, 0.0)
+                if (not throttle) or (now2 - last2) >= float(throttle):
+                    last_email_by_cam[email_key] = now2
+                    ts_ms = _extract_ts_ms(evt)
+                    try:
+                        jpeg = await asyncio.to_thread(
+                            _fetch_snapshot_jpeg_bytes,
+                            hub,
+                            cam_id=cam_id,
+                            ts_ms=ts_ms,
+                        )
+                        subj = f"[Home] Camect snapshot: {spoken_camera} ({kind})"
+                        body = f"Camera: {spoken_camera}\nType: {kind}\ncam_id: {cam_id or ''}\n"
+                        if isinstance(evt.get("desc"), str) and evt.get("desc"):
+                            body += f"desc: {evt.get('desc')}\n"
+                        sent_ok = 0
+                        for addr in email_to:
+                            try:
+                                await asyncio.to_thread(
+                                    mailer.send,
+                                    to_addrs=[addr],
+                                    subject=subj,
+                                    text=body,
+                                    attachments=[
+                                        EmailAttachment(
+                                            filename="camect_%s.jpg" % (spoken_camera.replace(" ", "_") or "snapshot"),
+                                            content_type="image/jpeg",
+                                            data=jpeg,
+                                        )
+                                    ],
+                                )
+                                sent_ok += 1
+                                mqttc.publish_json(
+                                    snapshot_emailed_topic,
+                                    make_event(
+                                        source="camect-agent",
+                                        typ="camera.snapshot.emailed",
+                                        data={
+                                            "camera_id": cam_id or None,
+                                            "camera_name": spoken_camera or None,
+                                            "kind": kind,
+                                            "to": [addr],
+                                            "bytes": len(jpeg),
+                                            "ts_ms": ts_ms,
+                                        },
+                                    ),
+                                )
+                            except Exception as e2:
+                                mqttc.publish_json(
+                                    snapshot_failed_topic,
+                                    make_event(
+                                        source="camect-agent",
+                                        typ="camera.snapshot.failed",
+                                        data={
+                                            "camera_id": cam_id or None,
+                                            "camera_name": spoken_camera or None,
+                                            "kind": kind,
+                                            "to": [addr],
+                                            "ts_ms": ts_ms,
+                                            "error": type(e2).__name__,
+                                        },
+                                    ),
+                                )
+                                log.warning(
+                                    "snapshot_email_failed_recipient",
+                                    camera=spoken_camera,
+                                    to=addr,
+                                    error=type(e2).__name__,
+                                )
+                        log.info("snapshot_email_attempted", camera=spoken_camera, ok=sent_ok, total=len(email_to))
+                    except Exception as e:
+                        # Snapshot fetch failure (or other pre-send failure) - mark all recipients as failed.
+                        for addr in email_to:
+                            mqttc.publish_json(
+                                snapshot_failed_topic,
+                                make_event(
+                                    source="camect-agent",
+                                    typ="camera.snapshot.failed",
+                                    data={
+                                        "camera_id": cam_id or None,
+                                        "camera_name": spoken_camera or None,
+                                        "kind": kind,
+                                        "to": [addr],
+                                        "ts_ms": ts_ms,
+                                        "error": type(e).__name__,
+                                    },
+                                ),
+                            )
+                        log.exception("snapshot_email_failed", camera=spoken_camera)
+
+            # Announce with throttle (per camera name/id).
             now = time.monotonic()
             last = last_announce_by_cam.get(throttle_key, 0.0)
             if throttle and (now - last) < float(throttle):
                 continue
             last_announce_by_cam[throttle_key] = now
 
-            spoken_camera = cam_name or cam_id or "camera"
-            kind = _spoken_kind_from_event(evt, token)
             try:
                 text = (settings.camect.announce_template or "").format(camera=spoken_camera, kind=kind)
             except Exception:

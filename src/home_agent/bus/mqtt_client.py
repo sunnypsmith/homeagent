@@ -173,4 +173,3 @@ class MqttClient:
             "last_connect_rc": int(self._last_connect_rc) if self._last_connect_rc is not None else -1,
             "last_disconnect_rc": int(self._last_disconnect_rc) if self._last_disconnect_rc is not None else -1,
         }
-
