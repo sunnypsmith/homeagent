@@ -20,6 +20,7 @@ Event-driven home automation / “house agent” stack in Python.
 - **Camect integration (optional)**: consume AI alerts, publish `camera.event`, and optionally announce
 - **Lutron Caséta integration (optional)**: control devices + scenes (virtual buttons) via LEAP
 - **Camera → lighting automation (optional)**: turn on/off selected Caséta devices based on Camect events + “after dark”
+- **Sunset scene (optional)**: trigger a Caséta scene at local sunset
 
 ## Quick start (local dev)
 
@@ -153,6 +154,10 @@ Then open on your iPhone:
 
 - `http://10.1.1.111:8001/`
 
+Built-in controls include:
+- Mute (1 hour) / Unmute
+- Test Tone (10s)
+
 ### Fixed announcements (DB-backed schedules)
 
 Add/update:
@@ -178,6 +183,14 @@ Schedule “Daytime” scene:
 ```bash
 home-agent add-caseta-scene --name caseta_daytime_weekday_0600 --at 06:00 --days mon-fri --scene-name Daytime
 home-agent add-caseta-scene --name caseta_daytime_weekend_0700 --at 07:00 --days sat,sun --scene-name Daytime
+```
+
+Sunset scene (runs daily at local sunset via `time-trigger` + Open‑Meteo):
+
+```bash
+SUNSET_SCENE_ENABLED=true
+SUNSET_SCENE_NAME=Nighttime
+SUNSET_SCENE_OFFSET_MINUTES=0
 ```
 
 ### Camect rules + camera → lighting (optional)

@@ -113,3 +113,23 @@ Weekends at 7:00am:
 home-agent add-caseta-scene --name caseta_daytime_weekend_0700 --at 07:00 --days sat,sun --scene-name Daytime
 ```
 
+## Sunset scene (optional)
+
+Trigger a Caséta scene at local sunset using the `time-trigger` service.
+
+Prereqs:
+- Weather is configured (`WEATHER_LAT`, `WEATHER_LON`, `WEATHER_PROVIDER=open_meteo`)
+- `home-agent time-trigger` is running
+
+Configure in `.env`:
+
+```bash
+SUNSET_SCENE_ENABLED=true
+SUNSET_SCENE_NAME=Nighttime
+SUNSET_SCENE_OFFSET_MINUTES=0
+```
+
+Notes:
+- Uses Open‑Meteo for sunrise/sunset times.
+- `SUNSET_SCENE_OFFSET_MINUTES` can be negative or positive.
+

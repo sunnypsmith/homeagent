@@ -53,3 +53,25 @@ To execute fixed announcements, run:
 
 Quiet hours are enforced at `sonos-gateway`.
 
+## Sunset scene (optional)
+
+The `time-trigger` service can publish a Caséta scene command at local sunset each day.
+
+Requirements:
+- `WEATHER_PROVIDER=open_meteo`
+- `WEATHER_LAT` / `WEATHER_LON` configured
+- `home-agent time-trigger` running
+
+Settings:
+
+```bash
+SUNSET_SCENE_ENABLED=true
+SUNSET_SCENE_NAME=Nighttime
+SUNSET_SCENE_OFFSET_MINUTES=0
+```
+
+Event published:
+- topic: `homeagent/lutron/command`
+- type: `lutron.command`
+- data: `{"action":"scene","scene_name":"Nighttime"}`
+
