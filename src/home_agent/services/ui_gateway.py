@@ -9,6 +9,8 @@ from home_agent.bus.envelope import make_event
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
+from home_agent.integrations.audio_host import AudioHost
+from home_agent.integrations.sonos_playback import SonosPlayback
 
 
 def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[str]) -> str:
@@ -48,6 +50,15 @@ def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[
             </form>
             """
         )
+    cards.append(
+        """
+        <form method="post" action="/tone-test" class="card">
+          <button type="submit" class="btn btn-subtle" aria-label="Play a 10 second test tone on Sonos">
+            <span class="label">Test Tone (10s)</span>
+          </button>
+        </form>
+        """
+    )
     cards_html = "\n".join(cards) if cards else "<p class='muted'>No actions configured.</p>"
     toast_html = f"<div class='toast'>{toast}</div>" if toast else ""
 
@@ -211,6 +222,34 @@ async def run_ui_gateway() -> None:
 
     app = FastAPI()
 
+    def _tone_wav_bytes(*, duration_s: float, frequency_hz: int) -> bytes:
+        import io
+        import math
+        import struct
+        import wave
+
+        sample_rate = 44100
+        n_samples = int(sample_rate * max(0.05, float(duration_s)))
+        amplitude = 0.85
+        fade_samples = int(sample_rate * 0.02)  # ~20ms
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(sample_rate)
+
+            frames = bytearray()
+            for i in range(n_samples):
+                t = float(i) / float(sample_rate)
+                fade = 1.0
+                if fade_samples > 0:
+                    fade = min(1.0, i / fade_samples, (n_samples - 1 - i) / fade_samples)
+                v = float(fade) * amplitude * math.sin(2.0 * math.pi * float(frequency_hz) * t)
+                frames += struct.pack("<h", int(v * 32767.0))
+            wf.writeframes(frames)
+        return buf.getvalue()
+
     @app.on_event("startup")
     async def _startup() -> None:
         await mqttc.connect()
@@ -271,6 +310,45 @@ async def run_ui_gateway() -> None:
         mqttc.publish_json(topic, evt, retain=True)
         log.info("unmute_requested")
         return RedirectResponse(url="/?toast=" + quote("Unmuted"), status_code=303)
+
+    @app.post("/tone-test")
+    async def tone_test() -> RedirectResponse:
+        targets = settings.sonos.announce_target_ips
+        if not targets:
+            return RedirectResponse(
+                url="/?toast=" + quote("Missing SONOS_ANNOUNCE_TARGETS"),
+                status_code=303,
+            )
+
+        async def _run_tone() -> None:
+            try:
+                data = await asyncio.to_thread(_tone_wav_bytes, duration_s=10.0, frequency_hz=880)
+                host = AudioHost()
+                player = SonosPlayback(
+                    speaker_ips=targets,
+                    default_volume=settings.sonos.default_volume,
+                    speaker_volume_map=settings.sonos.speaker_volume_map,
+                )
+                hosted = host.host_bytes(
+                    data=data,
+                    filename="tone_test.wav",
+                    content_type="audio/wav",
+                    route_to_ip=targets[0],
+                )
+                await player.play_url(
+                    url=hosted.url,
+                    title="Home Agent tone test",
+                    concurrency=12,
+                    tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
+                    expected_duration_seconds=10.0,
+                    done_timeout_seconds=20.0,
+                )
+                log.info("tone_test_done", seconds=10, concurrency=12)
+            except Exception:
+                log.exception("tone_test_failed")
+
+        asyncio.create_task(_run_tone())
+        return RedirectResponse(url="/?toast=" + quote("Test tone started"), status_code=303)
 
     config = uvicorn.Config(
         app,

@@ -400,6 +400,28 @@ class SmtpSettings(BaseSettings):
         return bool((self.host or "").strip()) and bool((self.from_addr or "").strip())
 
 
+class SunsetSceneSettings(BaseSettings):
+    """
+    Optional: trigger a Caseta scene at local sunset.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="SUNSET_SCENE_ENABLED")
+    scene_name: str = Field(default="", alias="SUNSET_SCENE_NAME")
+    offset_minutes: int = Field(default=0, alias="SUNSET_SCENE_OFFSET_MINUTES")
+
+    @field_validator("scene_name", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
 class CamectSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="",
@@ -688,6 +710,7 @@ class AppSettings(BaseSettings):
     gcal: GCalSettings = GCalSettings()
     quiet_hours: QuietHoursSettings = QuietHoursSettings()
     smtp: SmtpSettings = SmtpSettings()
+    sunset_scene: SunsetSceneSettings = SunsetSceneSettings()
     camect: CamectSettings = CamectSettings()
     caseta: CasetaSettings = CasetaSettings()
     camera_lighting: CameraLightingSettings = CameraLightingSettings()

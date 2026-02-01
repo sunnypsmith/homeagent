@@ -5,7 +5,7 @@ import signal
 import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,6 +18,8 @@ from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 from home_agent.db import DbConnectInfo, DbManager
+from home_agent.integrations.weather_open_meteo import OpenMeteoClient
+from zoneinfo import ZoneInfo
 
 
 @dataclass(frozen=True)
@@ -325,12 +327,116 @@ async def run_time_trigger() -> None:
 
     status_task = asyncio.create_task(status_loop())
 
+    async def _fetch_today_sunset() -> Optional[datetime]:
+        if settings.weather.provider != "open_meteo":
+            log.warning("sunset_disabled", reason="unsupported_weather_provider", provider=settings.weather.provider)
+            return None
+        if settings.weather.latitude is None or settings.weather.longitude is None:
+            log.warning("sunset_disabled", reason="missing_weather_lat_lon")
+            return None
+
+        client = OpenMeteoClient(
+            latitude=settings.weather.latitude,
+            longitude=settings.weather.longitude,
+            units=settings.weather.units,
+            timeout_seconds=settings.weather.timeout_seconds,
+        )
+        sun = await client.sun_times_today()
+        if sun.sunset is None:
+            log.warning("sunset_unavailable")
+            return None
+
+        tz = ZoneInfo(sun.timezone or settings.timezone)
+        dt = sun.sunset
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt
+
+    async def _sunset_scene_loop() -> None:
+        """
+        Optional: trigger a Caseta scene at local sunset each day.
+        """
+        if not settings.sunset_scene.enabled:
+            return
+        if not settings.sunset_scene.scene_name:
+            log.warning("sunset_disabled", reason="missing_scene_name")
+            return
+
+        topic = f"{settings.mqtt.base_topic}/lutron/command"
+        offset_min = int(settings.sunset_scene.offset_minutes or 0)
+        while not stop_event.is_set():
+            try:
+                sunset = await _fetch_today_sunset()
+                if sunset is None:
+                    # Retry later if we can't get sunset data.
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=3600.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                target = sunset + timedelta(minutes=offset_min)
+                now = datetime.now(tz=target.tzinfo)
+                if target <= now:
+                    # Already passed; wait until just after next local midnight to refresh.
+                    next_midnight = (now + timedelta(days=1)).replace(
+                        hour=0, minute=0, second=5, microsecond=0
+                    )
+                    wait_s = max(30.0, (next_midnight - now).total_seconds())
+                    log.info(
+                        "sunset_wait_next_day",
+                        now=str(now),
+                        sunset=str(target),
+                        wait_seconds=int(wait_s),
+                    )
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                wait_s = max(1.0, (target - now).total_seconds())
+                log.info(
+                    "sunset_scheduled",
+                    scene=settings.sunset_scene.scene_name,
+                    sunset=str(target),
+                    wait_seconds=int(wait_s),
+                )
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    pass
+
+                if stop_event.is_set():
+                    break
+
+                evt = make_event(
+                    source="time-trigger",
+                    typ="lutron.command",
+                    data={
+                        "action": "scene",
+                        "scene_name": settings.sunset_scene.scene_name,
+                        "schedule_name": "sunset_scene",
+                    },
+                )
+                mqttc.publish_json(topic, evt)
+                log.info("sunset_scene_triggered", scene=settings.sunset_scene.scene_name)
+            except Exception:
+                log.exception("sunset_scene_failed")
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=300.0)
+                except asyncio.TimeoutError:
+                    pass
+
+    sunset_task = asyncio.create_task(_sunset_scene_loop())
+
     try:
         await stop_event.wait()
     finally:
         log.info("shutdown_start")
         reload_task.cancel()
         status_task.cancel()
+        sunset_task.cancel()
         try:
             scheduler.shutdown(wait=False)
         except Exception:
