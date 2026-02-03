@@ -303,7 +303,9 @@ async def run_sonos_gateway() -> None:
             data_targets = data.get("targets")
             play_targets = targets
             if isinstance(data_targets, list) and all(isinstance(x, str) for x in data_targets) and data_targets:
-                play_targets = list(data_targets)
+                resolved = settings.sonos.resolve_targets(data_targets)
+                if resolved:
+                    play_targets = list(resolved)
 
             log.info("announce_request", id=event_id, trace_id=trace_id, source=source)
             try:

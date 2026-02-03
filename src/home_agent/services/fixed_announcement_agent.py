@@ -94,6 +94,10 @@ async def run_fixed_announcement_agent() -> None:
             targets = data.get("targets")
             if isinstance(targets, list) and all(isinstance(x, str) for x in targets) and targets:
                 announce_data["targets"] = list(targets)
+            else:
+                fallback = settings.sonos.resolve_targets(settings.sonos.fixed_announcement_targets)
+                if fallback:
+                    announce_data["targets"] = fallback
 
             announce = make_event(
                 source="fixed-announcement-agent",

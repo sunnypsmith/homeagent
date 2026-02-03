@@ -96,12 +96,20 @@ SMTP_USE_SSL=false
 SMTP_TIMEOUT_SECONDS=20
 ```
 
-### Sonos discovery (writes `SONOS_ANNOUNCE_TARGETS`)
+### Sonos discovery (writes `SONOS_SPEAKER_MAP`)
 
 ```bash
 python3 scripts/sonos_discover.py --write
 # or (if multicast/SSDP is blocked)
 python3 scripts/sonos_discover.py --subnet 192.168.1.0/24 --write
+```
+
+This writes `SONOS_SPEAKER_MAP` + `SONOS_GLOBAL_ANNOUNCE_TARGETS` (aliases + default targets).
+
+Optional per-agent targets:
+```bash
+SONOS_MORNING_BRIEFING_TARGETS=office
+SONOS_WAKEUP_TARGETS=bedroom
 ```
 
 ### TTS → Sonos end-to-end test

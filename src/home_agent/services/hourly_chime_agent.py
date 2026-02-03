@@ -105,11 +105,16 @@ async def run_hourly_chime_agent() -> None:
 
             text = "Current time is %s.%s" % (time_phrase, temp_phrase)
 
+            announce_data: Dict[str, Any] = {"text": text}
+            targets = settings.sonos.resolve_targets(settings.sonos.hourly_chime_targets)
+            if targets:
+                announce_data["targets"] = targets
+
             announce = make_event(
                 source="hourly-chime-agent",
                 typ="announce.request",
                 trace_id=trace_id,
-                data={"text": text},
+                data=announce_data,
             )
             mqttc.publish_json(pub_topic, announce)
             log.info("published", to=pub_topic, trace_id=trace_id, from_event=event_id)

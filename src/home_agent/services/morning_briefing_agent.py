@@ -333,11 +333,19 @@ async def run_morning_briefing_agent() -> None:
             try:
                 reply = await llm.chat(system=system, user=user, max_tokens=220, temperature=0.4)
                 text = reply.text.strip()
+                announce_data: Dict[str, Any] = {
+                    "text": text,
+                    "concurrency": settings.sonos.announce_concurrency,
+                }
+                targets = settings.sonos.resolve_targets(settings.sonos.morning_briefing_targets)
+                if targets:
+                    announce_data["targets"] = targets
+
                 announce = make_event(
                     source="morning-briefing-agent",
                     typ="announce.request",
                     trace_id=trace_id,
-                    data={"text": text, "concurrency": settings.sonos.announce_concurrency},
+                    data=announce_data,
                 )
                 mqttc.publish_json(pub_topic, announce)
                 log.info("published", to=pub_topic, trace_id=trace_id, llm_provider=reply.provider)

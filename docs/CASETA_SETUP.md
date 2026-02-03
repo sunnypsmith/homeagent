@@ -132,4 +132,3 @@ SUNSET_SCENE_OFFSET_MINUTES=0
 Notes:
 - Uses Open‑Meteo for sunrise/sunset times.
 - `SUNSET_SCENE_OFFSET_MINUTES` can be negative or positive.
-

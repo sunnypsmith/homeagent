@@ -54,10 +54,10 @@ def main() -> int:
 Notes:
   - SSDP mode requires multicast/UPnP to work on your network.
   - Subnet mode probes http://<ip>:1400/xml/device_description.xml and does not rely on multicast.
-  - This script updates ONLY SONOS_ANNOUNCE_TARGETS in your env file (it does not print or modify other keys).
+  - This script updates SONOS_SPEAKER_MAP + SONOS_GLOBAL_ANNOUNCE_TARGETS in your env file (it does not print or modify other keys).
 """
     parser = argparse.ArgumentParser(
-        description="Discover Sonos devices and (optionally) write SONOS_ANNOUNCE_TARGETS to an env file.",
+        description="Discover Sonos devices and (optionally) write SONOS_SPEAKER_MAP to an env file.",
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -172,21 +172,23 @@ Notes:
                 print("%d/%d test tone(s) failed." % (failures, len(chosen_devices)))
 
     env_path = Path(args.env_file)
-    ips = [d.ip for d in chosen_devices]
-    targets = ",".join(ips)
+    speaker_map, global_targets = _build_speaker_map(chosen_devices, default_volume=40)
     if args.write:
         update_env_file(
             env_path,
             {
-                "SONOS_ANNOUNCE_TARGETS": targets,
+                "SONOS_SPEAKER_MAP": speaker_map,
+                "SONOS_GLOBAL_ANNOUNCE_TARGETS": global_targets,
             },
         )
         print("Updated %s:" % env_path)
-        print("  SONOS_ANNOUNCE_TARGETS=%s" % targets)
-        print("Next (optional): set SONOS_DEFAULT_VOLUME=50 (or your preference)")
+        print("  SONOS_SPEAKER_MAP=%s" % speaker_map)
+        print("  SONOS_GLOBAL_ANNOUNCE_TARGETS=%s" % global_targets)
+        print("Next (optional): adjust per-speaker volumes or update SONOS_DEFAULT_VOLUME")
     else:
         print("\nDry-run (no files changed). Add this to %s:" % env_path)
-        print("SONOS_ANNOUNCE_TARGETS=%s" % targets)
+        print("SONOS_SPEAKER_MAP=%s" % speaker_map)
+        print("SONOS_GLOBAL_ANNOUNCE_TARGETS=%s" % global_targets)
 
     return 0
 
@@ -366,6 +368,39 @@ def choose_devices(devices: List[SonosDevice]) -> List[SonosDevice]:
             continue
 
         return chosen
+
+
+def _build_speaker_map(devices: List[SonosDevice], *, default_volume: int) -> tuple[str, str]:
+    """
+    Build SONOS_SPEAKER_MAP and SONOS_GLOBAL_ANNOUNCE_TARGETS strings.
+    """
+    aliases: List[str] = []
+    seen: dict[str, int] = {}
+    entries: List[str] = []
+
+    for d in devices:
+        alias = _normalize_alias(d.name or d.ip)
+        # de-dupe aliases by suffixing _2, _3, ...
+        count = seen.get(alias, 0) + 1
+        seen[alias] = count
+        if count > 1:
+            alias = f"{alias}_{count}"
+        aliases.append(alias)
+        entries.append("%s=%s:%d" % (alias, d.ip, int(default_volume)))
+
+    speaker_map = ",".join(entries)
+    global_targets = ",".join(aliases)
+    return (speaker_map, global_targets)
+
+
+def _normalize_alias(name: str) -> str:
+    s = (name or "").strip().lower()
+    if not s:
+        return "speaker"
+    # replace non-alnum with underscores and collapse repeats
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = s.strip("_")
+    return s or "speaker"
 
 
 _ENV_KV_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$")

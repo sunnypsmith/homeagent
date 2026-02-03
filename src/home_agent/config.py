@@ -34,6 +34,15 @@ class SonosSettings(BaseSettings):
     # Comma-delimited list of speaker IPs for announcements (v1: treat each target individually).
     # Keep this as a string because pydantic-settings tries to JSON-decode List[str] from .env.
     announce_targets: str = Field(default="", alias="SONOS_ANNOUNCE_TARGETS")
+    # Optional alias map: "office=10.1.2.58:60,kitchen=10.1.2.242:40"
+    speaker_map: str = Field(default="", alias="SONOS_SPEAKER_MAP")
+    # Optional default targets (aliases or IPs). If set, overrides SONOS_ANNOUNCE_TARGETS.
+    global_announce_targets: str = Field(default="", alias="SONOS_GLOBAL_ANNOUNCE_TARGETS")
+    # Optional per-agent targets (aliases or IPs).
+    morning_briefing_targets: str = Field(default="", alias="SONOS_MORNING_BRIEFING_TARGETS")
+    wakeup_targets: str = Field(default="", alias="SONOS_WAKEUP_TARGETS")
+    hourly_chime_targets: str = Field(default="", alias="SONOS_HOURLY_CHIME_TARGETS")
+    fixed_announcement_targets: str = Field(default="", alias="SONOS_FIXED_ANNOUNCEMENT_TARGETS")
     default_volume: int = Field(default=50, alias="SONOS_DEFAULT_VOLUME")
     announce_concurrency: int = Field(default=3, alias="SONOS_ANNOUNCE_CONCURRENCY")
     tail_padding_seconds: float = Field(default=3.0, alias="SONOS_TAIL_PADDING_SECONDS")
@@ -41,7 +50,16 @@ class SonosSettings(BaseSettings):
     # Format: "10.1.2.58:35,10.1.2.72:45" (comma/semicolon delimited)
     speaker_volumes: str = Field(default="", alias="SONOS_SPEAKER_VOLUMES")
 
-    @field_validator("announce_targets", mode="before")
+    @field_validator(
+        "announce_targets",
+        "speaker_map",
+        "global_announce_targets",
+        "morning_briefing_targets",
+        "wakeup_targets",
+        "hourly_chime_targets",
+        "fixed_announcement_targets",
+        mode="before",
+    )
     @classmethod
     def _normalize_announce_targets(cls, v: object) -> str:
         if v is None:
@@ -59,6 +77,8 @@ class SonosSettings(BaseSettings):
         In that case, the IP portion is used as the target, and the volume is treated
         as a per-speaker override (see `speaker_volume_map`).
         """
+        if self.global_announce_targets:
+            return self.resolve_targets(self.global_announce_targets)
         ips, _ = _parse_sonos_targets(self.announce_targets or "")
         return ips
 
@@ -71,11 +91,50 @@ class SonosSettings(BaseSettings):
         # Start with any embedded ip:vol in SONOS_ANNOUNCE_TARGETS (convenience).
         _, embedded = _parse_sonos_targets(self.announce_targets or "")
 
+        # Add any embedded volumes from the alias map.
+        _, alias_vols = _parse_sonos_speaker_map(self.speaker_map or "")
+
         # Then apply explicit overrides from SONOS_SPEAKER_VOLUMES (recommended).
         explicit = _parse_sonos_speaker_volumes(self.speaker_volumes or "")
 
         out: Dict[str, int] = dict(embedded)
+        out.update(alias_vols)
         out.update(explicit)
+        return out
+
+    @property
+    def speaker_alias_map(self) -> Dict[str, str]:
+        aliases, _ = _parse_sonos_speaker_map(self.speaker_map or "")
+        return aliases
+
+    def resolve_targets(self, raw: object) -> List[str]:
+        """
+        Resolve aliases to IPs for targets. Accepts a comma-delimited string or list of strings.
+        """
+        if raw is None:
+            return []
+        items: List[str] = []
+        if isinstance(raw, list):
+            for v in raw:
+                if isinstance(v, str) and v.strip():
+                    items.append(v.strip())
+        else:
+            s = _strip_quotes(str(raw)).strip()
+            if s:
+                items.extend([p.strip() for p in s.split(",") if p.strip()])
+
+        if not items:
+            return []
+
+        aliases = self.speaker_alias_map
+        out: List[str] = []
+        seen: set[str] = set()
+        for item in items:
+            ip = aliases.get(item, item)
+            ip = _strip_volume_suffix(ip)
+            if ip and ip not in seen:
+                seen.add(ip)
+                out.append(ip)
         return out
 
 
@@ -153,6 +212,63 @@ def _parse_sonos_speaker_volumes(raw: str) -> Dict[str, int]:
         vol = max(0, min(100, vol))
         out[ip] = vol
     return out
+
+
+def _parse_sonos_speaker_map(raw: str) -> tuple[Dict[str, str], Dict[str, int]]:
+    """
+    Parse SONOS_SPEAKER_MAP.
+    Format: "office=10.1.2.58:60,kitchen=10.1.2.242:40"
+    Returns (alias->ip, ip->volume).
+    """
+    s = _strip_quotes(str(raw or "")).strip()
+    if not s:
+        return ({}, {})
+
+    aliases: Dict[str, str] = {}
+    vols: Dict[str, int] = {}
+    for chunk in s.replace(";", ",").split(","):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        alias, target = item.split("=", 1)
+        alias = alias.strip()
+        target = target.strip()
+        if not alias or not target:
+            continue
+
+        ip = target
+        vol: Optional[int] = None
+        if ":" in target:
+            left, right = target.rsplit(":", 1)
+            left = left.strip()
+            right = right.strip()
+            if left and right:
+                try:
+                    vv = int(float(right))
+                    vv = max(0, min(100, vv))
+                    ip = left
+                    vol = vv
+                except Exception:
+                    ip = target
+                    vol = None
+        if ip:
+            aliases[alias] = ip
+            if vol is not None:
+                vols[ip] = vol
+
+    return (aliases, vols)
+
+
+def _strip_volume_suffix(value: str) -> str:
+    """
+    If value looks like "ip:vol", return ip. Otherwise return original string.
+    """
+    s = (value or "").strip()
+    if ":" in s:
+        left, right = s.rsplit(":", 1)
+        if left and right and right.isdigit():
+            return left.strip()
+    return s
 
 
 class ElevenLabsSettings(BaseSettings):

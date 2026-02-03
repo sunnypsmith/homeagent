@@ -74,4 +74,3 @@ Event published:
 - topic: `homeagent/lutron/command`
 - type: `lutron.command`
 - data: `{"action":"scene","scene_name":"Nighttime"}`
-

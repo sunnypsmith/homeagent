@@ -38,9 +38,14 @@ python3 scripts/sonos_discover.py --subnet 192.168.1.0/24 --timeout 2 --max-work
 ## What it writes
 
 The script updates **only**:
-- `SONOS_ANNOUNCE_TARGETS=<comma-delimited IPs>`
+- `SONOS_SPEAKER_MAP=<alias=ip:volume,...>`
+- `SONOS_GLOBAL_ANNOUNCE_TARGETS=<alias,...>`
 
 It does **not** print or modify other `.env` keys.
+
+Legacy note:
+- `SONOS_ANNOUNCE_TARGETS` is still supported as a fallback if
+  `SONOS_GLOBAL_ANNOUNCE_TARGETS` is not set.
 
 ## Recommended volume
 
@@ -48,6 +53,24 @@ In your `.env`, you can set a default announcement volume:
 
 ```bash
 SONOS_DEFAULT_VOLUME=50
+```
+
+## Speaker aliases (recommended)
+
+Define aliases once and use them as targets:
+
+```bash
+SONOS_SPEAKER_MAP=office=10.1.2.58:60,kitchen=10.1.2.242:40
+SONOS_GLOBAL_ANNOUNCE_TARGETS=office,kitchen
+```
+
+Optional per-agent targets:
+
+```bash
+SONOS_MORNING_BRIEFING_TARGETS=office
+SONOS_WAKEUP_TARGETS=bedroom
+SONOS_HOURLY_CHIME_TARGETS=kitchen,bedroom
+SONOS_FIXED_ANNOUNCEMENT_TARGETS=office
 ```
 
 ## Per-speaker volumes (recommended for mixed Sonos models)
@@ -77,7 +100,8 @@ If you still hear clipping, try `5.0`–`10.0` and restart `home-agent sonos-gat
 ## Test TTS -> Sonos end-to-end
 
 Once you’ve set:
-- `SONOS_ANNOUNCE_TARGETS=...`
+- `SONOS_SPEAKER_MAP=...`
+- `SONOS_GLOBAL_ANNOUNCE_TARGETS=...`
 - `ELEVENLABS_API_KEY=...`
 
 You can run:

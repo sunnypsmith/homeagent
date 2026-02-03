@@ -26,7 +26,7 @@ cp .env.example .env
 
 Key fields:
 - `MQTT_HOST`, `DB_HOST` (with host networking, `127.0.0.1` is fine)
-- `SONOS_ANNOUNCE_TARGETS`, `ELEVENLABS_API_KEY`
+- `SONOS_SPEAKER_MAP`, `SONOS_GLOBAL_ANNOUNCE_TARGETS`, `ELEVENLABS_API_KEY`
 - `SONOS_TAIL_PADDING_SECONDS` (optional; helps prevent clipped endings)
 - quiet hours: `QUIET_HOURS_*`
 - calendar (optional): `GCAL_*`

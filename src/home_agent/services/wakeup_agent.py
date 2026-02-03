@@ -107,14 +107,16 @@ async def run_wakeup_agent() -> None:
             else:
                 text = "Good morning Smith Family. It is six A M. It is time to wake up.%s" % weather_line
 
+            announce_data: Dict[str, Any] = {"text": text}
+            targets = settings.sonos.resolve_targets(settings.sonos.wakeup_targets)
+            if targets:
+                announce_data["targets"] = targets
+
             announce = make_event(
                 source="wakeup-agent",
                 typ="announce.request",
                 trace_id=trace_id,
-                data={
-                    "text": text,
-                    # Let the gateway defaults handle volume/targets; override later if needed.
-                },
+                data=announce_data,
             )
             mqttc.publish_json(pub_topic, announce)
             log.info("published", to=pub_topic, trace_id=trace_id, from_event=event_id, from_source=source)

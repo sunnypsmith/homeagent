@@ -64,6 +64,9 @@ Sonos output is handled by the dedicated `sonos-gateway` service:
 - hosts the audio over HTTP on the LAN
 - plays it on Sonos (SoCo), then restores the previous state
 
+Announcements can optionally include `data.targets` (aliases or IPs) to direct
+playback to specific speakers.
+
 The common “true speech on Sonos” pipeline is:
 1) call a TTS API to generate audio bytes
 2) host audio on a local HTTP endpoint

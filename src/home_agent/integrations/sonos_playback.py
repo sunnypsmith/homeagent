@@ -76,6 +76,7 @@ class SonosPlayback:
         done_timeout_seconds: float,
     ) -> None:
         snap = self._Snapshot(spk)
+        was_playing = _is_playing(spk)
         try:
             snap.snapshot()
             try:
@@ -97,6 +98,14 @@ class SonosPlayback:
         finally:
             try:
                 snap.restore()
+                if was_playing:
+                    # Give Sonos a moment to settle after restore, then verify playback.
+                    sleep(5.0)
+                    if not _is_playing(spk):
+                        try:
+                            spk.play()
+                        except Exception:
+                            pass
             except Exception:
                 try:
                     spk.stop()
@@ -154,6 +163,15 @@ def _wait_for_playing(soco_device, timeout_seconds: float) -> None:
             return
         sleep(step)
         waited += step
+
+
+def _is_playing(soco_device) -> bool:
+    try:
+        info = soco_device.get_current_transport_info()
+        state = (info or {}).get("current_transport_state") or ""
+        return str(state).upper() == "PLAYING"
+    except Exception:
+        return False
 
 
 def _wait_for_done_or_timeout(soco_device, timeout_seconds: float) -> None:
