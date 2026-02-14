@@ -27,6 +27,8 @@ All messages on MQTT use the same JSON envelope:
 - **`morning-briefing-agent`**: consumes `time.cron.morning_briefing`, calls LLM + weather (+ optional calendar ICS), emits `announce.request`
 - **`hourly-chime-agent`**: consumes `time.cron.hourly_chime` and emits `announce.request`
 - **`fixed-announcement-agent`**: consumes `time.cron.fixed_announcement` and emits `announce.request` using `data.text`
+- **`hourly-house-check-agent`**: consumes `time.cron.hourly_house_check` and emits `house.check.report` (+ optional announcements)
+- **`exec-briefing-agent`**: consumes `time.cron.exec_briefing` and emits `announce.request` (weather + calendar + financial)
 
 ## Legacy concepts (in-process)
 Some earlier code/doc concepts refer to a single `HomeAgentApp` + in-process `EventBus` modules. They’re still useful patterns, but the active path is the service-based stack above.
@@ -73,3 +75,15 @@ The common “true speech on Sonos” pipeline is:
 3) have Sonos play the audio URL (and restore the previous queue/state)
 
 Quiet hours are **hard-enforced** in `sonos-gateway`.
+
+### Temp Stick
+`integrations/tempstick.py` fetches sensor data via Temp Stick API (temperature + humidity).
+
+### UPS (SNMP)
+`integrations/ups_snmp.py` reads UPS input voltage/frequency via SNMP (UPS-MIB by default).
+
+### Internet egress
+`integrations/internet_check.py` runs a ping sample to estimate latency + packet loss.
+
+### SimpleFIN
+`integrations/simplefin.py` fetches account balances via SimpleFIN API (read-only financial data).

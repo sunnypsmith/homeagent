@@ -30,6 +30,11 @@ Key fields:
 - `SONOS_TAIL_PADDING_SECONDS` (optional; helps prevent clipped endings)
 - quiet hours: `QUIET_HOURS_*`
 - calendar (optional): `GCAL_*`
+- Temp Stick (optional): `TEMPSTICK_*`
+- UPS (optional): `UPS_*`
+- Internet check (optional): `INTERNET_*`
+- SimpleFIN (optional): `SIMPLEFIN_*`
+- Executive briefing (optional): `EXEC_BRIEFING_*`
 - Camect (optional): `CAMECT_*`
 - Caséta + camera lighting (optional): `CASETA_*`, `CAMERA_LIGHTING_*`
   - If you run `caseta-agent` via Compose, also set `CASETA_CERTS_DIR` (host path) so the certs can be mounted into the container at `/certs`.

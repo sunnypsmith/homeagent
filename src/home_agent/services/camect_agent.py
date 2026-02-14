@@ -6,6 +6,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+import base64
+
+import httpx
+
 from home_agent.bus.envelope import make_event
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
@@ -234,6 +238,72 @@ def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]
     except TypeError:
         pass
     return snap(cam_id=cam_id)  # type: ignore[misc]
+
+
+_VISION_SYSTEM_PROMPT = (
+    "You are a home security camera analyst. You will be shown a camera snapshot. "
+    "Describe what you see in one short sentence suitable for a spoken announcement. Focus on:\n"
+    "- Vehicle type and color (e.g., \"white delivery van\", \"red pickup truck\")\n"
+    "- Delivery carrier if identifiable (FedEx, UPS, USPS, Amazon, DHL)\n"
+    "- Person description if visible (e.g., \"person in dark jacket carrying a package\")\n"
+    "- Do not speculate beyond what is clearly visible\n"
+    "- If you cannot identify anything specific, respond with just: UNKNOWN"
+)
+
+
+async def _vision_describe(
+    *,
+    jpeg_bytes: bytes,
+    camera_name: str,
+    kind: str,
+    llm_base_url: str,
+    llm_api_key: str,
+    vision_model: str,
+    timeout_seconds: float = 10.0,
+) -> Optional[str]:
+    """
+    Send a snapshot to a vision LLM and get a short description.
+    Returns None on failure or UNKNOWN.
+    """
+    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+
+    user_prompt = "Camera: %s. Detection type: %s. Describe what you see." % (camera_name, kind)
+
+    headers = {
+        "Authorization": "Bearer %s" % llm_api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": vision_model,
+        "max_tokens": 128,
+        "messages": [
+            {"role": "system", "content": _VISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64,%s" % b64},
+                    },
+                ],
+            },
+        ],
+    }
+
+    url = "%s/chat/completions" % llm_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    text = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text or text.upper() == "UNKNOWN":
+        return None
+    return text
 
 
 @dataclass(frozen=True)
@@ -601,10 +671,41 @@ async def run_camect_agent() -> None:
                 continue
             last_announce_by_cam[throttle_key] = now
 
-            try:
-                text = (settings.camect.announce_template or "").format(camera=spoken_camera, kind=kind)
-            except Exception:
-                text = "%s detected at %s." % (kind, spoken_camera)
+            # Vision analysis (optional): enrich the announcement with a description.
+            vision_desc: Optional[str] = None
+            if settings.camect.vision_enabled and settings.llm.api_key:
+                try:
+                    ts_ms_v = _extract_ts_ms(evt)
+                    jpeg_v = await asyncio.to_thread(
+                        _fetch_snapshot_jpeg_bytes,
+                        hub,
+                        cam_id=cam_id,
+                        ts_ms=ts_ms_v,
+                    )
+                    vision_desc = await asyncio.wait_for(
+                        _vision_describe(
+                            jpeg_bytes=jpeg_v,
+                            camera_name=spoken_camera,
+                            kind=kind,
+                            llm_base_url=settings.llm.base_url,
+                            llm_api_key=settings.llm.api_key,
+                            vision_model=settings.camect.vision_model,
+                            timeout_seconds=settings.camect.vision_timeout_seconds,
+                        ),
+                        timeout=float(settings.camect.vision_timeout_seconds),
+                    )
+                    if vision_desc:
+                        log.info("vision_ok", camera=spoken_camera, desc=vision_desc[:100])
+                except Exception as e:
+                    log.warning("vision_failed", camera=spoken_camera, error=type(e).__name__)
+
+            if vision_desc:
+                text = "Your attention please. %s detected at %s." % (vision_desc, spoken_camera)
+            else:
+                try:
+                    text = (settings.camect.announce_template or "").format(camera=spoken_camera, kind=kind)
+                except Exception:
+                    text = "%s detected at %s." % (kind, spoken_camera)
 
             announce = make_event(
                 source="camect-agent",
@@ -612,7 +713,7 @@ async def run_camect_agent() -> None:
                 data={"text": text},
             )
             mqttc.publish_json(announce_topic, announce)
-            log.info("announce_published", camera=spoken_camera)
+            log.info("announce_published", camera=spoken_camera, vision=bool(vision_desc))
             announced_total += 1
     finally:
         try:

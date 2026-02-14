@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ from home_agent.core.logging import configure_logging, get_logger
 from home_agent.integrations.audio_host import AudioHost
 from home_agent.integrations.sonos_playback import SonosPlayback
 from home_agent.integrations.tts_elevenlabs import ElevenLabsTTSClient
+from home_agent.offline_audio import OFFLINE_AUDIO_ITEMS
 
 
 def _parse_hhmm(s: str) -> int:
@@ -48,6 +50,20 @@ def _is_quiet_now(*, now_local: datetime, weekday_start: str, weekday_end: str, 
 
     # Quiet window crosses midnight.
     return minute >= start or minute < end
+
+
+def _resolve_repo_path(raw: str) -> Path:
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return Path(__file__).resolve().parents[3] / p
+
+
+def _offline_audio_path(settings: AppSettings, key: str) -> Optional[Path]:
+    for item in OFFLINE_AUDIO_ITEMS:
+        if item["key"] == key:
+            return _resolve_repo_path(settings.offline_audio.dir) / item["filename"]
+    return None
 
 
 async def run_sonos_gateway() -> None:
@@ -300,6 +316,8 @@ async def run_sonos_gateway() -> None:
             elif isinstance(concurrency_raw, str) and concurrency_raw.isdigit():
                 concurrency = int(concurrency_raw)
 
+            offline_key = data.get("offline_audio_key") if isinstance(data.get("offline_audio_key"), str) else None
+
             data_targets = data.get("targets")
             play_targets = targets
             if isinstance(data_targets, list) and all(isinstance(x, str) for x in data_targets) and data_targets:
@@ -309,13 +327,26 @@ async def run_sonos_gateway() -> None:
 
             log.info("announce_request", id=event_id, trace_id=trace_id, source=source)
             try:
-                audio = await tts.synthesize(text=text, voice_id=voice_id)
-                hosted = host.host_bytes(
-                    data=audio.data,
-                    filename="announce.%s" % audio.suggested_ext,
-                    content_type=audio.content_type,
-                    route_to_ip=play_targets[0],
-                )
+                hosted = None
+                if offline_key:
+                    path = _offline_audio_path(settings, offline_key)
+                    if path and path.exists():
+                        hosted = host.host_bytes(
+                            data=path.read_bytes(),
+                            filename=path.name,
+                            content_type="audio/wav",
+                            route_to_ip=play_targets[0],
+                        )
+                        log.info("announce_offline_audio", key=offline_key, path=str(path))
+
+                if hosted is None:
+                    audio = await tts.synthesize(text=text, voice_id=voice_id)
+                    hosted = host.host_bytes(
+                        data=audio.data,
+                        filename="announce.%s" % audio.suggested_ext,
+                        content_type=audio.content_type,
+                        route_to_ip=play_targets[0],
+                    )
                 player2 = (
                     player
                     if play_targets == targets
@@ -336,6 +367,38 @@ async def run_sonos_gateway() -> None:
                 last_ok_at = loop.time()
                 log.info("announce_done")
             except Exception:
+                if offline_key:
+                    try:
+                        path = _offline_audio_path(settings, offline_key)
+                        if path and path.exists():
+                            hosted = host.host_bytes(
+                                data=path.read_bytes(),
+                                filename=path.name,
+                                content_type="audio/wav",
+                                route_to_ip=play_targets[0],
+                            )
+                            player2 = (
+                                player
+                                if play_targets == targets
+                                else SonosPlayback(
+                                    speaker_ips=play_targets,
+                                    default_volume=settings.sonos.default_volume,
+                                    speaker_volume_map=settings.sonos.speaker_volume_map,
+                                )
+                            )
+                            await player2.play_url(
+                                url=hosted.url,
+                                volume=volume,
+                                title="Home Agent",
+                                concurrency=concurrency,
+                                tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
+                            )
+                            ok_total += 1
+                            last_ok_at = loop.time()
+                            log.info("announce_done_offline_fallback", key=offline_key, path=str(path))
+                            continue
+                    except Exception:
+                        pass
                 err_total += 1
                 last_err_at = loop.time()
                 last_err_kind = "announce_failed"

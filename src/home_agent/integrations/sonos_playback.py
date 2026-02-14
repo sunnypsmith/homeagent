@@ -35,7 +35,7 @@ class SonosPlayback:
         concurrency: int = 3,
         tail_padding_seconds: float = 3.0,
         expected_duration_seconds: Optional[float] = None,
-        done_timeout_seconds: float = 25.0,
+        done_timeout_seconds: float = 300.0,
     ) -> None:
         """
         v1: play on each configured target (coordinator-aware), in parallel with a limit.
@@ -51,6 +51,7 @@ class SonosPlayback:
 
         async def run_one(item: "_ResolvedTarget") -> None:
             async with sem:
+                member_vols = item.member_volumes if volume is None else None
                 await loop.run_in_executor(
                     None,
                     self._play_url_blocking,
@@ -61,6 +62,7 @@ class SonosPlayback:
                     float(tail_padding_seconds),
                     float(expected_duration_seconds) if expected_duration_seconds is not None else None,
                     float(done_timeout_seconds),
+                    member_vols,
                 )
 
         await asyncio.gather(*(run_one(t) for t in targets))
@@ -74,15 +76,26 @@ class SonosPlayback:
         tail_padding_seconds: float,
         expected_duration_seconds: Optional[float],
         done_timeout_seconds: float,
+        member_volumes: Optional[Dict[str, int]] = None,
     ) -> None:
         snap = self._Snapshot(spk)
         was_playing = _is_playing(spk)
         try:
             snap.snapshot()
-            try:
-                spk.volume = int(volume if volume is not None else self._default_volume)
-            except Exception:
-                pass
+            # Set volume on each individual member speaker (handles grouped speakers).
+            if member_volumes:
+                for member_ip, member_vol in member_volumes.items():
+                    try:
+                        member_spk = self._SoCo(member_ip)
+                        member_spk.volume = max(0, min(100, int(member_vol)))
+                    except Exception:
+                        pass
+            else:
+                target_vol = int(volume if volume is not None else self._default_volume)
+                try:
+                    spk.volume = target_vol
+                except Exception:
+                    pass
             spk.play_uri(url, title=title, start=True)
             _wait_for_playing(spk, timeout_seconds=2.0)
             if expected_duration_seconds is not None and expected_duration_seconds > 0:
@@ -116,6 +129,7 @@ class SonosPlayback:
         """
         Resolve each IP to its current group coordinator (to avoid silent playback).
         De-duplicate coordinators while preserving order.
+        Collect per-speaker volume overrides for all members to set individually.
         """
         seen: Set[str] = set()
         out: List[_ResolvedTarget] = []
@@ -127,27 +141,33 @@ class SonosPlayback:
                 coord = d
             # Unique key: coordinator ip if available.
             key = getattr(coord, "ip_address", None) or ip
-            if key in seen:
-                continue
-            seen.add(key)
-            # Prefer a per-speaker override:
-            # - match by configured target ip first
-            # - then coordinator ip (in case user configured that)
+            # Build per-speaker volume map for this speaker (even if coordinator already seen)
             vol = self._speaker_volume_map.get(ip)
             if vol is None:
                 vol = self._speaker_volume_map.get(str(key))
             if vol is None:
                 vol = int(self._default_volume)
             vol = max(0, min(100, int(vol)))
-            out.append(_ResolvedTarget(device=coord, volume=vol, key=str(key)))
+
+            if key in seen:
+                # Coordinator already queued, but still record this member's volume
+                for t in out:
+                    if t.key == str(key):
+                        t.member_volumes[ip] = vol
+                        break
+                continue
+            seen.add(key)
+            member_vols: Dict[str, int] = {ip: vol}
+            out.append(_ResolvedTarget(device=coord, volume=vol, key=str(key), member_volumes=member_vols))
         return out
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ResolvedTarget:
     device: object
     volume: int
     key: str
+    member_volumes: Dict[str, int]
 
 
 def _wait_for_playing(soco_device, timeout_seconds: float) -> None:

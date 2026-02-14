@@ -23,6 +23,8 @@ camect = ["camect-py>=0.2.1"]
 caseta = ["pylutron-caseta>=0.26.0", "pylutron-caseta[cli]>=0.26.0"]
 gcal = ["icalendar>=6.0.0", "recurring-ical-events>=2.3.0"]
 ui = ["fastapi>=0.110", "uvicorn>=0.27"]
+snmp = ["pysnmp"]
+net = ["pythonping>=1.1.4"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.8"]
 
 [project.scripts]

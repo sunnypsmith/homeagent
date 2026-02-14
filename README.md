@@ -17,10 +17,12 @@ Event-driven home automation / “house agent” stack in Python.
   - morning briefing (LLM + weather + optional calendar ICS)
   - hourly chime
   - fixed announcements (arbitrary text on a schedule)
-- **Camect integration (optional)**: consume AI alerts, publish `camera.event`, and optionally announce
+- **Camect integration (optional)**: consume AI alerts, publish `camera.event`, optionally announce with vision-enriched descriptions
 - **Lutron Caséta integration (optional)**: control devices + scenes (virtual buttons) via LEAP
 - **Camera → lighting automation (optional)**: turn on/off selected Caséta devices based on Camect events + “after dark”
 - **Sunset scene (optional)**: trigger a Caséta scene at local sunset
+- **Home checks (optional)**: scheduled health checks (e.g., Temp Stick thresholds)
+- **Executive briefing (optional)**: M-F briefing with weather, calendar, financial summary (SimpleFIN), dashboard metrics, and configurable news feeds
 
 ## Quick start (local dev)
 
@@ -37,6 +39,8 @@ pip install -e ".[gcal]"    # Calendar ICS parsing (Google/iCloud)
 pip install -e ".[camect]"  # Camect hub integration
 pip install -e ".[caseta]"  # Lutron Caséta integration (+ CLI tools)
 pip install -e ".[ui]"      # Simple LAN web UI (buttons -> MQTT announce.request)
+pip install -e ".[snmp]"    # UPS monitoring via SNMP
+pip install -e ".[net]"     # Internet egress check (ping)
 ```
 
 ## Quick start (Docker / recommended on Linux)
@@ -78,6 +82,8 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent camect-agent`: Camect hub -> MQTT camera events (+ optional announcements)
 - `home-agent caseta-agent`: Lutron Caséta bridge -> MQTT commands/events
 - `home-agent camera-lighting-agent`: camera events -> Caséta lighting automation
+- `home-agent hourly-house-check-agent`: scheduled checks (e.g., Temp Stick thresholds)
+- `home-agent exec-briefing-agent`: daily executive briefing (weather + calendar + financial)
 
 ## Common examples
 
@@ -95,6 +101,85 @@ SMTP_USE_STARTTLS=true
 SMTP_USE_SSL=false
 SMTP_TIMEOUT_SECONDS=20
 ```
+
+### Temp Stick thresholds (optional)
+
+```bash
+TEMPSTICK_ENABLED=true
+TEMPSTICK_API_KEY=YOUR_TEMPSTICK_KEY_HERE
+TEMPSTICK_SENSOR_NAME=Greatroom
+TEMPSTICK_TEMP_LOW_F=60
+TEMPSTICK_TEMP_HIGH_F=78
+TEMPSTICK_HUMIDITY_LOW=20
+TEMPSTICK_HUMIDITY_HIGH=60
+```
+
+Set these in your repo-root `.env`.
+
+### UPS line input thresholds (optional)
+
+```bash
+UPS_ENABLED=true
+UPS_HOST=10.1.2.200
+UPS_COMMUNITY=public
+UPS_INPUT_VOLTAGE_LOW=108
+UPS_INPUT_VOLTAGE_HIGH=126
+UPS_INPUT_FREQUENCY_LOW=59.5
+UPS_INPUT_FREQUENCY_HIGH=60.5
+```
+
+Set these in your repo-root `.env`.
+
+### Internet egress check (optional)
+
+```bash
+INTERNET_CHECK_ENABLED=true
+INTERNET_CHECK_HOST=1.1.1.1
+INTERNET_CHECK_DURATION_SECONDS=10
+INTERNET_MAX_PACKET_LOSS_PERCENT=1
+INTERNET_MAX_LATENCY_MS=100
+```
+
+Set these in your repo-root `.env`.
+
+### Executive briefing (optional)
+
+```bash
+SIMPLEFIN_ENABLED=true
+SIMPLEFIN_ACCESS_URL=https://user:pass@beta-bridge.simplefin.org/simplefin
+EXEC_BRIEFING_TARGETS=office
+EXEC_BRIEFING_ICS_URL=https://calendar.google.com/calendar/ical/.../basic.ics
+EXEC_BRIEFING_DASHBOARD_URL=http://your-dashboard:port/path
+EXEC_BRIEFING_NEWS_HEADLINES=5
+EXEC_BRIEFING_FEED_1=AI News|https://rss.app/feeds/v1.1/XXXX.json
+EXEC_BRIEFING_FEED_2=Tech|https://rss.app/feeds/v1.1/YYYY.json
+```
+
+Trigger manually:
+
+```bash
+home-agent trigger-exec-briefing
+```
+
+### Camect vision analysis (optional)
+
+Enrich camera announcements with vision LLM descriptions (vehicle color/type, delivery carrier, person description):
+
+```bash
+CAMECT_VISION_ENABLED=true
+CAMECT_VISION_MODEL=meta-llama/llama-4-maverick-17b-128e-instruct
+CAMECT_VISION_TIMEOUT_SECONDS=10
+```
+
+### Offline announcement audio (optional)
+
+Generate offline WAV files (uses ElevenLabs settings in `.env`):
+
+```bash
+python scripts/generate_offline_audio.py
+```
+
+Files are written to `OFFLINE_AUDIO_DIR` (default: `assets/offline`).
 
 ### Sonos discovery (writes `SONOS_SPEAKER_MAP`)
 

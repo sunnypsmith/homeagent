@@ -21,7 +21,13 @@ class ElevenLabsTTSClient(TTSClient):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
 
-    async def synthesize(self, *, text: str, voice_id: Optional[str] = None) -> AudioBytes:
+    async def synthesize(
+        self,
+        *,
+        text: str,
+        voice_id: Optional[str] = None,
+        output_format: Optional[str] = None,
+    ) -> AudioBytes:
         if not self._api_key:
             raise RuntimeError("ELEVENLABS_API_KEY is not set")
 
@@ -33,6 +39,8 @@ class ElevenLabsTTSClient(TTSClient):
             "accept": "audio/mpeg",
             "content-type": "application/json",
         }
+        if output_format and output_format.startswith("wav"):
+            headers["accept"] = "audio/wav"
         payload: Dict[str, Any] = {
             "text": text,
             # Defaults are fine to start; tune later.
@@ -40,7 +48,8 @@ class ElevenLabsTTSClient(TTSClient):
         }
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+            params = {"output_format": output_format} if output_format else None
+            resp = await client.post(url, json=payload, headers=headers, params=params)
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
@@ -55,5 +64,13 @@ class ElevenLabsTTSClient(TTSClient):
                     request=e.request,
                     response=e.response,
                 )
-            return AudioBytes(content_type="audio/mpeg", data=resp.content, suggested_ext="mp3")
+            content_type = resp.headers.get("content-type", "audio/mpeg")
+            suggested_ext = "mp3"
+            if output_format:
+                of = output_format.lower()
+                if of.startswith("wav"):
+                    suggested_ext = "wav"
+                elif of.startswith("pcm"):
+                    suggested_ext = "wav"
+            return AudioBytes(content_type=content_type, data=resp.content, suggested_ext=suggested_ext)
 

@@ -407,6 +407,221 @@ class GCalSettings(BaseSettings):
         return _strip_quotes(str(v)).strip()
 
 
+class TempStickSettings(BaseSettings):
+    """
+    Temp Stick API (temperature/humidity sensors).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="TEMPSTICK_ENABLED")
+    api_key: str = Field(default="", alias="TEMPSTICK_API_KEY")
+    sensor_id: str = Field(default="", alias="TEMPSTICK_SENSOR_ID")
+    sensor_name: str = Field(default="", alias="TEMPSTICK_SENSOR_NAME")
+    # Thresholds (optional) - temperature in Fahrenheit, humidity in percent.
+    temp_low_f: Optional[float] = Field(default=None, alias="TEMPSTICK_TEMP_LOW_F")
+    temp_high_f: Optional[float] = Field(default=None, alias="TEMPSTICK_TEMP_HIGH_F")
+    humidity_low: Optional[float] = Field(default=None, alias="TEMPSTICK_HUMIDITY_LOW")
+    humidity_high: Optional[float] = Field(default=None, alias="TEMPSTICK_HUMIDITY_HIGH")
+    timeout_seconds: float = Field(default=15.0, alias="TEMPSTICK_TIMEOUT_SECONDS")
+
+    @field_validator("api_key", "sensor_id", "sensor_name", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
+class UpsSettings(BaseSettings):
+    """
+    UPS input power monitoring via SNMP (e.g., Tripp Lite).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="UPS_ENABLED")
+    name: str = Field(default="UPS", alias="UPS_NAME")
+    host: str = Field(default="", alias="UPS_HOST")
+    port: int = Field(default=161, alias="UPS_PORT")
+    community: str = Field(default="public", alias="UPS_COMMUNITY")
+    version: str = Field(default="2c", alias="UPS_SNMP_VERSION")
+    timeout_seconds: float = Field(default=2.0, alias="UPS_TIMEOUT_SECONDS")
+    retries: int = Field(default=1, alias="UPS_RETRIES")
+
+    # OIDs (defaults to standard UPS-MIB input voltage/frequency)
+    input_voltage_oid: str = Field(
+        default="1.3.6.1.2.1.33.1.3.3.1.3.1", alias="UPS_INPUT_VOLTAGE_OID"
+    )
+    input_frequency_oid: str = Field(
+        default="1.3.6.1.2.1.33.1.3.3.1.2.1", alias="UPS_INPUT_FREQUENCY_OID"
+    )
+    # Scale factors to convert raw SNMP values to volts/Hz.
+    input_voltage_scale: float = Field(default=1.0, alias="UPS_INPUT_VOLTAGE_SCALE")
+    input_frequency_scale: float = Field(default=0.1, alias="UPS_INPUT_FREQUENCY_SCALE")
+
+    # Thresholds (optional)
+    input_voltage_low: Optional[float] = Field(default=None, alias="UPS_INPUT_VOLTAGE_LOW")
+    input_voltage_high: Optional[float] = Field(default=None, alias="UPS_INPUT_VOLTAGE_HIGH")
+    input_frequency_low: Optional[float] = Field(default=None, alias="UPS_INPUT_FREQUENCY_LOW")
+    input_frequency_high: Optional[float] = Field(default=None, alias="UPS_INPUT_FREQUENCY_HIGH")
+
+    @field_validator(
+        "name",
+        "host",
+        "community",
+        "version",
+        "input_voltage_oid",
+        "input_frequency_oid",
+        mode="before",
+    )
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
+class InternetSettings(BaseSettings):
+    """
+    Internet egress check (packet loss + latency).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="INTERNET_CHECK_ENABLED")
+    host: str = Field(default="", alias="INTERNET_CHECK_HOST")
+    duration_seconds: float = Field(default=10.0, alias="INTERNET_CHECK_DURATION_SECONDS")
+    interval_seconds: float = Field(default=1.0, alias="INTERNET_CHECK_INTERVAL_SECONDS")
+    timeout_seconds: float = Field(default=1.0, alias="INTERNET_CHECK_TIMEOUT_SECONDS")
+    max_latency_ms: float = Field(default=100.0, alias="INTERNET_MAX_LATENCY_MS")
+    max_loss_percent: float = Field(default=1.0, alias="INTERNET_MAX_PACKET_LOSS_PERCENT")
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
+class OfflineAudioSettings(BaseSettings):
+    """
+    Pre-generated offline announcement audio.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    dir: str = Field(default="assets/offline", alias="OFFLINE_AUDIO_DIR")
+
+    @field_validator("dir", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
+class SimpleFINSettings(BaseSettings):
+    """
+    SimpleFIN (read-only financial data).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="SIMPLEFIN_ENABLED")
+    access_url: str = Field(default="", alias="SIMPLEFIN_ACCESS_URL")
+    timeout_seconds: float = Field(default=30.0, alias="SIMPLEFIN_TIMEOUT_SECONDS")
+
+    @field_validator("access_url", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
+class ExecBriefingSettings(BaseSettings):
+    """
+    Executive briefing agent.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    targets: str = Field(default="", alias="EXEC_BRIEFING_TARGETS")
+    ics_url: str = Field(default="", alias="EXEC_BRIEFING_ICS_URL")
+    dashboard_url: str = Field(default="", alias="EXEC_BRIEFING_DASHBOARD_URL")
+    dashboard_vision_model: str = Field(
+        default="meta-llama/llama-4-maverick-17b-128e-instruct",
+        alias="EXEC_BRIEFING_DASHBOARD_VISION_MODEL",
+    )
+    news_headlines: int = Field(default=5, alias="EXEC_BRIEFING_NEWS_HEADLINES")
+
+    @field_validator("targets", "ics_url", "dashboard_url", "dashboard_vision_model", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+    @property
+    def news_feeds(self) -> List[Dict[str, str]]:
+        """
+        Parse EXEC_BRIEFING_FEED_N env vars.
+        Format: EXEC_BRIEFING_FEED_1=Label|URL
+        """
+        import os
+        feeds: List[Dict[str, str]] = []
+        env_path = Path(_env_files()[1])
+        env_vars: Dict[str, str] = {}
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    env_vars[k.strip()] = v.strip()
+        # Also check os.environ
+        for k, v in os.environ.items():
+            env_vars[k] = v
+
+        for key in sorted(env_vars.keys()):
+            if not key.startswith("EXEC_BRIEFING_FEED_"):
+                continue
+            raw = _strip_quotes(env_vars[key]).strip()
+            if not raw:
+                continue
+            if "|" in raw:
+                label, url = raw.split("|", 1)
+                label = label.strip()
+                url = url.strip()
+            else:
+                url = raw
+                label = "News"
+            if url:
+                feeds.append({"label": label, "url": url})
+        return feeds
+
+
 class LLMSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="",
@@ -560,6 +775,13 @@ class CamectSettings(BaseSettings):
     announce_template: str = Field(default="{kind} detected at {camera}.", alias="CAMECT_ANNOUNCE_TEMPLATE")
     # Optional: comma-delimited list of recipients to email snapshot images to (empty disables).
     email_alert_pics_to: str = Field(default="", alias="CAMECT_EMAIL_ALERT_PICS_TO")
+    # Vision analysis of snapshots before announcing.
+    vision_enabled: bool = Field(default=False, alias="CAMECT_VISION_ENABLED")
+    vision_model: str = Field(
+        default="meta-llama/llama-4-maverick-17b-128e-instruct",
+        alias="CAMECT_VISION_MODEL",
+    )
+    vision_timeout_seconds: float = Field(default=10.0, alias="CAMECT_VISION_TIMEOUT_SECONDS")
 
     @field_validator(
         "host",
@@ -569,6 +791,7 @@ class CamectSettings(BaseSettings):
         "event_filter",
         "announce_template",
         "email_alert_pics_to",
+        "vision_model",
         mode="before",
     )
     @classmethod
@@ -824,6 +1047,12 @@ class AppSettings(BaseSettings):
     db: DbSettings = DbSettings()
     weather: WeatherSettings = WeatherSettings()
     gcal: GCalSettings = GCalSettings()
+    tempstick: TempStickSettings = TempStickSettings()
+    ups: UpsSettings = UpsSettings()
+    internet: InternetSettings = InternetSettings()
+    offline_audio: OfflineAudioSettings = OfflineAudioSettings()
+    simplefin: SimpleFINSettings = SimpleFINSettings()
+    exec_briefing: ExecBriefingSettings = ExecBriefingSettings()
     quiet_hours: QuietHoursSettings = QuietHoursSettings()
     smtp: SmtpSettings = SmtpSettings()
     sunset_scene: SunsetSceneSettings = SunsetSceneSettings()

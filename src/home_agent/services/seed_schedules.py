@@ -38,6 +38,12 @@ def default_seed_schedules(*, timezone: str, base_topic: str) -> List[SeedSchedu
     chime_topic = "%s/time/cron/hourly_chime" % base_topic
     chime_type = "time.cron.hourly_chime"
 
+    house_topic = "%s/time/cron/hourly_house_check" % base_topic
+    house_type = "time.cron.hourly_house_check"
+
+    exec_topic = "%s/time/cron/exec_briefing" % base_topic
+    exec_type = "time.cron.exec_briefing"
+
     return [
         SeedSchedule(
             name="wakeup_weekday_0600",
@@ -102,6 +108,46 @@ def default_seed_schedules(*, timezone: str, base_topic: str) -> List[SeedSchedu
             mqtt_topic=chime_topic,
             event_type=chime_type,
             data={"variant": "weekend"},
+        ),
+        SeedSchedule(
+            name="hourly_house_check",
+            enabled=True,
+            kind="cron",
+            timezone=timezone,
+            spec="0 * * * *",
+            mqtt_topic=house_topic,
+            event_type=house_type,
+            data={},
+        ),
+        SeedSchedule(
+            name="exec_briefing_weekday_0900",
+            enabled=True,
+            kind="cron",
+            timezone=timezone,
+            spec="0 9 * * mon-fri",
+            mqtt_topic=exec_topic,
+            event_type=exec_type,
+            data={},
+        ),
+        SeedSchedule(
+            name="exec_briefing_weekday_1200",
+            enabled=True,
+            kind="cron",
+            timezone=timezone,
+            spec="0 12 * * mon-fri",
+            mqtt_topic=exec_topic,
+            event_type=exec_type,
+            data={},
+        ),
+        SeedSchedule(
+            name="exec_briefing_weekday_1600",
+            enabled=True,
+            kind="cron",
+            timezone=timezone,
+            spec="0 16 * * mon-fri",
+            mqtt_topic=exec_topic,
+            event_type=exec_type,
+            data={},
         ),
     ]
 

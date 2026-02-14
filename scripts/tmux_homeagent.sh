@@ -61,9 +61,9 @@ tmux select-pane -t "$SESSION:0.1" -T "sonos-gateway"
 tmux select-pane -t "$SESSION:0.2" -T "event-recorder"
 tmux select-pane -t "$SESSION:0.3" -T "shell"
 
-tmux send-keys -t "$SESSION:0.0" "$(cmd time-trigger 'HOME_AGENT_LOG_LEVEL=WARNING home-agent time-trigger')" C-m
-tmux send-keys -t "$SESSION:0.1" "$(cmd sonos-gateway 'HOME_AGENT_LOG_LEVEL=INFO home-agent sonos-gateway')" C-m
-tmux send-keys -t "$SESSION:0.2" "$(cmd event-recorder 'HOME_AGENT_LOG_LEVEL=INFO home-agent event-recorder')" C-m
+tmux send-keys -t "$SESSION:0.0" "$(cmd time-trigger 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent time-trigger')" C-m
+tmux send-keys -t "$SESSION:0.1" "$(cmd sonos-gateway 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent sonos-gateway')" C-m
+tmux send-keys -t "$SESSION:0.2" "$(cmd event-recorder 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent event-recorder')" C-m
 tmux send-keys -t "$SESSION:0.3" "cd /workspace" C-m
 
 #
@@ -80,10 +80,10 @@ tmux select-pane -t "$SESSION:1.1" -T "morning-briefing"
 tmux select-pane -t "$SESSION:1.2" -T "hourly-chime"
 tmux select-pane -t "$SESSION:1.3" -T "fixed-announcements"
 
-tmux send-keys -t "$SESSION:1.0" "$(cmd wakeup-agent 'HOME_AGENT_LOG_LEVEL=INFO home-agent wakeup-agent')" C-m
-tmux send-keys -t "$SESSION:1.1" "$(cmd morning-briefing 'HOME_AGENT_LOG_LEVEL=INFO home-agent morning-briefing-agent')" C-m
-tmux send-keys -t "$SESSION:1.2" "$(cmd hourly-chime 'HOME_AGENT_LOG_LEVEL=INFO home-agent hourly-chime-agent')" C-m
-tmux send-keys -t "$SESSION:1.3" "$(cmd fixed-announcements 'HOME_AGENT_LOG_LEVEL=INFO home-agent fixed-announcement-agent')" C-m
+tmux send-keys -t "$SESSION:1.0" "$(cmd wakeup-agent 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent wakeup-agent')" C-m
+tmux send-keys -t "$SESSION:1.1" "$(cmd morning-briefing 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent morning-briefing-agent')" C-m
+tmux send-keys -t "$SESSION:1.2" "$(cmd hourly-chime 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent hourly-chime-agent')" C-m
+tmux send-keys -t "$SESSION:1.3" "$(cmd fixed-announcements 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent fixed-announcement-agent')" C-m
 
 #
 # Window 2: integrations (2x2)
@@ -99,9 +99,9 @@ tmux select-pane -t "$SESSION:2.1" -T "caseta-agent"
 tmux select-pane -t "$SESSION:2.2" -T "camera-lighting"
 tmux select-pane -t "$SESSION:2.3" -T "shell"
 
-tmux send-keys -t "$SESSION:2.0" "$(cmd camect 'HOME_AGENT_LOG_LEVEL=INFO home-agent camect-agent')" C-m
-tmux send-keys -t "$SESSION:2.1" "$(cmd caseta 'HOME_AGENT_LOG_LEVEL=INFO home-agent caseta-agent')" C-m
-tmux send-keys -t "$SESSION:2.2" "$(cmd camera-lighting 'HOME_AGENT_LOG_LEVEL=INFO home-agent camera-lighting-agent')" C-m
+tmux send-keys -t "$SESSION:2.0" "$(cmd camect 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent camect-agent')" C-m
+tmux send-keys -t "$SESSION:2.1" "$(cmd caseta 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent caseta-agent')" C-m
+tmux send-keys -t "$SESSION:2.2" "$(cmd camera-lighting 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent camera-lighting-agent')" C-m
 tmux send-keys -t "$SESSION:2.3" "cd /workspace" C-m
 
 #
@@ -109,7 +109,17 @@ tmux send-keys -t "$SESSION:2.3" "cd /workspace" C-m
 #
 tmux new-window -t "$SESSION:3" -n ui
 tmux select-pane -t "$SESSION:3.0" -T "ui-gateway"
-tmux send-keys -t "$SESSION:3.0" "$(cmd ui-gateway 'HOME_AGENT_LOG_LEVEL=INFO home-agent ui-gateway')" C-m
+tmux send-keys -t "$SESSION:3.0" "$(cmd ui-gateway 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent ui-gateway')" C-m
+
+#
+# Window 4: checks + exec briefing (2 panes)
+#
+tmux new-window -t "$SESSION:4" -n checks
+tmux split-window -v -t "$SESSION:4"
+tmux select-pane -t "$SESSION:4.0" -T "hourly-house-check"
+tmux select-pane -t "$SESSION:4.1" -T "exec-briefing"
+tmux send-keys -t "$SESSION:4.0" "$(cmd hourly-house-check 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent hourly-house-check-agent')" C-m
+tmux send-keys -t "$SESSION:4.1" "$(cmd exec-briefing 'HOME_AGENT_LOG_LEVEL=DEBUG home-agent exec-briefing-agent')" C-m
 
 tmux select-window -t "$SESSION:0"
 exec tmux attach -t "$SESSION"

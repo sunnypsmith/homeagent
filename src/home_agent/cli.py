@@ -27,6 +27,7 @@ from home_agent.services.time_trigger import main as time_trigger_main
 from home_agent.services.ui_gateway import main as ui_gateway_main
 from home_agent.services.monitor_tui import main as monitor_main
 from home_agent.services.wakeup_agent import main as wakeup_agent_main
+from home_agent.services.exec_briefing_agent import main as exec_briefing_agent_main
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -312,6 +313,39 @@ def trigger_hourly_chime() -> None:
     typer.echo("Published %s to %s" % (evt["type"], topic))
 
 
+@app.command("trigger-exec-briefing")
+def trigger_exec_briefing() -> None:
+    """Publish a time event to trigger the executive briefing immediately."""
+    settings = AppSettings()
+    configure_logging(settings.log_level)
+
+    topic = f"{settings.mqtt.base_topic}/time/cron/exec_briefing"
+    evt = make_event(
+        source="manual",
+        typ="time.cron.exec_briefing",
+        data={"manual": True},
+    )
+
+    import asyncio
+
+    async def _run() -> None:
+        mqttc = MqttClient(
+            host=settings.mqtt.host,
+            port=settings.mqtt.port,
+            username=settings.mqtt.username,
+            password=settings.mqtt.password,
+            client_id="homeagent-trigger-exec-briefing",
+        )
+        await mqttc.connect()
+        try:
+            mqttc.publish_json(topic, evt)
+        finally:
+            await mqttc.close()
+
+    asyncio.run(_run())
+    typer.echo("Published %s to %s" % (evt["type"], topic))
+
+
 @app.command("hourly-chime-agent")
 def hourly_chime_agent() -> None:
     """Run hourly chime agent (time event -> announce.request)."""
@@ -322,6 +356,12 @@ def hourly_chime_agent() -> None:
 def hourly_house_check_agent() -> None:
     """Run hourly house check agent (stub) (time event -> house.check.request)."""
     raise SystemExit(hourly_house_check_agent_main())
+
+@app.command("exec-briefing-agent")
+def exec_briefing_agent() -> None:
+    """Run executive briefing agent (time event -> announce.request)."""
+    raise SystemExit(exec_briefing_agent_main())
+
 
 @app.command("caseta-agent")
 def caseta_agent() -> None:

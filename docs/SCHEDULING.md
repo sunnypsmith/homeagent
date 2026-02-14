@@ -19,6 +19,12 @@ Examples:
 home-agent seed-schedules
 ```
 
+Defaults include:
+- wakeup + morning briefing schedules
+- hourly chime (daytime only)
+- hourly house check
+- executive briefing (9am M-F)
+
 ## Trigger a morning briefing now (for testing)
 
 ```bash
@@ -52,6 +58,21 @@ To execute fixed announcements, run:
 - `home-agent sonos-gateway`
 
 Quiet hours are enforced at `sonos-gateway`.
+
+## Hourly house checks (optional)
+
+The `hourly-house-check-agent` listens for:
+- `event_type = time.cron.hourly_house_check`
+
+It publishes a summary event:
+- topic: `homeagent/house/check/report`
+- type: `house.check.report`
+
+If any checks are out of bounds (e.g., Temp Stick thresholds), it also publishes:
+- topic: `homeagent/announce/request`
+- type: `announce.request`
+ 
+Available checks include Temp Stick, UPS input metrics, and internet egress.
 
 ## Sunset scene (optional)
 
