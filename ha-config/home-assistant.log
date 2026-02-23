@@ -1,0 +1,4 @@
+2026-02-21 16:54:09.662 ERROR (MainThread) [homeassistant.components.http] Failed to create HTTP server at port 8123: [Errno 98] error while attempting to bind on address ('0.0.0.0', 8123): [errno 98] address in use
+2026-02-21 16:54:09.783 ERROR (MainThread) [homeassistant.config] Invalid config for 'mqtt' at configuration.yaml, line 15: 'broker' is an invalid option for 'mqtt', check: mqtt->0->broker, please check the docs at https://www.home-assistant.io/integrations/mqtt
+Invalid config for 'mqtt' at configuration.yaml, line 15: 'port' is an invalid option for 'mqtt', check: mqtt->0->port, please check the docs at https://www.home-assistant.io/integrations/mqtt
+2026-02-21 16:54:09.783 ERROR (MainThread) [homeassistant.setup] Setup failed for 'mqtt': Invalid config.

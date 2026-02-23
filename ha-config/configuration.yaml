@@ -1,0 +1,26 @@
+# Home Assistant Core — used as a voice pipeline bridge only.
+# Voice transcriptions are forwarded to the home-agent MQTT bus.
+
+homeassistant:
+  name: Home Agent Voice Bridge
+  unit_system: imperial
+  time_zone: America/New_York
+  currency: USD
+
+# HTTP access (for initial setup and ESPHome dashboard)
+http:
+  server_port: 8123
+
+# MQTT — connects to the same broker as the home-agent stack.
+mqtt:
+  broker: 127.0.0.1
+  port: 1883
+
+# Logger
+logger:
+  default: warning
+  logs:
+    homeassistant.components.mqtt: info
+
+# Automations (loaded from automations.yaml)
+automation: !include automations.yaml

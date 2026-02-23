@@ -218,17 +218,18 @@ def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]
         raise RuntimeError("camect_snapshot_not_supported")
 
     # Try with timestamp if present, otherwise fall back to latest snapshot.
-    if ts_ms is not None:
+    # Camect API: snapshot_camera(cam_id, width=0, height=0, ts_ms=0)
+    if ts_ms is not None and int(ts_ms) > 0:
         try:
-            return snap(cam_id, ts_ms)  # type: ignore[misc]
+            return snap(cam_id, 0, 0, int(ts_ms))  # type: ignore[misc]
         except TypeError:
             pass
         try:
-            return snap(cam_id, ts_ms=ts_ms)  # type: ignore[misc]
+            return snap(cam_id, ts_ms=int(ts_ms))  # type: ignore[misc]
         except TypeError:
             pass
         try:
-            return snap(cam_id=cam_id, ts_ms=ts_ms)  # type: ignore[misc]
+            return snap(cam_id=cam_id, ts_ms=int(ts_ms))  # type: ignore[misc]
         except TypeError:
             pass
 
@@ -241,33 +242,70 @@ def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]
 
 
 _VISION_SYSTEM_PROMPT = (
-    "You are a home security camera analyst. You will be shown a camera snapshot. "
-    "Describe what you see in one short sentence suitable for a spoken announcement. Focus on:\n"
-    "- Vehicle type and color (e.g., \"white delivery van\", \"red pickup truck\")\n"
-    "- Delivery carrier if identifiable (FedEx, UPS, USPS, Amazon, DHL)\n"
-    "- Person description if visible (e.g., \"person in dark jacket carrying a package\")\n"
-    "- Do not speculate beyond what is clearly visible\n"
-    "- If you cannot identify anything specific, respond with just: UNKNOWN"
+    "You compare two security camera images. Image 1 is before. Image 2 is now. "
+    "A {kind} was just detected. Reply with ONLY a short noun phrase describing what is new. "
+    "Examples of good replies: \"white FedEx van\", \"person in red jacket with package\", "
+    "\"black SUV\", \"Amazon delivery driver\". "
+    "No explanation. No narration. No full sentences. Just the noun phrase. "
+    "If nothing new is visible, reply: UNKNOWN"
 )
 
 
 async def _vision_describe(
     *,
-    jpeg_bytes: bytes,
+    jpeg_before: Optional[bytes],
+    jpeg_after: bytes,
     camera_name: str,
     kind: str,
     llm_base_url: str,
     llm_api_key: str,
     vision_model: str,
+    detail: str = "auto",
     timeout_seconds: float = 10.0,
 ) -> Optional[str]:
     """
-    Send a snapshot to a vision LLM and get a short description.
+    Send before/after snapshots to a vision LLM and get a description of what's new.
     Returns None on failure or UNKNOWN.
     """
-    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+    b64_after = base64.b64encode(jpeg_after).decode("utf-8")
 
-    user_prompt = "Camera: %s. Detection type: %s. Describe what you see." % (camera_name, kind)
+    system = _VISION_SYSTEM_PROMPT.replace("{kind}", kind)
+
+    img_detail = detail if detail in ("low", "high", "auto") else "auto"
+
+    image_content: list = []
+    if jpeg_before is not None:
+        b64_before = base64.b64encode(jpeg_before).decode("utf-8")
+        image_content.append(
+            {"type": "text", "text": "Image 1 (60 seconds ago, BEFORE):"}
+        )
+        image_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,%s" % b64_before, "detail": img_detail},
+            }
+        )
+        image_content.append(
+            {"type": "text", "text": "Image 2 (right now, AFTER — the new %s was just detected):" % kind}
+        )
+        image_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,%s" % b64_after, "detail": img_detail},
+            }
+        )
+        user_prompt = "Camera: %s. What is NEW in the second image?" % camera_name
+    else:
+        # No before image available — fall back to single-image analysis.
+        image_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,%s" % b64_after, "detail": img_detail},
+            }
+        )
+        user_prompt = "Camera: %s. Detection type: %s. Describe what you see." % (camera_name, kind)
+
+    image_content.insert(0, {"type": "text", "text": user_prompt})
 
     headers = {
         "Authorization": "Bearer %s" % llm_api_key,
@@ -277,17 +315,8 @@ async def _vision_describe(
         "model": vision_model,
         "max_tokens": 128,
         "messages": [
-            {"role": "system", "content": _VISION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": "data:image/jpeg;base64,%s" % b64},
-                    },
-                ],
-            },
+            {"role": "system", "content": system},
+            {"role": "user", "content": image_content},
         ],
     }
 
@@ -567,7 +596,7 @@ async def run_camect_agent() -> None:
             mqttc.publish_json(event_topic, camera_event)
 
             throttle_key = cam_name or cam_id or "unknown"
-            spoken_camera = cam_name or cam_id or "camera"
+            spoken_camera = (cam_name or cam_id or "camera").replace("_", " ")
             kind = _spoken_kind_from_event(evt, token)
 
             # Optionally email a snapshot image (JPEG) for this event.
@@ -671,25 +700,43 @@ async def run_camect_agent() -> None:
                 continue
             last_announce_by_cam[throttle_key] = now
 
-            # Vision analysis (optional): enrich the announcement with a description.
+            # Vision analysis (optional): enrich the announcement with before/after comparison.
             vision_desc: Optional[str] = None
             if settings.camect.vision_enabled and settings.llm.api_key:
                 try:
                     ts_ms_v = _extract_ts_ms(evt)
-                    jpeg_v = await asyncio.to_thread(
+                    # Fetch "after" snapshot (current).
+                    jpeg_after = await asyncio.to_thread(
                         _fetch_snapshot_jpeg_bytes,
                         hub,
                         cam_id=cam_id,
                         ts_ms=ts_ms_v,
                     )
+                    # Fetch "before" snapshot (60 seconds ago).
+                    jpeg_before: Optional[bytes] = None
+                    try:
+                        before_ts = (ts_ms_v - 60000) if ts_ms_v else (int(time.time() * 1000) - 60000)
+                        jpeg_before = await asyncio.to_thread(
+                            _fetch_snapshot_jpeg_bytes,
+                            hub,
+                            cam_id=cam_id,
+                            ts_ms=before_ts,
+                        )
+                    except Exception as e_before:
+                        log.warning("vision_before_snapshot_failed", camera=spoken_camera, error=type(e_before).__name__, detail=str(e_before)[:200])
+
+                    v_base = settings.camect.vision_base_url or settings.llm.base_url
+                    v_key = settings.camect.vision_api_key or settings.llm.api_key
                     vision_desc = await asyncio.wait_for(
                         _vision_describe(
-                            jpeg_bytes=jpeg_v,
+                            jpeg_before=jpeg_before,
+                            jpeg_after=jpeg_after,
                             camera_name=spoken_camera,
                             kind=kind,
-                            llm_base_url=settings.llm.base_url,
-                            llm_api_key=settings.llm.api_key,
+                            llm_base_url=v_base,
+                            llm_api_key=v_key,
                             vision_model=settings.camect.vision_model,
+                            detail=settings.camect.vision_detail,
                             timeout_seconds=settings.camect.vision_timeout_seconds,
                         ),
                         timeout=float(settings.camect.vision_timeout_seconds),

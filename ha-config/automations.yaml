@@ -1,0 +1,29 @@
+# Forward voice assistant transcriptions to the home-agent MQTT bus.
+# When a voice assistant finishes STT, publish the text to MQTT.
+- id: voice_to_mqtt
+  alias: "Voice command to MQTT"
+  trigger:
+    - platform: event
+      event_type: assist_pipeline_run_end
+  condition:
+    - condition: template
+      value_template: >-
+        {{ trigger.event.data.stt_output is defined and
+           trigger.event.data.stt_output.text | default('') | length > 0 }}
+  action:
+    - service: mqtt.publish
+      data:
+        topic: "homeagent/voice/command"
+        payload: >-
+          {
+            "id": "{{ (now().timestamp() * 1000) | int | string }}",
+            "ts": "{{ now().isoformat() }}",
+            "source": "voice-assistant",
+            "type": "voice.command",
+            "trace_id": "voice-{{ (now().timestamp() * 1000) | int | string }}",
+            "data": {
+              "text": {{ trigger.event.data.stt_output.text | tojson }},
+              "device_id": {{ (trigger.event.data.device_id | default('unknown')) | tojson }}
+            }
+          }
+        retain: false

@@ -781,6 +781,9 @@ class CamectSettings(BaseSettings):
         default="meta-llama/llama-4-maverick-17b-128e-instruct",
         alias="CAMECT_VISION_MODEL",
     )
+    vision_base_url: str = Field(default="", alias="CAMECT_VISION_BASE_URL")
+    vision_api_key: str = Field(default="", alias="CAMECT_VISION_API_KEY")
+    vision_detail: str = Field(default="auto", alias="CAMECT_VISION_DETAIL")
     vision_timeout_seconds: float = Field(default=10.0, alias="CAMECT_VISION_TIMEOUT_SECONDS")
 
     @field_validator(
@@ -792,6 +795,9 @@ class CamectSettings(BaseSettings):
         "announce_template",
         "email_alert_pics_to",
         "vision_model",
+        "vision_base_url",
+        "vision_api_key",
+        "vision_detail",
         mode="before",
     )
     @classmethod
