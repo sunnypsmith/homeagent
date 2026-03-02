@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -8,6 +9,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from home_agent.bus.envelope import make_event
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
@@ -99,6 +101,9 @@ async def run_sonos_gateway() -> None:
     await mqttc.connect()
     log.info("mqtt_connected", host=settings.mqtt.host, port=settings.mqtt.port)
 
+    reporter = ErrorReporter(mqttc=mqttc, service="sonos-gateway", base_topic=settings.mqtt.base_topic)
+    reporter.start_heartbeat(interval_seconds=30.0)
+
     topic = "%s/announce/request" % settings.mqtt.base_topic
     mqttc.subscribe(topic)
     log.info("subscribed", topic=topic)
@@ -118,6 +123,17 @@ async def run_sonos_gateway() -> None:
     ok_total = 0
     err_total = 0
     muted_until_unix = 0
+    pending_msg = None
+    active_players: set = set()
+
+    async def _restore_active() -> None:
+        nonlocal active_players
+        for p in list(active_players):
+            try:
+                await p.restore_all()
+            except Exception:
+                log.exception("snapshot_restore_error")
+        active_players.clear()
 
     async def status_loop() -> None:
         nonlocal last_request_at, last_ok_at, last_err_at, last_err_kind, muted_until_unix
@@ -167,7 +183,13 @@ async def run_sonos_gateway() -> None:
 
     try:
         while True:
-            msg = await mqttc.next_message()
+            if pending_msg is not None:
+                msg = pending_msg
+                pending_msg = None
+            else:
+                if active_players:
+                    await _restore_active()
+                msg = await mqttc.next_message()
             last_request_at = loop.time()
             try:
                 payload: Dict[str, Any] = msg.json()
@@ -363,10 +385,12 @@ async def run_sonos_gateway() -> None:
                     concurrency=concurrency,
                     tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
                 )
+                active_players.add(player2)
                 ok_total += 1
                 last_ok_at = loop.time()
                 log.info("announce_done")
             except Exception:
+                played_fallback = False
                 if offline_key:
                     try:
                         path = _offline_audio_path(settings, offline_key)
@@ -393,16 +417,29 @@ async def run_sonos_gateway() -> None:
                                 concurrency=concurrency,
                                 tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
                             )
+                            active_players.add(player2)
                             ok_total += 1
                             last_ok_at = loop.time()
                             log.info("announce_done_offline_fallback", key=offline_key, path=str(path))
-                            continue
+                            played_fallback = True
                     except Exception:
                         pass
-                err_total += 1
-                last_err_at = loop.time()
-                last_err_kind = "announce_failed"
-                log.exception("announce_failed")
+                if not played_fallback:
+                    active_players.add(player2)
+                    err_total += 1
+                    last_err_at = loop.time()
+                    last_err_kind = "announce_failed"
+                    exc_val = sys.exc_info()[1]
+                    log.exception("announce_failed")
+                    reporter.report_error("announce_failed", exc_val)
+
+            # Peek for more messages to batch announcements (avoid restoring
+            # music between rapid-fire announcements, then re-snapshotting).
+            try:
+                pending_msg = await asyncio.wait_for(mqttc.next_message(), timeout=0.5)
+                log.info("announce_batch_peek", queue_has_more=True)
+            except asyncio.TimeoutError:
+                pass
     finally:
         status_task.cancel()
         await mqttc.close()

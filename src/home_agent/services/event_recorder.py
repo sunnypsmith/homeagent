@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
@@ -45,6 +46,8 @@ async def run_event_recorder() -> None:
         client_id="homeagent-event-recorder",
     )
     await mqttc.connect()
+    reporter = ErrorReporter(mqttc=mqttc, service="event-recorder", base_topic=settings.mqtt.base_topic)
+    reporter.start_heartbeat(interval_seconds=30.0)
     mqttc.subscribe(topic)
     log.info("mqtt_connected", host=settings.mqtt.host, port=settings.mqtt.port)
     log.info("subscribed", topic=topic)
@@ -191,11 +194,12 @@ async def run_event_recorder() -> None:
                 await loop.run_in_executor(None, insert_row, ts, msg.topic, source, typ, event_id, trace_id, payload_json)
                 stats["insert_ok"] += 1
                 last_insert_ok_at = loop.time()
-            except Exception:
+            except Exception as exc:
                 stats["insert_err"] += 1
                 last_insert_err_at = loop.time()
                 last_insert_err_kind = "insert_failed"
                 log.exception("insert_failed", topic=msg.topic)
+                reporter.report_error("insert_failed", exc)
     finally:
         reporter_task.cancel()
         status_task.cancel()

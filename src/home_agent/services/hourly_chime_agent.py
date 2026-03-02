@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from home_agent.bus.envelope import make_event
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
@@ -54,6 +55,8 @@ async def run_hourly_chime_agent() -> None:
         client_id="homeagent-hourly-chime-agent",
     )
     await mqttc.connect()
+    reporter = ErrorReporter(mqttc=mqttc, service="hourly-chime-agent", base_topic=settings.mqtt.base_topic)
+    reporter.start_heartbeat(interval_seconds=30.0)
 
     sub_topic = "%s/time/cron/hourly_chime" % settings.mqtt.base_topic
     mqttc.subscribe(sub_topic)

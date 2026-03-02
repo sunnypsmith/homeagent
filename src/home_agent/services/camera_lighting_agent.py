@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from home_agent.bus.envelope import make_event
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
@@ -182,6 +183,8 @@ async def run_camera_lighting_agent() -> None:
         client_id="homeagent-camera-lighting-agent",
     )
     await mqttc.connect()
+    reporter = ErrorReporter(mqttc=mqttc, service="camera-lighting-agent", base_topic=settings.mqtt.base_topic)
+    reporter.start_heartbeat(interval_seconds=30.0)
 
     base = settings.mqtt.base_topic
     sub_topic = f"{base}/camera/event"

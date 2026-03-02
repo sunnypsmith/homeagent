@@ -14,6 +14,7 @@ from home_agent.bus.envelope import make_event
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.integrations.smtp_mailer import EmailAttachment, SmtpMailer
 
 
@@ -244,8 +245,12 @@ def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]
 _VISION_SYSTEM_PROMPT = (
     "You compare two security camera images. Image 1 is before. Image 2 is now. "
     "A {kind} was just detected. Reply with ONLY a short noun phrase describing what is new. "
-    "Examples of good replies: \"white FedEx van\", \"person in red jacket with package\", "
-    "\"black SUV\", \"Amazon delivery driver\". "
+    "For vehicles, identify the color, make, and model if possible (e.g. \"white Toyota RAV4\", "
+    "\"gray Honda Civic\", \"blue Ford F-150\"). Include the delivery carrier if identifiable "
+    "(FedEx, UPS, USPS, Amazon, DHL). "
+    "For people, describe clothing, carried items, and any visible uniform or branding. "
+    "Examples: \"white Toyota Camry\", \"brown UPS truck\", \"person in red jacket with package\", "
+    "\"Amazon driver with gray Mercedes Sprinter van\". "
     "No explanation. No narration. No full sentences. Just the noun phrase. "
     "If nothing new is visible, reply: UNKNOWN"
 )
@@ -443,6 +448,9 @@ async def run_camect_agent() -> None:
         client_id="homeagent-camect-agent",
     )
     await mqttc.connect()
+
+    reporter = ErrorReporter(mqttc=mqttc, service="camect-agent", base_topic=settings.mqtt.base_topic)
+    reporter.start_heartbeat(interval_seconds=30.0)
 
     event_topic = "%s/camera/event" % settings.mqtt.base_topic
     announce_topic = "%s/announce/request" % settings.mqtt.base_topic
@@ -692,6 +700,7 @@ async def run_camect_agent() -> None:
                                 ),
                             )
                         log.exception("snapshot_email_failed", camera=spoken_camera)
+                        reporter.report_error("snapshot_email_failed", e)
 
             # Announce with throttle (per camera name/id).
             now = time.monotonic()
@@ -762,6 +771,10 @@ async def run_camect_agent() -> None:
             mqttc.publish_json(announce_topic, announce)
             log.info("announce_published", camera=spoken_camera, vision=bool(vision_desc))
             announced_total += 1
+    except Exception as exc:
+        log.exception("event_loop_crashed")
+        reporter.report_error("event_loop_crashed", exc)
+        raise
     finally:
         try:
             status_task.cancel()

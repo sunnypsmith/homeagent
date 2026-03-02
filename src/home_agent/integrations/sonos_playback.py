@@ -1,12 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass
 from time import sleep
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
+
+from home_agent.core.logging import get_logger
+
+_log = get_logger(service="sonos_playback")
+
+_RESUME_POLL_STEP = 1.0
+_RESUME_POLL_TIMEOUT = 10.0
+_RESUME_MAX_RETRIES = 3
+_DONE_POLL_MAX_CONSECUTIVE_ERRORS = 6
 
 
 class SonosPlayback:
+    """
+    Plays audio URLs on Sonos speakers with snapshot/restore support.
+
+    Snapshots are held across successive play_url() calls so that back-to-back
+    announcements don't wastefully restore and re-snapshot between each one.
+    Call restore_all() after the last announcement in a batch to resume music.
+    """
+
     def __init__(
         self,
         *,
@@ -25,6 +43,13 @@ class SonosPlayback:
         self._speaker_ips = list(speaker_ips)
         self._default_volume = default_volume
         self._speaker_volume_map = dict(speaker_volume_map or {})
+        self._held: Dict[str, _HeldSnapshot] = {}
+        self._held_lock = threading.Lock()
+
+    @property
+    def has_held_snapshots(self) -> bool:
+        with self._held_lock:
+            return bool(self._held)
 
     async def play_url(
         self,
@@ -38,9 +63,10 @@ class SonosPlayback:
         done_timeout_seconds: float = 300.0,
     ) -> None:
         """
-        v1: play on each configured target (coordinator-aware), in parallel with a limit.
+        Play on each configured target (coordinator-aware), in parallel with a limit.
 
-        SoCo is synchronous/blocking; we run each target in a worker thread.
+        Acquires a snapshot on first call; subsequent calls reuse the held snapshot.
+        Does NOT restore — caller must invoke restore_all() when the batch is done.
         """
         targets = self._resolve_targets()
         if not targets:
@@ -67,6 +93,24 @@ class SonosPlayback:
 
         await asyncio.gather(*(run_one(t) for t in targets))
 
+    async def restore_all(self) -> None:
+        """Restore all held speaker snapshots with robust retry logic."""
+        with self._held_lock:
+            held = dict(self._held)
+            self._held.clear()
+        if not held:
+            return
+        _log.info("restore_all_start", speakers=list(held.keys()))
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*(
+            loop.run_in_executor(None, _restore_one, h)
+            for h in held.values()
+        ))
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
     def _play_url_blocking(
         self,
         spk,
@@ -78,52 +122,64 @@ class SonosPlayback:
         done_timeout_seconds: float,
         member_volumes: Optional[Dict[str, int]] = None,
     ) -> None:
-        snap = self._Snapshot(spk)
-        was_playing = _is_playing(spk)
+        ip = getattr(spk, "ip_address", "unknown")
+        self._acquire_snapshot(spk)
         try:
-            snap.snapshot()
-            # Set volume on each individual member speaker (handles grouped speakers).
+            spk.play_uri(url, title=title, start=True)
+            # Set volume AFTER play_uri to avoid Sonos group volume normalization
+            # that some firmware versions trigger when starting a new transport.
             if member_volumes:
                 for member_ip, member_vol in member_volumes.items():
+                    clamped = max(0, min(100, int(member_vol)))
                     try:
                         member_spk = self._SoCo(member_ip)
-                        member_spk.volume = max(0, min(100, int(member_vol)))
-                    except Exception:
-                        pass
+                        member_spk.volume = clamped
+                        _log.info("volume_set", speaker=member_ip, volume=clamped)
+                    except Exception as e:
+                        _log.warning("member_volume_failed", speaker=member_ip, volume=clamped, error=str(e))
+                # Also set on coordinator if not already covered by member_volumes.
+                coord_ip = getattr(spk, "ip_address", None)
+                if coord_ip and coord_ip not in member_volumes:
+                    coord_vol = int(volume if volume is not None else self._default_volume)
+                    try:
+                        spk.volume = max(0, min(100, coord_vol))
+                        _log.info("volume_set_coordinator", speaker=coord_ip, volume=coord_vol)
+                    except Exception as e:
+                        _log.warning("coordinator_volume_failed", speaker=coord_ip, error=str(e))
             else:
                 target_vol = int(volume if volume is not None else self._default_volume)
                 try:
-                    spk.volume = target_vol
-                except Exception:
-                    pass
-            spk.play_uri(url, title=title, start=True)
+                    spk.volume = max(0, min(100, target_vol))
+                    _log.info("volume_set", speaker=ip, volume=target_vol)
+                except Exception as e:
+                    _log.warning("volume_set_failed", speaker=ip, volume=target_vol, error=str(e))
             _wait_for_playing(spk, timeout_seconds=2.0)
             if expected_duration_seconds is not None and expected_duration_seconds > 0:
-                # For known short clips (e.g., test tones), Sonos can keep reporting PLAYING
-                # for a while. Sleeping is both faster and avoids long "done" polling.
                 sleep(max(0.2, float(expected_duration_seconds) + 0.75))
             else:
                 _wait_for_done_or_timeout(spk, timeout_seconds=float(done_timeout_seconds))
-            # Sonos can report "not playing" a fraction early; add a small grace delay
-            # so the last words aren't clipped before we restore the snapshot.
             if tail_padding_seconds and tail_padding_seconds > 0:
                 sleep(float(tail_padding_seconds))
-        finally:
-            try:
-                snap.restore()
-                if was_playing:
-                    # Give Sonos a moment to settle after restore, then verify playback.
-                    sleep(5.0)
-                    if not _is_playing(spk):
-                        try:
-                            spk.play()
-                        except Exception:
-                            pass
-            except Exception:
-                try:
-                    spk.stop()
-                except Exception:
-                    pass
+        except Exception:
+            _log.exception("play_url_failed", speaker=ip)
+            raise
+
+    def _acquire_snapshot(self, spk) -> None:
+        """Take a snapshot if one isn't already held for this speaker."""
+        ip = getattr(spk, "ip_address", "unknown")
+        with self._held_lock:
+            if ip in self._held:
+                _log.info("snapshot_reused", speaker=ip)
+                return
+        snap = self._Snapshot(spk)
+        was_playing = _is_playing(spk)
+        snap.snapshot()
+        with self._held_lock:
+            if ip not in self._held:
+                self._held[ip] = _HeldSnapshot(snap=snap, was_playing=was_playing, device=spk, ip=ip)
+                _log.info("snapshot_acquired", speaker=ip, was_playing=was_playing)
+            else:
+                _log.info("snapshot_reused", speaker=ip)
 
     def _resolve_targets(self) -> List[object]:
         """
@@ -139,9 +195,7 @@ class SonosPlayback:
                 coord = d.group.coordinator
             except Exception:
                 coord = d
-            # Unique key: coordinator ip if available.
             key = getattr(coord, "ip_address", None) or ip
-            # Build per-speaker volume map for this speaker (even if coordinator already seen)
             vol = self._speaker_volume_map.get(ip)
             if vol is None:
                 vol = self._speaker_volume_map.get(str(key))
@@ -150,7 +204,6 @@ class SonosPlayback:
             vol = max(0, min(100, int(vol)))
 
             if key in seen:
-                # Coordinator already queued, but still record this member's volume
                 for t in out:
                     if t.key == str(key):
                         t.member_volumes[ip] = vol
@@ -162,12 +215,92 @@ class SonosPlayback:
         return out
 
 
+# ------------------------------------------------------------------
+# Data classes
+# ------------------------------------------------------------------
+
+@dataclass
+class _HeldSnapshot:
+    snap: object
+    was_playing: bool
+    device: object
+    ip: str
+
+
 @dataclass
 class _ResolvedTarget:
     device: object
     volume: int
     key: str
     member_volumes: Dict[str, int]
+
+
+# ------------------------------------------------------------------
+# Restore logic (runs in worker threads)
+# ------------------------------------------------------------------
+
+def _restore_one(held: _HeldSnapshot) -> None:
+    """Restore a single speaker snapshot with adaptive polling and retries."""
+    ip = held.ip
+    spk = held.device
+    snap = held.snap
+    was_playing = held.was_playing
+
+    try:
+        snap.restore()
+        _log.info("snapshot_restored", speaker=ip, was_playing=was_playing)
+    except Exception:
+        _log.exception("snapshot_restore_failed", speaker=ip)
+        try:
+            spk.stop()
+        except Exception:
+            pass
+        return
+
+    if not was_playing:
+        return
+
+    # Adaptive polling: wait for Sonos to resume on its own after restore.
+    if _poll_for_playing(spk, timeout=_RESUME_POLL_TIMEOUT):
+        _log.info("playback_resumed", speaker=ip)
+        return
+
+    # Playback didn't resume organically — retry spk.play() with backoff.
+    for attempt in range(1, _RESUME_MAX_RETRIES + 1):
+        _log.warning("playback_not_resumed", speaker=ip, attempt=attempt, max_retries=_RESUME_MAX_RETRIES)
+        try:
+            spk.play()
+        except Exception as e:
+            _log.warning("play_retry_failed", speaker=ip, attempt=attempt, error=str(e))
+            sleep(2.0 * attempt)
+            continue
+        if _poll_for_playing(spk, timeout=5.0):
+            _log.info("playback_resumed_after_retry", speaker=ip, attempt=attempt)
+            return
+        sleep(2.0 * attempt)
+
+    _log.error("playback_resume_exhausted", speaker=ip, retries=_RESUME_MAX_RETRIES)
+
+
+# ------------------------------------------------------------------
+# Transport polling helpers
+# ------------------------------------------------------------------
+
+def _poll_for_playing(soco_device, timeout: float) -> bool:
+    """Poll transport state until PLAYING. Returns True if reached."""
+    step = _RESUME_POLL_STEP
+    waited = 0.0
+    while waited < timeout:
+        try:
+            info = soco_device.get_current_transport_info()
+            state = (info or {}).get("current_transport_state") or ""
+            if str(state).upper() == "PLAYING":
+                return True
+        except Exception:
+            pass
+        sleep(step)
+        waited += step
+    return False
 
 
 def _wait_for_playing(soco_device, timeout_seconds: float) -> None:
@@ -195,19 +328,25 @@ def _is_playing(soco_device) -> bool:
 
 
 def _wait_for_done_or_timeout(soco_device, timeout_seconds: float) -> None:
-    """
-    Best-effort: wait until Sonos stops playing, otherwise timeout.
-    """
+    """Wait until Sonos stops playing. Tolerates transient network errors."""
     step = 0.5
     waited = 0.0
+    consecutive_errors = 0
     while waited < timeout_seconds:
         try:
             info = soco_device.get_current_transport_info()
             state = (info or {}).get("current_transport_state") or ""
+            consecutive_errors = 0
             if str(state).upper() not in ("PLAYING", "TRANSITIONING"):
                 return
         except Exception:
-            return
+            consecutive_errors += 1
+            if consecutive_errors >= _DONE_POLL_MAX_CONSECUTIVE_ERRORS:
+                _log.warning(
+                    "done_poll_abort",
+                    speaker=getattr(soco_device, "ip_address", "?"),
+                    consecutive_errors=consecutive_errors,
+                )
+                return
         sleep(step)
         waited += step
-

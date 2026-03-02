@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Dict, Optional
 
 from home_agent.bus.envelope import make_event
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
@@ -80,6 +81,8 @@ async def run_caseta_agent() -> None:
         client_id="homeagent-caseta-agent",
     )
     await mqttc.connect()
+    reporter = ErrorReporter(mqttc=mqttc, service="caseta-agent", base_topic=settings.mqtt.base_topic)
+    reporter.start_heartbeat(interval_seconds=30.0)
 
     base = settings.mqtt.base_topic
     cmd_topic = f"{base}/lutron/command"

@@ -1066,4 +1066,5 @@ class AppSettings(BaseSettings):
     caseta: CasetaSettings = CasetaSettings()
     camera_lighting: CameraLightingSettings = CameraLightingSettings()
     ui: UiSettings = UiSettings()
+    watchdog_tmux_map: str = Field(default="", alias="WATCHDOG_TMUX_MAP")
 

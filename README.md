@@ -74,7 +74,7 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent sonos-gateway`: MQTT `announce.request` -> TTS -> play on Sonos
 - `home-agent time-trigger`: DB schedules -> MQTT time events
 - `home-agent event-recorder`: MQTT events -> TimescaleDB
-- `home-agent ui-gateway`: simple LAN web UI (buttons -> MQTT announce.request)
+- `home-agent ui-gateway`: LAN web UI — controls at `/`, real-time status dashboard at `/status`
 - `home-agent wakeup-agent`: time event -> announce.request
 - `home-agent morning-briefing-agent`: time event -> weather + LLM (+ optional calendar ICS) -> announce.request
 - `home-agent hourly-chime-agent`: time event -> announce.request
@@ -84,6 +84,7 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent camera-lighting-agent`: camera events -> Caséta lighting automation
 - `home-agent hourly-house-check-agent`: scheduled checks (e.g., Temp Stick thresholds)
 - `home-agent exec-briefing-agent`: daily executive briefing (weather + calendar + financial)
+- `home-agent watchdog`: monitors all services via heartbeats/errors, announces failures, restarts crashed processes
 
 ## Common examples
 
@@ -163,12 +164,31 @@ home-agent trigger-exec-briefing
 
 ### Camect vision analysis (optional)
 
-Enrich camera announcements with vision LLM descriptions (vehicle color/type, delivery carrier, person description):
+Enrich camera announcements with vision LLM descriptions. Uses before/after image comparison (60s apart) to identify what's new — vehicle color/make/model, delivery carrier, person description:
 
 ```bash
 CAMECT_VISION_ENABLED=true
 CAMECT_VISION_MODEL=meta-llama/llama-4-maverick-17b-128e-instruct
 CAMECT_VISION_TIMEOUT_SECONDS=10
+
+# Optional: use a different endpoint/key for vision (falls back to LLM_BASE_URL / LLM_API_KEY)
+CAMECT_VISION_BASE_URL=https://api.openai.com/v1
+CAMECT_VISION_API_KEY=sk-...
+CAMECT_VISION_DETAIL=auto   # low | high | auto
+```
+
+### Watchdog (recommended)
+
+Monitors all services via MQTT heartbeats and error events. On failure: logs to DB, announces the error on Sonos, and attempts a single restart.
+
+```bash
+home-agent watchdog
+```
+
+To enable automatic restarts, set a tmux pane mapping so the watchdog knows where each service runs:
+
+```bash
+WATCHDOG_TMUX_MAP=sonos-gateway:homeagent:0.1,camect-agent:homeagent:2.0,time-trigger:homeagent:0.0
 ```
 
 ### Offline announcement audio (optional)

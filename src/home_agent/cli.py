@@ -26,6 +26,7 @@ from home_agent.services.sonos_gateway import main as sonos_gateway_main
 from home_agent.services.time_trigger import main as time_trigger_main
 from home_agent.services.ui_gateway import main as ui_gateway_main
 from home_agent.services.monitor_tui import main as monitor_main
+from home_agent.services.watchdog import main as watchdog_main
 from home_agent.services.wakeup_agent import main as wakeup_agent_main
 from home_agent.services.exec_briefing_agent import main as exec_briefing_agent_main
 
@@ -378,6 +379,12 @@ def camect_agent() -> None:
 def camera_lighting_agent() -> None:
     """Run camera -> lighting agent (camera events -> Caséta lights)."""
     raise SystemExit(camera_lighting_agent_main())
+
+
+@app.command("watchdog")
+def watchdog() -> None:
+    """Run watchdog service (monitors all services, announces errors, restarts crashed processes)."""
+    raise SystemExit(watchdog_main())
 
 
 @app.command("fixed-announcement-agent")

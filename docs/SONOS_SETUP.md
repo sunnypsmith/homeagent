@@ -149,6 +149,39 @@ The Sonos gateway (`home-agent sonos-gateway`) consumes:
 }
 ```
 
+## Mute / unmute
+
+The sonos-gateway supports temporary muting via MQTT. While muted, all announcements are suppressed and `announce.suppressed` events are published with `reason: "mute"`.
+
+Publish a retained message to `homeagent/announce/mute`:
+
+```json
+{
+  "id": "mute-1",
+  "ts": "2026-01-24T12:00:00Z",
+  "source": "ui-gateway",
+  "type": "announce.mute",
+  "trace_id": "trace_1",
+  "data": {
+    "muted_until_unix": 1737748800
+  }
+}
+```
+
+- `muted_until_unix`: UNIX timestamp when the mute expires. Set to `0` to unmute immediately.
+- Using a retained message ensures the mute survives gateway restarts.
+
+The UI gateway provides **Mute (1 hour)** and **Unmute** buttons for convenience.
+
+## Announcement batching
+
+When multiple announcements arrive in quick succession (e.g. several camera events), the gateway batches them automatically:
+- The speaker's current state (queue, position, volume) is snapshotted once before the first announcement.
+- Subsequent announcements play without restoring and re-snapshotting in between.
+- Music is restored only after a 0.5-second quiet period with no new messages.
+
+This avoids the jarring start/stop/start of music between rapid-fire announcements.
+
 ## Troubleshooting
 
 - **Nothing found (SSDP)**:

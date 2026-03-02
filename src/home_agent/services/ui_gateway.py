@@ -1,40 +1,141 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import json
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from home_agent.bus.envelope import make_event
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 from home_agent.integrations.audio_host import AudioHost
 from home_agent.integrations.sonos_playback import SonosPlayback
 
+_MAX_ERRORS = 50
+_MAX_FEED = 100
+_TOPIC_WINDOW = 50_000
+
+_latest_health: Dict[str, Any] = {}
+_recent_errors: collections.deque = collections.deque(maxlen=_MAX_ERRORS)
+_source_stats: Dict[str, Dict[str, Any]] = {}
+_recent_feed: collections.deque = collections.deque(maxlen=_MAX_FEED)
+_topic_events: collections.deque = collections.deque(maxlen=_TOPIC_WINDOW)
+_db_activity: Dict[str, Any] = {}
+
+
+def _update_source(source: str, typ: str, topic: str) -> None:
+    now = time.time()
+    st = _source_stats.get(source)
+    if st is None:
+        st = {"source": source, "total": 0, "last_ts": 0.0, "last_type": "", "last_topic": "", "seen": collections.deque(maxlen=10_000)}
+        _source_stats[source] = st
+    st["total"] += 1
+    st["last_ts"] = now
+    st["last_type"] = typ
+    st["last_topic"] = topic
+    st["seen"].append(now)
+
+
+def _source_rate(st: Dict[str, Any]) -> float:
+    seen = st.get("seen")
+    if not seen:
+        return 0.0
+    now = time.time()
+    while seen and (now - seen[0]) > 60.0:
+        seen.popleft()
+    return len(seen) / 60.0
+
+
+def _top_topics(limit: int = 10) -> List[Dict[str, Any]]:
+    now = time.time()
+    while _topic_events and (now - _topic_events[0][0]) > 60.0:
+        _topic_events.popleft()
+    counts: Dict[str, int] = {}
+    for _, topic in _topic_events:
+        counts[topic] = counts.get(topic, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    return [{"topic": t, "count": c, "rate": round(c / 60.0, 2)} for t, c in top]
+
+
+def _fetch_db_activity_cached(settings: Any) -> Dict[str, Any]:
+    cached = _db_activity.get("_cached_at", 0.0)
+    if (time.time() - cached) < 5.0 and _db_activity.get("rows") is not None:
+        return _db_activity
+    try:
+        import psycopg
+        conn = psycopg.connect(settings.db.conninfo, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT now(), (SELECT max(ingested_at) FROM events),
+                           (SELECT count(*) FROM events WHERE ingested_at > now() - interval '60 seconds')
+                """)
+                now_utc, last_at, last_60 = cur.fetchone()
+                cur.execute("SELECT ingested_at, topic, source, type FROM events ORDER BY ingested_at DESC LIMIT 8")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        age_s = None
+        if last_at and now_utc:
+            age_s = round(max(0.0, (now_utc - last_at).total_seconds()), 1)
+        result = {
+            "last_ingest_age_s": age_s,
+            "events_last_60s": int(last_60 or 0),
+            "rows": [{"age_s": round(max(0, (now_utc - r[0]).total_seconds()), 1) if r[0] else None,
+                       "topic": str(r[1] or ""), "source": str(r[2] or ""), "type": str(r[3] or "")} for r in (rows or [])],
+            "_cached_at": time.time(),
+        }
+        _db_activity.clear()
+        _db_activity.update(result)
+        return _db_activity
+    except Exception:
+        return _db_activity
+
+
+# ---------------------------------------------------------------------------
+# Shared CSS variables (used by both pages)
+# ---------------------------------------------------------------------------
+_CSS_VARS = """
+    :root{
+      --bg:#0a0e1a;--surface:#12172a;--surface2:#1a2038;
+      --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.14);
+      --text:rgba(255,255,255,0.92);--dim:rgba(255,255,255,0.45);
+      --green:#34d399;--cyan:#22d3ee;--blue:#60a5fa;--red:#f87171;--yellow:#fbbf24;
+      --mono:'SF Mono',SFMono-Regular,ui-monospace,'Cascadia Mono',Menlo,Consolas,monospace;
+      --r:14px;
+    }
+    *{box-sizing:border-box;margin:0}
+    body{
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif;
+      background:var(--bg);color:var(--text);min-height:100vh;
+    }
+"""
+
 
 def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[str]) -> str:
-    # Single-file, dependency-free UI (no external assets) for iPhone.
-    # Big touch targets, safe-area padding, and a simple “toast” area.
     cards = []
-    # Built-in controls.
     cards.append(
-        """
-        <form method="post" action="/mute/60" class="card">
-          <button type="submit" class="btn btn-danger" aria-label="Mute Sonos announcements for 1 hour">
-            <span class="label">Mute (1 hour)</span>
-          </button>
-        </form>
-        """
+        '<form method="post" action="/mute/60" class="card">'
+        '<button type="submit" class="btn btn-danger" aria-label="Mute 1 hour">'
+        '<span class="ico">&#x1f507;</span><span class="label">Mute (1 hour)</span>'
+        '</button></form>'
     )
     cards.append(
-        """
-        <form method="post" action="/unmute" class="card">
-          <button type="submit" class="btn btn-subtle" aria-label="Unmute Sonos announcements">
-            <span class="label">Unmute</span>
-          </button>
-        </form>
-        """
+        '<form method="post" action="/mute/120" class="card">'
+        '<button type="submit" class="btn btn-danger" aria-label="Mute 2 hours">'
+        '<span class="ico">&#x1f507;</span><span class="label">Mute (2 hours)</span>'
+        '</button></form>'
+    )
+    cards.append(
+        '<form method="post" action="/unmute" class="card">'
+        '<button type="submit" class="btn btn-subtle" aria-label="Unmute">'
+        '<span class="ico">&#x1f50a;</span><span class="label">Unmute</span>'
+        '</button></form>'
     )
     for a in actions:
         aid = str(a.get("id") or "").strip()
@@ -42,148 +143,237 @@ def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[
         if not aid or not label:
             continue
         cards.append(
-            f"""
-            <form method="post" action="/a/{quote(aid)}" class="card">
-              <button type="submit" class="btn" aria-label="{label}">
-                <span class="label">{label}</span>
-              </button>
-            </form>
-            """
+            f'<form method="post" action="/a/{quote(aid)}" class="card">'
+            f'<button type="submit" class="btn" aria-label="{label}">'
+            f'<span class="label">{label}</span>'
+            f'</button></form>'
         )
     cards.append(
-        """
-        <form method="post" action="/tone-test" class="card">
-          <button type="submit" class="btn btn-subtle" aria-label="Play a 10 second test tone on Sonos">
-            <span class="label">Test Tone (10s)</span>
-          </button>
-        </form>
-        """
+        '<form method="post" action="/tone-test" class="card">'
+        '<button type="submit" class="btn btn-subtle" aria-label="Test Tone">'
+        '<span class="ico">&#x1f514;</span><span class="label">Test Tone (10s)</span>'
+        '</button></form>'
     )
-    cards_html = "\n".join(cards) if cards else "<p class='muted'>No actions configured.</p>"
+    cards_html = "\n".join(cards) if cards else "<p class='dim'>No actions configured.</p>"
     toast_html = f"<div class='toast'>{toast}</div>" if toast else ""
 
     return f"""<!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#0b1220" />
-    <title>{title}</title>
-    <style>
-      :root {{
-        --bg: #0b1220;
-        --card: rgba(255,255,255,0.06);
-        --card2: rgba(255,255,255,0.10);
-        --text: rgba(255,255,255,0.92);
-        --muted: rgba(255,255,255,0.60);
-        --accent: #5eead4;
-        --danger: #fb7185;
-        --shadow: 0 10px 25px rgba(0,0,0,0.35);
-        --radius: 18px;
-      }}
-      * {{ box-sizing: border-box; }}
-      body {{
-        margin: 0;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
-        background: radial-gradient(1200px 800px at 20% -10%, rgba(94,234,212,0.20), transparent 50%),
-                    radial-gradient(900px 700px at 110% 0%, rgba(56,189,248,0.18), transparent 55%),
-                    var(--bg);
-        color: var(--text);
-      }}
-      .wrap {{
-        max-width: 820px;
-        margin: 0 auto;
-        padding: 18px;
-        padding-top: calc(18px + env(safe-area-inset-top));
-        padding-bottom: calc(24px + env(safe-area-inset-bottom));
-      }}
-      header {{
-        display: flex;
-        align-items: baseline;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 14px;
-      }}
-      h1 {{
-        font-size: 20px;
-        letter-spacing: 0.2px;
-        margin: 0;
-      }}
-      .sub {{
-        font-size: 12px;
-        color: var(--muted);
-      }}
-      .grid {{
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 12px;
-      }}
-      @media (min-width: 720px) {{
-        .grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-      }}
-      .card {{
-        margin: 0;
-      }}
-      .btn {{
-        width: 100%;
-        border: 1px solid rgba(255,255,255,0.10);
-        background: linear-gradient(180deg, var(--card), rgba(255,255,255,0.03));
-        color: var(--text);
-        padding: 16px 14px;
-        border-radius: var(--radius);
-        box-shadow: var(--shadow);
-        text-align: left;
-        font-size: 16px;
-        font-weight: 650;
-        letter-spacing: 0.1px;
-        cursor: pointer;
-        -webkit-tap-highlight-color: transparent;
-        transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
-      }}
-      .btn-danger {{
-        border-color: rgba(251,113,133,0.35);
-        background: linear-gradient(180deg, rgba(251,113,133,0.18), rgba(255,255,255,0.03));
-      }}
-      .btn-subtle {{
-        border-color: rgba(255,255,255,0.06);
-        background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
-        color: rgba(255,255,255,0.84);
-      }}
-      .btn:active {{
-        transform: scale(0.98);
-        background: linear-gradient(180deg, var(--card2), rgba(255,255,255,0.04));
-        border-color: rgba(94,234,212,0.35);
-      }}
-      .label {{ display: block; line-height: 1.15; }}
-      .muted {{ color: var(--muted); font-size: 13px; margin-top: 12px; }}
-      .toast {{
-        margin-top: 12px;
-        padding: 10px 12px;
-        border-radius: 14px;
-        border: 1px solid rgba(94,234,212,0.25);
-        background: rgba(94,234,212,0.08);
-        color: var(--text);
-        font-size: 13px;
-      }}
-    </style>
-  </head>
-  <body>
-    <div class="wrap">
-      <header>
-        <h1>{title}</h1>
-        <div class="sub">Tap a button</div>
-      </header>
-      <div class="grid">
-        {cards_html}
-      </div>
-      {toast_html}
-      <div class="muted">
-        Tip: add this page to your Home Screen (Share → Add to Home Screen).
-      </div>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <meta name="theme-color" content="#0a0e1a"/>
+  <title>{title}</title>
+  <style>
+    {_CSS_VARS}
+    .w{{
+      max-width:820px;margin:0 auto;padding:16px;
+      padding-top:calc(16px + env(safe-area-inset-top));
+      padding-bottom:calc(24px + env(safe-area-inset-bottom));
+    }}
+    header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}}
+    h1{{font-size:18px;font-weight:700;letter-spacing:.3px}}
+    .nav{{display:flex;gap:10px;align-items:center}}
+    .nav a{{color:var(--blue);font-size:12px;text-decoration:none}}
+    .grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}}
+    @media(min-width:600px){{.grid{{grid-template-columns:repeat(3,1fr)}}}}
+    .card{{margin:0}}
+    .btn{{
+      width:100%;display:flex;align-items:center;gap:10px;
+      border:1px solid var(--border);background:var(--surface);
+      color:var(--text);padding:14px;border-radius:var(--r);
+      text-align:left;font-size:15px;font-weight:600;letter-spacing:.1px;
+      cursor:pointer;-webkit-tap-highlight-color:transparent;
+      transition:transform 100ms ease,border-color 150ms ease,background 150ms ease;
+    }}
+    .btn:active{{transform:scale(0.97);border-color:rgba(52,211,153,0.35);background:var(--surface2)}}
+    .btn-danger{{border-color:rgba(248,113,113,0.25);background:linear-gradient(180deg,rgba(248,113,113,0.10),var(--surface))}}
+    .btn-danger:active{{border-color:rgba(248,113,113,0.5)}}
+    .btn-subtle{{border-color:rgba(255,255,255,0.04);color:rgba(255,255,255,0.75)}}
+    .ico{{font-size:18px;flex-shrink:0}}
+    .label{{display:block;line-height:1.2}}
+    .toast{{
+      margin-top:14px;padding:10px 14px;border-radius:var(--r);
+      border:1px solid rgba(52,211,153,0.25);background:rgba(52,211,153,0.08);
+      color:var(--text);font-size:13px;
+    }}
+    .foot{{color:var(--dim);font-size:12px;margin-top:16px;display:flex;gap:6px;align-items:center}}
+    .foot a{{color:var(--blue);text-decoration:none}}
+  </style>
+</head>
+<body>
+  <div class="w">
+    <header>
+      <h1>{title}</h1>
+      <div class="nav"><a href="/status">System Status &#x2192;</a></div>
+    </header>
+    <div class="grid">
+      {cards_html}
     </div>
-  </body>
+    {toast_html}
+    <div class="foot">Add to Home Screen for quick access</div>
+  </div>
+</body>
 </html>
 """
+
+
+def _status_html(*, title: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <meta name="theme-color" content="#0a0e1a"/>
+  <title>{title} &#x2014; Status</title>
+  <style>
+    {_CSS_VARS}
+    .w{{max-width:1100px;margin:0 auto;padding:14px;padding-top:calc(14px + env(safe-area-inset-top));padding-bottom:calc(20px + env(safe-area-inset-bottom))}}
+    header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}}
+    h1{{font-size:17px;font-weight:700}}
+    .nav{{display:flex;gap:10px;align-items:center}}
+    .nav a{{color:var(--blue);font-size:12px;text-decoration:none}}
+    .pulse{{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;animation:p 2s infinite}}
+    @keyframes p{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
+    .bar{{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:10px 14px;margin-bottom:12px;font-size:11px;font-family:var(--mono);color:var(--dim);display:flex;flex-wrap:wrap;gap:6px 18px}}
+    .bar span{{color:var(--text)}}
+    .bar .g{{color:var(--green)}} .bar .y{{color:var(--yellow)}} .bar .r{{color:var(--red)}}
+    .st{{font-size:13px;font-weight:600;margin:14px 0 8px;display:flex;align-items:center;gap:8px}}
+    .badge{{font-size:10px;font-weight:700;font-family:var(--mono);padding:1px 6px;border-radius:7px}}
+    .bg{{background:rgba(52,211,153,.12);color:var(--green)}} .br{{background:rgba(248,113,113,.15);color:var(--red)}}
+    .grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:4px}}
+    @media(min-width:540px){{.grid{{grid-template-columns:repeat(3,1fr)}}}}
+    @media(min-width:800px){{.grid{{grid-template-columns:repeat(4,1fr)}}}}
+    .c{{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;transition:border-color .2s}}
+    .c:hover{{border-color:var(--border2)}}
+    .c .n{{font-size:12px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:5px;white-space:nowrap;overflow:hidden}}
+    .dot{{width:7px;height:7px;border-radius:50%;flex-shrink:0}}
+    .dot.ok{{background:var(--green)}}.dot.error{{background:var(--yellow)}}.dot.down{{background:var(--red)}}.dot.u{{background:var(--dim)}}
+    .c .s{{font-size:10px;color:var(--dim);font-family:var(--mono);line-height:1.65}}
+    .c .s b{{color:var(--text);font-weight:500}}
+    .cols{{display:grid;grid-template-columns:1fr;gap:12px;margin-top:4px}}
+    @media(min-width:700px){{.cols{{grid-template-columns:1fr 1fr}}}}
+    .pan{{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}}
+    .pan-t{{font-size:12px;font-weight:600;padding:8px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px}}
+    .pan-t .ico{{font-size:14px}}
+    table{{width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono)}}
+    th{{text-align:left;color:var(--dim);font-weight:500;padding:5px 10px;border-bottom:1px solid var(--border)}}
+    td{{padding:4px 10px;border-bottom:1px solid rgba(255,255,255,.03);color:var(--dim)}}
+    td b{{color:var(--text);font-weight:500}}
+    tr:last-child td{{border-bottom:none}}
+    .err-row{{padding:8px 12px;border-bottom:1px solid var(--border);font-size:11px;line-height:1.5}}
+    .err-row:last-child{{border-bottom:none}}
+    .ets{{color:var(--dim);font-family:var(--mono);font-size:10px}}
+    .esvc{{color:var(--yellow);font-weight:600}}
+    .ectx{{color:var(--dim)}}
+    .emsg{{color:var(--red);font-family:var(--mono);font-size:10px;margin-top:2px;word-break:break-all}}
+    .etb{{color:var(--dim);font-family:var(--mono);font-size:9px;margin-top:3px;white-space:pre-wrap;max-height:100px;overflow-y:auto;background:rgba(0,0,0,.3);padding:5px 7px;border-radius:7px}}
+    .empty{{color:var(--dim);font-size:12px;padding:16px;text-align:center}}
+  </style>
+</head>
+<body>
+<div class="w">
+  <header><h1>System Status</h1><div class="nav"><span class="pulse" id="pulse"></span><a href="/">&#x2190; Controls</a></div></header>
+  <div class="bar" id="bar">Connecting...</div>
+  <div class="st">Services</div>
+  <div class="grid" id="grid"></div>
+  <div class="cols">
+    <div>
+      <div class="st">MQTT Sources <span class="badge bg" id="src-n">0</span></div>
+      <div class="pan"><div class="pan-t"><span class="ico">&#x1f4e1;</span>Activity by source</div><div id="src-tbl"><div class="empty">Loading...</div></div></div>
+      <div class="st" style="margin-top:14px">Top Topics (60s)</div>
+      <div class="pan"><div class="pan-t"><span class="ico">&#x1f4ca;</span>Message rates</div><div id="top-tbl"><div class="empty">Loading...</div></div></div>
+    </div>
+    <div>
+      <div class="st">Recent Activity</div>
+      <div class="pan" style="max-height:300px;overflow-y:auto"><div class="pan-t"><span class="ico">&#x26a1;</span>Live feed</div><div id="feed"><div class="empty">Loading...</div></div></div>
+      <div class="st" style="margin-top:14px">Database <span class="badge bg" id="db-badge">&#x2014;</span></div>
+      <div class="pan"><div class="pan-t"><span class="ico">&#x1f5c4;&#xfe0f;</span>Recent ingested events</div><div id="db-tbl"><div class="empty">Loading...</div></div></div>
+    </div>
+  </div>
+  <div class="st">Errors <span class="badge bg" id="err-badge">0</span></div>
+  <div class="pan" id="errors" style="max-height:350px;overflow-y:auto"><div class="empty">No errors</div></div>
+</div>
+<script>
+(function(){{
+const $=id=>document.getElementById(id);
+function ago(s){{if(s==null)return'\u2014';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}}
+function ts(t){{if(!t)return'';try{{return new Date(t).toLocaleTimeString([],{{hour:'2-digit',minute:'2-digit',second:'2-digit'}})}}catch(e){{return t}}}}
+function esc(s){{const d=document.createElement('div');d.textContent=s;return d.innerHTML}}
+
+async function refresh(){{
+  try{{
+    const r=await fetch('/api/health');
+    const d=await r.json();
+    const w=d.watchdog||{{}};const srcs=d.sources||[];const feed=d.feed||[];
+    const topics=d.topics||[];const errs=d.errors||[];const db=d.db;const mq=d.mqtt||{{}};
+
+    let bh=`MQTT: <span class="${{mq.connected?'g':'r'}}">${{mq.connected?'connected':'disconnected'}}</span> \u00b7 `
+      +`recv: <span>${{mq.received_total||0}}</span> \u00b7 dropped: <span>${{mq.dropped_total||0}}</span> \u00b7 `
+      +`queue: <span>${{mq.queue_size||0}}</span> \u00b7 `
+      +`sources: <span>${{srcs.length}}</span> \u00b7 `
+      +`updated: <span>${{ts(d.ts)}}</span>`;
+    $('bar').innerHTML=bh;
+
+    const wk=Object.keys(w).sort();
+    let gh='';
+    for(const k of wk){{
+      const s=w[k];const st=s.status||'unknown';
+      const src=srcs.find(x=>x.source===k);
+      gh+=`<div class="c"><div class="n"><span class="dot ${{st==='ok'?'ok':st==='error'?'error':st==='down'?'down':'u'}}"></span>${{esc(k)}}</div>`
+        +`<div class="s">Status: <b>${{st.toUpperCase()}}</b><br>HB: <b>${{ago(s.heartbeat_age_seconds)}}</b>`
+        +`<br>Errs: <b>${{s.error_count||0}}</b> \u00b7 PID: <b>${{s.pid||'\u2014'}}</b>`
+        +(src?`<br>Rate: <b>${{src.rate}}/s</b> \u00b7 Msgs: <b>${{src.total}}</b>`:'')
+        +(s.restart_attempted?'<br><span style="color:var(--yellow)">restarted</span>':'')
+        +`</div></div>`;
+    }}
+    $('grid').innerHTML=gh||'<div class="empty">Waiting for watchdog...</div>';
+
+    $('src-n').textContent=srcs.length;
+    if(srcs.length){{
+      let st='<table><tr><th>Source</th><th>Age</th><th>Rate</th><th>Total</th><th>Last Type</th></tr>';
+      for(const s of srcs)st+=`<tr><td><b>${{esc(s.source)}}</b></td><td>${{ago(s.age_s)}}</td><td>${{s.rate}}/s</td><td>${{s.total}}</td><td>${{esc((s.last_type||'').substring(0,30))}}</td></tr>`;
+      $('src-tbl').innerHTML=st+'</table>';
+    }}
+
+    if(topics.length){{
+      let tt='<table><tr><th>Topic</th><th>Count</th><th>Rate</th></tr>';
+      for(const t of topics)tt+=`<tr><td><b>${{esc(t.topic)}}</b></td><td>${{t.count}}</td><td>${{t.rate}}/s</td></tr>`;
+      $('top-tbl').innerHTML=tt+'</table>';
+    }}else{{$('top-tbl').innerHTML='<div class="empty">No traffic</div>'}}
+
+    if(feed.length){{
+      let fh='<table><tr><th>Time</th><th>Source</th><th>Type</th></tr>';
+      for(const f of feed.slice(0,25))fh+=`<tr><td>${{ts(f.ts)}}</td><td><b>${{esc(f.source)}}</b></td><td>${{esc((f.type||'').substring(0,35))}}</td></tr>`;
+      $('feed').innerHTML=fh+'</table>';
+    }}
+
+    if(db&&db.rows){{
+      $('db-badge').textContent=`${{db.events_last_60s||0}}/60s`;
+      let dh=`<div style="padding:6px 10px;font-size:10px;font-family:var(--mono);color:var(--dim)">last ingest: <b style="color:var(--text)">${{ago(db.last_ingest_age_s)}}</b> \u00b7 events/60s: <b style="color:var(--text)">${{db.events_last_60s||0}}</b></div>`;
+      if(db.rows.length){{
+        dh+='<table><tr><th>Age</th><th>Source</th><th>Type</th></tr>';
+        for(const r of db.rows)dh+=`<tr><td>${{ago(r.age_s)}}</td><td><b>${{esc(r.source)}}</b></td><td>${{esc((r.type||'').substring(0,30))}}</td></tr>`;
+        dh+='</table>';
+      }}
+      $('db-tbl').innerHTML=dh;
+    }}else{{$('db-tbl').innerHTML='<div class="empty">DB unavailable</div>'}}
+
+    const eb=$('err-badge');
+    if(errs.length){{
+      let eh='';
+      for(const e of errs)eh+=`<div class="err-row"><span class="ets">${{ts(e.ts)}}</span> <span class="esvc">${{esc(e.service)}}</span> <span class="ectx">${{esc(e.context)}}</span><div class="emsg">${{esc(e.error_type)}}: ${{esc((e.error||'').substring(0,200))}}</div>`+(e.traceback?`<div class="etb">${{esc(e.traceback)}}</div>`:'')+`</div>`;
+      $('errors').innerHTML=eh;eb.textContent=errs.length;eb.className='badge br';
+    }}else{{$('errors').innerHTML='<div class="empty">No errors</div>';eb.textContent='0';eb.className='badge bg'}}
+
+    $('pulse').style.background='var(--green)';
+  }}catch(e){{$('pulse').style.background='var(--red)';$('bar').innerHTML='Connection error'}}
+}}
+refresh();setInterval(refresh,5000);
+}})();
+</script>
+</body>
+</html>"""
 
 
 async def run_ui_gateway() -> None:
@@ -231,12 +421,12 @@ async def run_ui_gateway() -> None:
         sample_rate = 44100
         n_samples = int(sample_rate * max(0.05, float(duration_s)))
         amplitude = 0.85
-        fade_samples = int(sample_rate * 0.02)  # ~20ms
+        fade_samples = int(sample_rate * 0.02)
 
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(sample_rate)
 
             frames = bytearray()
@@ -253,7 +443,61 @@ async def run_ui_gateway() -> None:
     @app.on_event("startup")
     async def _startup() -> None:
         await mqttc.connect()
+        reporter = ErrorReporter(mqttc=mqttc, service="ui-gateway", base_topic=settings.mqtt.base_topic)
+        reporter.start_heartbeat(interval_seconds=30.0)
+        mqttc.subscribe("%s/#" % settings.mqtt.base_topic)
+        asyncio.create_task(_mqtt_reader())
+        asyncio.create_task(_db_poll_loop())
         log.info("mqtt_connected", host=settings.mqtt.host, port=settings.mqtt.port)
+
+    async def _mqtt_reader() -> None:
+        while True:
+            try:
+                msg = await mqttc.next_message()
+                _topic_events.append((time.time(), msg.topic))
+                try:
+                    payload = msg.json()
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+
+                typ = payload.get("type", "")
+                source = payload.get("source", "")
+                data = payload.get("data") or {}
+
+                if source:
+                    _update_source(source, typ, msg.topic)
+
+                _recent_feed.appendleft({
+                    "ts": payload.get("ts", ""),
+                    "source": source,
+                    "type": typ,
+                    "topic": msg.topic,
+                })
+
+                if typ == "watchdog.health":
+                    _latest_health.clear()
+                    _latest_health.update(data.get("services", {}))
+                elif typ == "service.error":
+                    _recent_errors.appendleft({
+                        "ts": payload.get("ts", ""),
+                        "service": data.get("service", ""),
+                        "context": data.get("context", ""),
+                        "error_type": data.get("error_type", ""),
+                        "error": data.get("error", ""),
+                        "traceback": data.get("traceback"),
+                    })
+            except Exception:
+                await asyncio.sleep(1.0)
+
+    async def _db_poll_loop() -> None:
+        while True:
+            await asyncio.sleep(5.0)
+            try:
+                await asyncio.to_thread(_fetch_db_activity_cached, settings)
+            except Exception:
+                pass
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
@@ -311,6 +555,39 @@ async def run_ui_gateway() -> None:
         log.info("unmute_requested")
         return RedirectResponse(url="/?toast=" + quote("Unmuted"), status_code=303)
 
+    @app.get("/api/health")
+    async def api_health() -> Dict[str, Any]:
+        now = time.time()
+        sources = []
+        for k in sorted(_source_stats.keys()):
+            st = _source_stats[k]
+            age = round(now - st["last_ts"], 1) if st["last_ts"] else None
+            sources.append({
+                "source": k, "total": st["total"], "age_s": age,
+                "rate": round(_source_rate(st), 2),
+                "last_type": st["last_type"], "last_topic": st["last_topic"],
+            })
+        mqtt_stats = mqttc.stats()
+        return {
+            "watchdog": dict(_latest_health),
+            "sources": sources,
+            "feed": list(_recent_feed)[:50],
+            "topics": _top_topics(10),
+            "errors": list(_recent_errors),
+            "db": dict(_db_activity) if _db_activity.get("rows") is not None else None,
+            "mqtt": {
+                "connected": bool(mqtt_stats.get("connected")),
+                "queue_size": mqtt_stats.get("queue_size", 0),
+                "received_total": mqtt_stats.get("received_total", 0),
+                "dropped_total": mqtt_stats.get("dropped_total", 0),
+            },
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @app.get("/status", response_class=HTMLResponse)
+    async def status_page() -> str:
+        return _status_html(title=settings.ui.title)
+
     @app.post("/tone-test")
     async def tone_test() -> RedirectResponse:
         targets = settings.sonos.announce_target_ips
@@ -365,4 +642,3 @@ async def run_ui_gateway() -> None:
 def main() -> int:
     asyncio.run(run_ui_gateway())
     return 0
-

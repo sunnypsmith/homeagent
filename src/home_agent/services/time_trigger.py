@@ -14,6 +14,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from home_agent.bus.envelope import make_event
+from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
@@ -83,6 +84,8 @@ async def run_time_trigger() -> None:
         client_id="homeagent-time-trigger",
     )
     await mqttc.connect()
+    reporter = ErrorReporter(mqttc=mqttc, service="time-trigger", base_topic=settings.mqtt.base_topic)
+    reporter.start_heartbeat(interval_seconds=30.0)
     log.info("mqtt_connected", host=settings.mqtt.host, port=settings.mqtt.port)
 
     db = DbManager(
@@ -287,9 +290,10 @@ async def run_time_trigger() -> None:
                 )
                 last_reload_finished_at = loop.time()
                 reload_inflight = False
-            except Exception:
+            except Exception as exc:
                 reload_inflight = False
                 log.exception("schedules_reload_failed")
+                reporter.report_error("schedules_reload_failed", exc)
             # Sleep, but wake immediately on shutdown (Ctrl-C/SIGTERM).
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=60.0)
@@ -421,8 +425,9 @@ async def run_time_trigger() -> None:
                 )
                 mqttc.publish_json(topic, evt)
                 log.info("sunset_scene_triggered", scene=settings.sunset_scene.scene_name)
-            except Exception:
+            except Exception as exc:
                 log.exception("sunset_scene_failed")
+                reporter.report_error("sunset_scene_failed", exc)
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=300.0)
                 except asyncio.TimeoutError:
