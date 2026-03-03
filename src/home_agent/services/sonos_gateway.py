@@ -189,6 +189,8 @@ async def run_sonos_gateway() -> None:
             else:
                 if active_players:
                     await _restore_active()
+                    _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
+                    mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
                 msg = await mqttc.next_message()
             last_request_at = loop.time()
             try:
@@ -348,6 +350,10 @@ async def run_sonos_gateway() -> None:
                     play_targets = list(resolved)
 
             log.info("announce_request", id=event_id, trace_id=trace_id, source=source)
+            # Notify voice service that speakers are about to play
+            _pb_targets = data_targets if isinstance(data_targets, list) else list(settings.sonos.speaker_alias_map.keys())
+            _pb_start = make_event(source="sonos-gateway", typ="sonos.playback_start", data={"targets": _pb_targets})
+            mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_start)
             try:
                 hosted = None
                 if offline_key:

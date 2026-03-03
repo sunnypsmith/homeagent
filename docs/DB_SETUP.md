@@ -33,6 +33,18 @@ docker exec -it home-db psql -U homeagent -d homeagent -c "\dt"
 docker exec -it home-db psql -U homeagent -d homeagent -c "SELECT extname, extversion FROM pg_extension;"
 ```
 
+## Data retention
+
+The `events` hypertable has a **30-day automatic retention policy** via TimescaleDB.
+Old rows are pruned automatically — no manual cleanup or cron job needed.
+
+To check or adjust the policy:
+
+```bash
+docker exec -it home-db psql -U homeagent -d homeagent -c \
+  "SELECT * FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention';"
+```
+
 ## Schedules
 
 Schedules are stored in the `schedules` table and consumed by `home-agent time-trigger`.

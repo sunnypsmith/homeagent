@@ -33,18 +33,26 @@ class SimpleFINClient:
 
     async def fetch_accounts(self) -> List[SimpleFINAccount]:
         url = "%s/accounts?balances-only=1" % self._access_url
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
-
-        raw_accounts = data.get("accounts") or []
-        accounts: List[SimpleFINAccount] = []
-        for item in raw_accounts:
-            if not isinstance(item, dict):
-                continue
-            accounts.append(_parse_account(item))
-        return accounts
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    data = resp.json()
+                raw_accounts = data.get("accounts") or []
+                accounts: List[SimpleFINAccount] = []
+                for item in raw_accounts:
+                    if not isinstance(item, dict):
+                        continue
+                    accounts.append(_parse_account(item))
+                return accounts
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                last_exc = e
+                if attempt == 0:
+                    import asyncio
+                    await asyncio.sleep(2.0)
+        raise last_exc  # type: ignore[misc]
 
     async def financial_summary(self) -> FinancialSummary:
         accounts = await self.fetch_accounts()

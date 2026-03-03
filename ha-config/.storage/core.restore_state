@@ -6,7 +6,7 @@
     {
       "state": {"entity_id":"automation.voice_command_to_mqtt","state":"on","attributes":{"id":"voice_to_mqtt","last_triggered":null,"mode":"single","current":0,"friendly_name":"Voice command to MQTT"},"last_changed":"2026-02-21T21:54:09.666690+00:00","last_reported":"2026-02-21T21:54:09.666690+00:00","last_updated":"2026-02-21T21:54:09.666690+00:00","context":{"id":"01KJ1348M2BKG6HJN4NQHDMRSC","parent_id":null,"user_id":null}},
       "extra_data": null,
-      "last_seen": "2026-03-02T13:39:11.147470+00:00"
+      "last_seen": "2026-03-02T19:00:29.394772+00:00"
     },
     {
       "state": {"entity_id":"event.backup_automatic_backup","state":"unknown","attributes":{"event_types":["completed","failed","in_progress"],"event_type":null,"friendly_name":"Backup Automatic backup"},"last_changed":"2026-02-21T21:54:09.862627+00:00","last_reported":"2026-02-21T21:54:09.862627+00:00","last_updated":"2026-02-21T21:54:09.862627+00:00","context":{"id":"01KJ1348T6KM7BQ3QJZ1GJ5A36","parent_id":null,"user_id":null}},
@@ -14,7 +14,7 @@
         "last_event_type": null,
         "last_event_attributes": null
       },
-      "last_seen": "2026-03-02T13:39:11.147470+00:00"
+      "last_seen": "2026-03-02T19:00:29.394772+00:00"
     }
   ]
 }

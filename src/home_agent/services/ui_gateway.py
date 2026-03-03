@@ -26,6 +26,8 @@ _source_stats: Dict[str, Dict[str, Any]] = {}
 _recent_feed: collections.deque = collections.deque(maxlen=_MAX_FEED)
 _topic_events: collections.deque = collections.deque(maxlen=_TOPIC_WINDOW)
 _db_activity: Dict[str, Any] = {}
+_voice_rooms: Dict[str, Dict[str, Any]] = {}
+_voice_commands: collections.deque = collections.deque(maxlen=20)
 
 
 def _update_source(source: str, typ: str, topic: str) -> None:
@@ -76,7 +78,7 @@ def _fetch_db_activity_cached(settings: Any) -> Dict[str, Any]:
                            (SELECT count(*) FROM events WHERE ingested_at > now() - interval '60 seconds')
                 """)
                 now_utc, last_at, last_60 = cur.fetchone()
-                cur.execute("SELECT ingested_at, topic, source, type FROM events ORDER BY ingested_at DESC LIMIT 8")
+                cur.execute("SELECT ingested_at, topic, source, type FROM events WHERE type NOT IN ('service.heartbeat', 'voice.room_status', 'watchdog.health', 'service.error') ORDER BY ingested_at DESC LIMIT 8")
                 rows = cur.fetchall()
         finally:
             conn.close()
@@ -291,7 +293,11 @@ def _status_html(*, title: str) -> str:
       <div class="pan"><div class="pan-t"><span class="ico">&#x1f5c4;&#xfe0f;</span>Recent ingested events</div><div id="db-tbl"><div class="empty">Loading...</div></div></div>
     </div>
   </div>
-  <div class="st">Errors <span class="badge bg" id="err-badge">0</span></div>
+  <div class="st">Voice Assistants</div>
+  <div class="grid" id="voice-grid"></div>
+  <div class="st" style="margin-top:10px">Recent Voice Commands</div>
+  <div class="pan" id="voice-cmds" style="max-height:200px;overflow-y:auto"><div class="empty">No commands yet</div></div>
+  <div class="st" style="margin-top:14px">Errors <span class="badge bg" id="err-badge">0</span></div>
   <div class="pan" id="errors" style="max-height:350px;overflow-y:auto"><div class="empty">No errors</div></div>
 </div>
 <script>
@@ -358,6 +364,32 @@ async function refresh(){{
       }}
       $('db-tbl').innerHTML=dh;
     }}else{{$('db-tbl').innerHTML='<div class="empty">DB unavailable</div>'}}
+
+    // voice rooms
+    const vr=d.voice_rooms||{{}};
+    const vrk=Object.keys(vr).sort();
+    if(vrk.length){{
+      let vh='';
+      for(const k of vrk){{
+        const v=vr[k];
+        const act=v.active;
+        vh+=`<div class="c"><div class="n"><span class="dot ${{act?'ok':'down'}}"></span>${{esc(v.room_name||k)}}</div>`
+          +`<div class="s">State: <b>${{esc(v.state||'?')}}</b><br>`
+          +`Active: <b>${{act?'yes':'no'}}</b><br>`
+          +`Wakes: <b>${{v.wakes||0}}</b> \u00b7 STT: <b>${{v.stt_reqs||0}}</b><br>`
+          +`Frames: <b>${{v.frames||0}}</b>`
+          +`</div></div>`;
+      }}
+      $('voice-grid').innerHTML=vh;
+    }}else{{$('voice-grid').innerHTML='<div class="empty">No voice data yet</div>'}}
+
+    // voice commands
+    const vc=d.voice_commands||[];
+    if(vc.length){{
+      let vch='<table><tr><th>Time</th><th>Room</th><th>Command</th></tr>';
+      for(const c of vc.slice(0,10))vch+=`<tr><td>${{ts(c.ts)}}</td><td><b>${{esc(c.room_name||c.room_id)}}</b></td><td>${{esc(c.text)}}</td></tr>`;
+      $('voice-cmds').innerHTML=vch+'</table>';
+    }}
 
     const eb=$('err-badge');
     if(errs.length){{
@@ -476,7 +508,30 @@ async def run_ui_gateway() -> None:
                     "topic": msg.topic,
                 })
 
-                if typ == "watchdog.health":
+                if typ == "service.heartbeat" and source == "voice-service":
+                    # Extract room status from heartbeat... not available there.
+                    pass
+                elif typ == "voice.room_status":
+                    rid = data.get("room_id", "")
+                    if rid:
+                        _voice_rooms[rid] = {
+                            "room_id": rid,
+                            "room_name": data.get("room_name", rid),
+                            "active": data.get("active", False),
+                            "state": data.get("state", "unknown"),
+                            "frames": data.get("frames", 0),
+                            "wakes": data.get("wakes", 0),
+                            "stt_reqs": data.get("stt_reqs", 0),
+                            "ts": payload.get("ts", ""),
+                        }
+                elif typ == "voice.command":
+                    _voice_commands.appendleft({
+                        "ts": payload.get("ts", ""),
+                        "room_id": data.get("room_id", ""),
+                        "room_name": data.get("room_name", ""),
+                        "text": data.get("text", ""),
+                    })
+                elif typ == "watchdog.health":
                     _latest_health.clear()
                     _latest_health.update(data.get("services", {}))
                 elif typ == "service.error":
@@ -581,6 +636,8 @@ async def run_ui_gateway() -> None:
                 "received_total": mqtt_stats.get("received_total", 0),
                 "dropped_total": mqtt_stats.get("dropped_total", 0),
             },
+            "voice_rooms": dict(_voice_rooms),
+            "voice_commands": list(_voice_commands),
             "ts": datetime.now(timezone.utc).isoformat(),
         }
 

@@ -14,7 +14,7 @@ from home_agent.core.logging import configure_logging, get_logger
 from home_agent.integrations.llm import LLMClient
 from home_agent.integrations.llm_router import LLMRouter
 from home_agent.integrations.gcal_ics import GoogleCalendarIcsClient
-from home_agent.integrations.weather_open_meteo import OpenMeteoClient
+from home_agent.integrations.weather import create_weather_client
 
 
 def _require_str(payload: Dict[str, Any], key: str) -> str:
@@ -215,9 +215,10 @@ async def run_morning_briefing_agent() -> None:
         )
     llm = LLMRouter(providers)
 
-    weather_client: Optional[OpenMeteoClient] = None
-    if settings.weather.provider == "open_meteo" and settings.weather.latitude and settings.weather.longitude:
-        weather_client = OpenMeteoClient(
+    weather_client: Optional[object] = None
+    if settings.weather.provider and settings.weather.latitude and settings.weather.longitude:
+        weather_client = create_weather_client(
+            provider=settings.weather.provider,
             latitude=settings.weather.latitude,
             longitude=settings.weather.longitude,
             units=settings.weather.units,
@@ -282,8 +283,9 @@ async def run_morning_briefing_agent() -> None:
 
                     if parts:
                         weather_sentence = "Forecast for today: " + ", ".join(parts) + "."
-                except Exception:
-                    log.warning("weather_failed")
+                except Exception as e:
+                    log.warning("weather_failed", error=str(e))
+                    reporter.report_error("weather_failed", e)
 
             now_local = datetime.now(tz=tz)
             today = now_local.strftime("%A, %B %d").replace(" 0", " ")
@@ -310,6 +312,7 @@ async def run_morning_briefing_agent() -> None:
                 except Exception as e:
                     # Do not log the ICS URL; treat it like a bearer secret.
                     log.warning("gcal_failed", error=str(e))
+                    reporter.report_error("gcal_failed", e)
 
             system = (
                 "You are a home morning-briefing generator. "

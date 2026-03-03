@@ -182,6 +182,15 @@ When multiple announcements arrive in quick succession (e.g. several camera even
 
 This avoids the jarring start/stop/start of music between rapid-fire announcements.
 
+## Playback events (voice coordination)
+
+The gateway publishes events on `homeagent/sonos/playback` to coordinate with the voice service:
+
+- **`sonos.playback_start`**: published immediately before audio plays. Contains `data.targets` (speaker aliases being used). The voice service uses this to go "deaf" and avoid picking up its own announcements.
+- **`sonos.playback_done`**: published after playback ends and the prior queue/state has been restored. The voice service resumes listening.
+
+These events are also displayed on the `/status` dashboard.
+
 ## Troubleshooting
 
 - **Nothing found (SSDP)**:

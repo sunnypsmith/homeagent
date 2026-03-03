@@ -19,7 +19,7 @@ from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 from home_agent.db import DbConnectInfo, DbManager
-from home_agent.integrations.weather_open_meteo import OpenMeteoClient
+from home_agent.integrations.weather import create_weather_client
 from zoneinfo import ZoneInfo
 
 
@@ -339,7 +339,8 @@ async def run_time_trigger() -> None:
             log.warning("sunset_disabled", reason="missing_weather_lat_lon")
             return None
 
-        client = OpenMeteoClient(
+        client = create_weather_client(
+            provider=settings.weather.provider,
             latitude=settings.weather.latitude,
             longitude=settings.weather.longitude,
             units=settings.weather.units,

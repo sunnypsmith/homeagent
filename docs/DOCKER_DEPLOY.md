@@ -39,6 +39,9 @@ Key fields:
 - Caséta + camera lighting (optional): `CASETA_*`, `CAMERA_LIGHTING_*`
   - If you run `caseta-agent` via Compose, also set `CASETA_CERTS_DIR` (host path) so the certs can be mounted into the container at `/certs`.
 - Web UI (optional): `UI_*` (bind to your LAN IP, e.g. `UI_BIND_HOST=10.1.1.111`, `UI_PORT=8001`)
+- Weather provider (optional): `WEATHER_PROVIDER=nws` for National Weather Service (default: `open_meteo`)
+- Voice assistant (optional): `VOICE_*` (UDP port, rooms, wake model, STT key, room speakers)
+- Watchdog (recommended): `WATCHDOG_TMUX_MAP` (maps service names to tmux panes for auto-restart)
 
 ## 2) Start the stack
 
@@ -84,4 +87,14 @@ Or per-service:
 ```bash
 docker compose -f deploy/docker-compose.yml logs -f --tail=100 sonos-gateway
 ```
+
+## Voice assistant (optional)
+
+If you run voice services via Docker, the container needs UDP port access (`VOICE_UDP_PORT`, default `9100`) and the wake-word model file. With `network_mode: host`, no extra port mapping is needed.
+
+For tmux-based deployments (recommended for voice), run the voice services in the tmux layout provided by `scripts/tmux_homeagent.sh` instead of Docker — this simplifies access to the Atom Echo UDP stream and the watchdog's restart capability.
+
+## Database retention
+
+The `events` hypertable uses a 30-day TimescaleDB retention policy. Old rows are automatically pruned — no manual cleanup needed.
 

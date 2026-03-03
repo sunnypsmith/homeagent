@@ -13,7 +13,7 @@ from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
-from home_agent.integrations.weather_open_meteo import OpenMeteoClient
+from home_agent.integrations.weather import create_weather_client
 
 
 def _require_str(payload: Dict[str, Any], key: str) -> str:
@@ -139,13 +139,14 @@ async def run_camera_lighting_agent() -> None:
         log.error("caseta_not_enabled", hint="Set CASETA_ENABLED=true and run caseta-agent")
         return
 
-    if not (settings.weather.provider == "open_meteo" and settings.weather.latitude and settings.weather.longitude):
+    if not (settings.weather.provider and settings.weather.latitude and settings.weather.longitude):
         log.error("missing_weather_location", hint="Set WEATHER_LAT and WEATHER_LON for dark detection")
         return
 
     tz = ZoneInfo(settings.timezone)
 
-    weather = OpenMeteoClient(
+    weather = create_weather_client(
+        provider=settings.weather.provider,
         latitude=settings.weather.latitude,
         longitude=settings.weather.longitude,
         units=settings.weather.units,

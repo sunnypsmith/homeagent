@@ -149,28 +149,6 @@ services:
     command: ["home-agent", "camera-lighting-agent"]
     depends_on: [mqtt, db]
 
-  # Wyoming Whisper STT (local speech-to-text for voice pipeline)
-  whisper:
-    image: rhasspy/wyoming-whisper:latest
-    container_name: home-whisper
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - whisper_data:/data
-    command: ["--model", "small", "--language", "en", "--uri", "tcp://0.0.0.0:10300"]
-
-  # Home Assistant Core (voice pipeline bridge for Atom Echo devices)
-  homeassistant:
-    image: ghcr.io/home-assistant/home-assistant:stable
-    container_name: home-ha
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../ha-config:/config
-    environment:
-      TZ: ${HOME_AGENT_TIMEZONE:-America/New_York}
-    depends_on: [mqtt, whisper]
-
   # Optional: simple LAN web UI (buttons -> MQTT announce.request)
   ui-gateway:
     build:
@@ -188,5 +166,4 @@ volumes:
   mosquitto_data:
   mosquitto_log:
   timescaledb_data:
-  whisper_data:
 

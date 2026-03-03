@@ -26,6 +26,8 @@ from home_agent.services.sonos_gateway import main as sonos_gateway_main
 from home_agent.services.time_trigger import main as time_trigger_main
 from home_agent.services.ui_gateway import main as ui_gateway_main
 from home_agent.services.monitor_tui import main as monitor_main
+from home_agent.services.voice_intent_agent import main as voice_intent_agent_main
+from home_agent.services.voice_service import main as voice_service_main
 from home_agent.services.watchdog import main as watchdog_main
 from home_agent.services.wakeup_agent import main as wakeup_agent_main
 from home_agent.services.exec_briefing_agent import main as exec_briefing_agent_main
@@ -385,6 +387,18 @@ def camera_lighting_agent() -> None:
 def watchdog() -> None:
     """Run watchdog service (monitors all services, announces errors, restarts crashed processes)."""
     raise SystemExit(watchdog_main())
+
+
+@app.command("voice-service")
+def voice_service() -> None:
+    """Run voice service (UDP audio from Atom Echos -> wake word -> STT -> MQTT)."""
+    raise SystemExit(voice_service_main())
+
+
+@app.command("voice-intent-agent")
+def voice_intent_agent() -> None:
+    """Run voice intent agent (voice commands -> LLM -> actions + Sonos responses)."""
+    raise SystemExit(voice_intent_agent_main())
 
 
 @app.command("fixed-announcement-agent")

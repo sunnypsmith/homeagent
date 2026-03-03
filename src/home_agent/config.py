@@ -572,12 +572,14 @@ class ExecBriefingSettings(BaseSettings):
     ics_url: str = Field(default="", alias="EXEC_BRIEFING_ICS_URL")
     dashboard_url: str = Field(default="", alias="EXEC_BRIEFING_DASHBOARD_URL")
     dashboard_vision_model: str = Field(
-        default="meta-llama/llama-4-maverick-17b-128e-instruct",
+        default="gpt-4.1-mini",
         alias="EXEC_BRIEFING_DASHBOARD_VISION_MODEL",
     )
+    dashboard_vision_base_url: str = Field(default="", alias="EXEC_BRIEFING_DASHBOARD_VISION_BASE_URL")
+    dashboard_vision_api_key: str = Field(default="", alias="EXEC_BRIEFING_DASHBOARD_VISION_API_KEY")
     news_headlines: int = Field(default=5, alias="EXEC_BRIEFING_NEWS_HEADLINES")
 
-    @field_validator("targets", "ics_url", "dashboard_url", "dashboard_vision_model", mode="before")
+    @field_validator("targets", "ics_url", "dashboard_url", "dashboard_vision_model", "dashboard_vision_base_url", "dashboard_vision_api_key", mode="before")
     @classmethod
     def _norm_str(cls, v: object) -> str:
         return _strip_quotes(str(v)).strip()
@@ -1067,4 +1069,53 @@ class AppSettings(BaseSettings):
     camera_lighting: CameraLightingSettings = CameraLightingSettings()
     ui: UiSettings = UiSettings()
     watchdog_tmux_map: str = Field(default="", alias="WATCHDOG_TMUX_MAP")
+
+    voice_udp_port: int = Field(default=9100, alias="VOICE_UDP_PORT")
+    voice_rooms: str = Field(default="", alias="VOICE_ROOMS")
+    voice_wake_model: str = Field(default="models/master_higgins.onnx", alias="VOICE_WAKE_MODEL")
+    voice_wake_threshold: float = Field(default=0.5, alias="VOICE_WAKE_THRESHOLD")
+    voice_wake_cooldown: float = Field(default=2.0, alias="VOICE_WAKE_COOLDOWN")
+    voice_vad_silence_ms: int = Field(default=1000, alias="VOICE_VAD_SILENCE_MS")
+    voice_vad_max_command_ms: int = Field(default=10000, alias="VOICE_VAD_MAX_COMMAND_MS")
+    voice_stt_provider: str = Field(default="groq", alias="VOICE_STT_PROVIDER")
+    voice_stt_api_key: str = Field(default="", alias="VOICE_STT_API_KEY")
+    voice_stt_model: str = Field(default="whisper-large-v3", alias="VOICE_STT_MODEL")
+    voice_stt_language: str = Field(default="en", alias="VOICE_STT_LANGUAGE")
+    voice_room_speakers: str = Field(default="", alias="VOICE_ROOM_SPEAKERS")
+
+    @property
+    def voice_room_speakers_parsed(self) -> Dict[str, List[str]]:
+        """Parse VOICE_ROOM_SPEAKERS='offi:office,ktch:kitchen_dining' into {room_id: [speakers]}."""
+        raw = _strip_quotes(str(self.voice_room_speakers or "")).strip()
+        if not raw:
+            return {}
+        out: Dict[str, List[str]] = {}
+        for chunk in raw.replace(";", ",").split(","):
+            item = chunk.strip()
+            if ":" not in item:
+                continue
+            room_id, speakers = item.split(":", 1)
+            room_id = room_id.strip()
+            speaker_list = [s.strip() for s in speakers.split("+") if s.strip()]
+            if room_id and speaker_list:
+                out[room_id] = speaker_list
+        return out
+
+    @property
+    def voice_rooms_parsed(self) -> Dict[str, str]:
+        """Parse VOICE_ROOMS='office=offi,kitchen=ktch' into {name: room_id}."""
+        raw = _strip_quotes(str(self.voice_rooms or "")).strip()
+        if not raw:
+            return {}
+        out: Dict[str, str] = {}
+        for chunk in raw.replace(";", ",").split(","):
+            item = chunk.strip()
+            if "=" not in item:
+                continue
+            name, room_id = item.split("=", 1)
+            name = name.strip()
+            room_id = room_id.strip()[:4]
+            if name and room_id:
+                out[name] = room_id
+        return out
 

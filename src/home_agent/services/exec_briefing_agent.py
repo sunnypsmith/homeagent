@@ -17,7 +17,7 @@ from home_agent.integrations.llm_router import LLMRouter
 from home_agent.integrations.gcal_ics import GoogleCalendarIcsClient
 from home_agent.integrations.news_feed import fetch_all_feeds
 from home_agent.integrations.simplefin import SimpleFINClient
-from home_agent.integrations.weather_open_meteo import OpenMeteoClient
+from home_agent.integrations.weather import create_weather_client
 
 
 def _require_str(payload: Dict[str, Any], key: str) -> str:
@@ -236,9 +236,10 @@ async def run_exec_briefing_agent() -> None:
         )
     llm = LLMRouter(providers)
 
-    weather_client: Optional[OpenMeteoClient] = None
-    if settings.weather.provider == "open_meteo" and settings.weather.latitude and settings.weather.longitude:
-        weather_client = OpenMeteoClient(
+    weather_client: Optional[object] = None
+    if settings.weather.provider and settings.weather.latitude and settings.weather.longitude:
+        weather_client = create_weather_client(
+            provider=settings.weather.provider,
             latitude=settings.weather.latitude,
             longitude=settings.weather.longitude,
             units=settings.weather.units,
@@ -256,10 +257,12 @@ async def run_exec_briefing_agent() -> None:
 
     dashboard_scraper: Optional[DashboardScraper] = None
     if settings.exec_briefing.dashboard_url and settings.llm.api_key:
+        v_base = settings.exec_briefing.dashboard_vision_base_url or settings.llm.base_url
+        v_key = settings.exec_briefing.dashboard_vision_api_key or settings.llm.api_key
         dashboard_scraper = DashboardScraper(
             url=settings.exec_briefing.dashboard_url,
-            llm_base_url=settings.llm.base_url,
-            llm_api_key=settings.llm.api_key,
+            llm_base_url=v_base,
+            llm_api_key=v_key,
             vision_model=settings.exec_briefing.dashboard_vision_model,
         )
 
@@ -315,8 +318,9 @@ async def run_exec_briefing_agent() -> None:
 
                     if parts:
                         weather_sentence = "Forecast for today: " + ", ".join(parts) + "."
-                except Exception:
-                    log.warning("weather_failed")
+                except Exception as e:
+                    log.warning("weather_failed", error=str(e))
+                    reporter.report_error("weather_failed", e)
 
             # --- Calendar ---
             now_local = datetime.now(tz=tz)
@@ -337,6 +341,7 @@ async def run_exec_briefing_agent() -> None:
                     calendar_json = json.dumps(_calendar_payload(today_events, now_local=now_local), ensure_ascii=False)
                 except Exception as e:
                     log.warning("gcal_failed", error=str(e))
+                    reporter.report_error("gcal_failed", e)
 
             # --- Financial ---
             finance_sentence = ""
@@ -353,6 +358,7 @@ async def run_exec_briefing_agent() -> None:
                     )
                 except Exception as e:
                     log.warning("simplefin_failed", error=str(e))
+                    reporter.report_error("simplefin_failed", e)
 
             # --- Dashboard ---
             dashboard_sentence = ""
@@ -370,6 +376,7 @@ async def run_exec_briefing_agent() -> None:
                         dashboard_sentence = "Massed Compute: " + ", ".join(parts) + "."
                 except Exception as e:
                     log.warning("dashboard_scrape_failed", error=str(e))
+                    reporter.report_error("dashboard_scrape_failed", e)
 
             # --- News feeds ---
             news_section = ""
@@ -391,6 +398,7 @@ async def run_exec_briefing_agent() -> None:
                         news_section = " ".join(parts)
                 except Exception as e:
                     log.warning("news_feed_failed", error=str(e))
+                    reporter.report_error("news_feed_failed", e)
 
             # --- LLM ---
             system = (

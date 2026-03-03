@@ -23,6 +23,9 @@ Event-driven home automation / “house agent” stack in Python.
 - **Sunset scene (optional)**: trigger a Caséta scene at local sunset
 - **Home checks (optional)**: scheduled health checks (e.g., Temp Stick thresholds)
 - **Executive briefing (optional)**: M-F briefing with weather, calendar, financial summary (SimpleFIN), dashboard metrics, and configurable news feeds
+- **Voice assistant (optional)**: M5Stack Atom Echo devices stream UDP audio to a voice service (openWakeWord wake detection, VAD, Groq Whisper STT) which publishes commands to a voice-intent agent (LLM tool-calling for actions + Sonos spoken responses)
+- **NWS weather provider (optional)**: National Weather Service API as an alternative to Open-Meteo (no API key, US-only, built-in response caching)
+- **Status dashboard**: real-time `/status` page on the UI gateway showing service health, MQTT activity, DB events, voice room status, recent commands, and errors
 
 ## Quick start (local dev)
 
@@ -85,6 +88,8 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent hourly-house-check-agent`: scheduled checks (e.g., Temp Stick thresholds)
 - `home-agent exec-briefing-agent`: daily executive briefing (weather + calendar + financial)
 - `home-agent watchdog`: monitors all services via heartbeats/errors, announces failures, restarts crashed processes
+- `home-agent voice-service`: UDP audio receiver (Atom Echo) → openWakeWord → VAD → Groq Whisper STT → MQTT `voice.command`
+- `home-agent voice-intent-agent`: voice commands → LLM tool-calling → actions + Sonos spoken responses
 
 ## Common examples
 
@@ -190,6 +195,46 @@ To enable automatic restarts, set a tmux pane mapping so the watchdog knows wher
 ```bash
 WATCHDOG_TMUX_MAP=sonos-gateway:homeagent:0.1,camect-agent:homeagent:2.0,time-trigger:homeagent:0.0
 ```
+
+### Voice assistant (optional)
+
+Hands-free voice control via M5Stack Atom Echo devices running custom ESPHome firmware.
+The Atom Echos stream 16 kHz PCM audio over UDP to the voice service, which runs
+openWakeWord wake-word detection, WebRTC VAD, and Groq Whisper STT. Transcribed commands
+are published to MQTT and processed by the voice-intent agent (LLM with tool calling).
+Responses are spoken back on the nearest Sonos speaker.
+
+```bash
+# Voice service config
+VOICE_UDP_PORT=9100
+VOICE_ROOMS=office=offi,kitchen=ktch
+VOICE_WAKE_MODEL=models/master_higgins.onnx
+VOICE_WAKE_THRESHOLD=0.5
+VOICE_STT_PROVIDER=groq
+VOICE_STT_API_KEY=YOUR_GROQ_KEY_HERE
+VOICE_ROOM_SPEAKERS=offi:office,ktch:kitchen_dining
+```
+
+Run the two services:
+
+```bash
+home-agent voice-service
+home-agent voice-intent-agent
+```
+
+ESPHome device configs live in `esphome/`. Flash with `esphome run esphome/atom-echo-voice.yaml`.
+
+The voice service enters a "deaf" state when Sonos is playing (`sonos.playback_start` / `sonos.playback_done` MQTT events) to avoid picking up its own announcements.
+
+### NWS weather provider (optional)
+
+Switch from Open-Meteo to the National Weather Service API (free, no key, US locations only):
+
+```bash
+WEATHER_PROVIDER=nws
+```
+
+Built-in response caching (5 min current conditions, 10 min forecast). Falls back to Open-Meteo for sunrise/sunset data.
 
 ### Offline announcement audio (optional)
 
@@ -339,4 +384,5 @@ CAMERA_LIGHTING_DURATION_SECONDS=600
 - `docs/CAMECT_SETUP.md`
 - `docs/CASETA_SETUP.md`
 - `docs/CAMERA_LIGHTING.md`
+- `esphome/` — ESPHome configs for M5Stack Atom Echo voice devices
 
