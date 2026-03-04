@@ -22,7 +22,7 @@ All messages on MQTT use the same JSON envelope:
 - **`event-recorder`**: subscribes to MQTT topics and records all events to TimescaleDB (`events` table)
 - **`ui-gateway`** (optional): LAN web UI with controls (`/`) and a real-time system status dashboard (`/status`) showing service health, MQTT activity, DB events, voice room status, recent voice commands, and errors
 - **`watchdog`**: monitors all services via heartbeats and error events, announces failures, and attempts restarts via tmux (`WATCHDOG_TMUX_MAP`)
-- **`voice-service`** (optional): receives UDP audio from M5Stack Atom Echo devices, runs openWakeWord wake-word detection, WebRTC VAD, and Groq Whisper STT; publishes `voice.command` events to MQTT
+- **`voice-service`** (optional): receives UDP audio from M5Stack Atom Echo devices, runs wake-word detection (Porcupine or openWakeWord), WebRTC VAD, and Groq Whisper STT; publishes `voice.command` events to MQTT
 - **`voice-intent-agent`** (optional): subscribes to `voice.command`, uses LLM with tool calling to classify commands vs questions, dispatches actions via MQTT, and speaks responses through the room's Sonos speaker
 
 ### Agents (examples)
@@ -38,7 +38,7 @@ All messages on MQTT use the same JSON envelope:
 
 ### Voice pipeline
 The voice system is split into two services:
-1. **`voice-service`**: runs one openWakeWord model instance per room, each fed 16 kHz PCM frames from an Atom Echo over UDP. On wake detection, it captures speech (WebRTC VAD), transcribes via Groq Whisper STT, and publishes `voice.command` to MQTT.
+1. **`voice-service`**: runs one wake-word engine instance per room (Porcupine or openWakeWord, configured via `VOICE_WAKE_ENGINE`), each fed 16 kHz PCM frames from an Atom Echo over UDP. On wake detection, it captures speech (WebRTC VAD), transcribes via Groq Whisper STT, and publishes `voice.command` to MQTT.
 2. **`voice-intent-agent`**: receives `voice.command`, builds an LLM prompt with tool definitions (announce, mute, lights, scenes, briefings, household commands, time/weather), and either executes a tool call or responds conversationally. Responses are targeted to the room's Sonos speaker via `VOICE_ROOM_SPEAKERS`.
 
 Feedback suppression: when the Sonos gateway starts playback it publishes `sonos.playback_start`; the voice service goes "deaf" (drops audio buffers) until `sonos.playback_done` arrives, preventing the mic from picking up its own announcements.
@@ -76,6 +76,9 @@ Pluggable unit of behavior. A module's `start(ctx)` typically:
 
 ### LLM
 `integrations/llm.py` is an OpenAI-compatible `/v1/chat/completions` client. Supports tool calling (used by `voice-intent-agent`).
+
+### LLM Fallback Router
+`integrations/llm_router.py` wraps one or more LLM providers with automatic failover. If the primary provider fails (timeout, HTTP error), the router retries the request on the fallback provider. Configure with `LLM_FALLBACK_*` environment variables.
 
 ### Weather
 `integrations/weather.py` is a factory that returns either an NWS or Open-Meteo client based on the `WEATHER_PROVIDER` config (`nws` or `open_meteo`). Both expose `current()` and `forecast_today()` async methods.

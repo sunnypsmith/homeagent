@@ -23,8 +23,9 @@ Event-driven home automation / “house agent” stack in Python.
 - **Sunset scene (optional)**: trigger a Caséta scene at local sunset
 - **Home checks (optional)**: scheduled health checks (e.g., Temp Stick thresholds)
 - **Executive briefing (optional)**: M-F briefing with weather, calendar, financial summary (SimpleFIN), dashboard metrics, and configurable news feeds
-- **Voice assistant (optional)**: M5Stack Atom Echo devices stream UDP audio to a voice service (openWakeWord wake detection, VAD, Groq Whisper STT) which publishes commands to a voice-intent agent (LLM tool-calling for actions + Sonos spoken responses)
+- **Voice assistant (optional)**: M5Stack Atom Echo devices stream UDP audio to a voice service (Porcupine or openWakeWord wake detection, WebRTC VAD, Groq Whisper STT) which publishes commands to a voice-intent agent (LLM tool-calling for actions + Sonos spoken responses)
 - **NWS weather provider (optional)**: National Weather Service API as an alternative to Open-Meteo (no API key, US-only, built-in response caching)
+- **LLM fallback**: automatic failover to a secondary LLM provider when the primary is down (`LLM_FALLBACK_*` config)
 - **Status dashboard**: real-time `/status` page on the UI gateway showing service health, MQTT activity, DB events, voice room status, recent commands, and errors
 
 ## Quick start (local dev)
@@ -88,8 +89,9 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent hourly-house-check-agent`: scheduled checks (e.g., Temp Stick thresholds)
 - `home-agent exec-briefing-agent`: daily executive briefing (weather + calendar + financial)
 - `home-agent watchdog`: monitors all services via heartbeats/errors, announces failures, restarts crashed processes
-- `home-agent voice-service`: UDP audio receiver (Atom Echo) → openWakeWord → VAD → Groq Whisper STT → MQTT `voice.command`
+- `home-agent voice-service`: UDP audio receiver (Atom Echo) → Porcupine/openWakeWord → VAD → Groq Whisper STT → MQTT `voice.command`
 - `home-agent voice-intent-agent`: voice commands → LLM tool-calling → actions + Sonos spoken responses
+- `home-agent monitor`: terminal dashboard (rich TUI) for MQTT activity and service status
 
 ## Common examples
 
@@ -208,11 +210,24 @@ Responses are spoken back on the nearest Sonos speaker.
 # Voice service config
 VOICE_UDP_PORT=9100
 VOICE_ROOMS=office=offi,kitchen=ktch
-VOICE_WAKE_MODEL=models/master_higgins.onnx
-VOICE_WAKE_THRESHOLD=0.5
+VOICE_ROOM_SPEAKERS=offi:office,ktch:kitchen_dining
+
+# Wake word — Porcupine (recommended)
+VOICE_WAKE_ENGINE=porcupine
+VOICE_PORCUPINE_KEY=YOUR_PICOVOICE_KEY
+VOICE_PORCUPINE_MODEL=models/Master-Higgins_en_linux_v4_0_0.ppn
+VOICE_WAKE_COOLDOWN=2.0
+
+# Wake word — openWakeWord (alternative)
+# VOICE_WAKE_ENGINE=openwakeword
+# VOICE_WAKE_MODEL=models/master_higgins.onnx
+# VOICE_WAKE_THRESHOLD=0.5
+
+# STT
 VOICE_STT_PROVIDER=groq
 VOICE_STT_API_KEY=YOUR_GROQ_KEY_HERE
-VOICE_ROOM_SPEAKERS=offi:office,ktch:kitchen_dining
+VOICE_STT_MODEL=whisper-large-v3
+VOICE_STT_LANGUAGE=en
 ```
 
 Run the two services:
@@ -375,14 +390,17 @@ CAMERA_LIGHTING_DURATION_SECONDS=600
 
 ## Docs
 
-- `docs/ARCHITECTURE.md`
-- `docs/SONOS_SETUP.md`
-- `docs/DB_SETUP.md`
-- `docs/SCHEDULING.md`
-- `docs/CALENDAR_SETUP.md`
-- `docs/DOCKER_DEPLOY.md`
-- `docs/CAMECT_SETUP.md`
-- `docs/CASETA_SETUP.md`
-- `docs/CAMERA_LIGHTING.md`
+- `docs/ARCHITECTURE.md` — system design and service overview
+- `docs/VOICE_ASSISTANT.md` — voice pipeline, ESPHome firmware, configuration, troubleshooting
+- `docs/WEATHER.md` — weather provider factory (NWS + Open-Meteo)
+- `docs/WATCHDOG.md` — service health monitoring and auto-restart
+- `docs/SONOS_SETUP.md` — speaker discovery, volumes, playback events
+- `docs/DB_SETUP.md` — TimescaleDB migrations and retention
+- `docs/SCHEDULING.md` — cron/interval schedules
+- `docs/CALENDAR_SETUP.md` — Google Calendar / iCloud ICS
+- `docs/DOCKER_DEPLOY.md` — Docker Compose deployment
+- `docs/CAMECT_SETUP.md` — Camect camera integration
+- `docs/CASETA_SETUP.md` — Lutron Caséta lighting
+- `docs/CAMERA_LIGHTING.md` — camera → lighting automation
 - `esphome/` — ESPHome configs for M5Stack Atom Echo voice devices
 
