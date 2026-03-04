@@ -18,6 +18,7 @@ from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 from home_agent.integrations.llm import LLMClient, LLMToolCall, LLMTextResponse
+from home_agent.integrations.llm_router import LLMRouter
 
 SYSTEM_PROMPT = """You are Higgins, a helpful home assistant. You manage a smart home.
 
@@ -26,6 +27,18 @@ When the user gives a COMMAND (e.g., "turn off the lights", "mute announcements"
 When the user asks a QUESTION (e.g., "what time is it?", "what's the weather?"), answer conversationally in 1-3 short sentences. Format your answer for spoken audio: spell out numbers, avoid abbreviations, no URLs, no markdown.
 
 After executing a command, do NOT respond with text. The system will generate a spoken confirmation automatically.
+
+The user message is prefixed with [Room: name] indicating which room they are in. Use this for context — e.g., "turn off the lights" from the office means office lights.
+
+Format ALL output for spoken text-to-speech audio:
+- Spell out ALL numbers: '3' becomes 'three', '42' becomes 'forty two', '2026' becomes 'twenty twenty six'.
+- Spell out times: '2:45 PM' becomes 'two forty five P M'.
+- Spell out dates: 'March 3rd' not 'March 3'.
+- Spell out currency: '$1,500' becomes 'fifteen hundred dollars', '$42.50' becomes 'forty two dollars and fifty cents'.
+- Spell out percentages: '22%' becomes 'twenty two percent'.
+- Spell out abbreviations: 'Dr.' becomes 'Doctor', 'St.' becomes 'Street', 'Ave' becomes 'Avenue'.
+- No URLs, no markdown, no bullet points, no special characters.
+- Use short, natural sentences suitable for listening.
 
 Be concise. You are speaking out loud to a person in their home."""
 
@@ -118,7 +131,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "activate_scene",
-            "description": "Activate a Caseta lighting scene by name (e.g. 'Nighttime', 'Daytime').",
+            "description": "Activate a Caseta lighting scene. Available scenes: Bedtime, Daytime, Sleep, Nighttime.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -152,6 +165,24 @@ TOOLS = [
             "name": "get_time_and_weather",
             "description": "Get the current time and outdoor temperature. Use this when the user asks what time it is, what the temperature is, or asks about current weather conditions.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_forecast",
+            "description": "Get the weather forecast for today or tomorrow. Use this when the user asks about the forecast, tomorrow's weather, or upcoming weather conditions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {
+                        "type": "string",
+                        "enum": ["today", "tomorrow"],
+                        "description": "Which day to get the forecast for",
+                    },
+                },
+                "required": ["day"],
+            },
         },
     },
     {
@@ -217,12 +248,25 @@ async def run_voice_intent_agent() -> None:
     mqttc.subscribe("%s/voice/command" % base)
     log.info("subscribed", topic="%s/voice/command" % base)
 
-    llm = LLMClient(
-        base_url=settings.llm.base_url,
-        api_key=settings.llm.api_key,
-        model=settings.llm.model,
-        timeout_seconds=settings.llm.timeout_seconds,
-    )
+    providers = [
+        ("primary", LLMClient(
+            base_url=settings.llm.base_url,
+            api_key=settings.llm.api_key,
+            model=settings.llm.model,
+            timeout_seconds=settings.llm.timeout_seconds,
+        )),
+    ]
+    if settings.llm_fallback.enabled:
+        providers.append(
+            ("fallback", LLMClient(
+                base_url=settings.llm_fallback.base_url,
+                api_key=settings.llm_fallback.api_key,
+                model=settings.llm_fallback.model,
+                timeout_seconds=settings.llm_fallback.timeout_seconds,
+            ))
+        )
+    llm = LLMRouter(providers)
+    log.info("llm_providers", count=len(providers), names=[p[0] for p in providers])
 
     room_speakers = settings.voice_room_speakers_parsed
     log.info("room_speaker_map", map=room_speakers)
@@ -347,6 +391,48 @@ async def run_voice_intent_agent() -> None:
                 time_str = now_local.strftime("%I:%M %p").lstrip("0")
                 return "It is %s." % time_str
 
+        elif name == "get_forecast":
+            from home_agent.integrations.weather import create_weather_client
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            try:
+                day = str(args.get("day", "today"))
+                tz = ZoneInfo(settings.timezone)
+                weather_client = create_weather_client(
+                    provider=settings.weather.provider,
+                    latitude=settings.weather.latitude,
+                    longitude=settings.weather.longitude,
+                    units=settings.weather.units,
+                    timeout_seconds=settings.weather.timeout_seconds,
+                )
+                fc = await weather_client.forecast_today()
+                parts = []
+                if day == "tomorrow":
+                    # NWS forecast includes tonight/tomorrow in the periods
+                    # For now, use today's forecast as approximation
+                    # TODO: add multi-day forecast support to weather client
+                    now_local = datetime.now(tz=tz)
+                    import calendar
+                    tomorrow_name = calendar.day_name[(now_local.weekday() + 1) % 7]
+                    prefix = "The forecast for tomorrow, %s" % tomorrow_name
+                else:
+                    now_local = datetime.now(tz=tz)
+                    prefix = "Today's forecast"
+                if fc.temp_max is not None and fc.temp_min is not None:
+                    parts.append("a high of %d and a low of %d degrees" % (int(round(fc.temp_max)), int(round(fc.temp_min))))
+                if fc.precip_probability_max is not None and fc.precip_probability_max > 0:
+                    parts.append("%d percent chance of precipitation" % int(round(fc.precip_probability_max)))
+                if fc.wind_speed_max is not None:
+                    parts.append("winds up to %d miles per hour" % int(round(fc.wind_speed_max)))
+                current = await weather_client.current()
+                if current.description:
+                    parts.append("currently %s" % current.description.lower())
+                if parts:
+                    return "%s: %s." % (prefix, ", ".join(parts))
+                return "%s is not available right now." % prefix
+            except Exception:
+                return "I was unable to get the forecast right now."
+
         elif name == "household_command":
             cmd = str(args.get("command", ""))
             text = _HOUSEHOLD_TEXTS.get(cmd)
@@ -391,7 +477,7 @@ async def run_voice_intent_agent() -> None:
             try:
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
+                    {"role": "user", "content": "[Room: %s] %s" % (room_name, text)},
                 ]
                 result = await llm.chat_with_tools(
                     messages=messages,

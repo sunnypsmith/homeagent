@@ -34,4 +34,24 @@ OFFLINE_AUDIO_ITEMS: List[OfflineAudioItem] = [
             "Repeating. The internet egress has significant packet loss."
         ),
     },
+    {
+        "key": "voice_ack",
+        "filename": "voice_ack.wav",
+        "text": "One moment.",
+    },
+    {
+        "key": "voice_ack_2",
+        "filename": "voice_ack_2.wav",
+        "text": "Let me check.",
+    },
+    {
+        "key": "voice_ack_3",
+        "filename": "voice_ack_3.wav",
+        "text": "Working on it.",
+    },
+    {
+        "key": "voice_error",
+        "filename": "voice_error.wav",
+        "text": "I'm sorry, I had trouble with that request.",
+    },
 ]

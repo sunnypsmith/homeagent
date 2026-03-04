@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
-from home_agent.integrations.llm import LLMClient
+from typing import Any, Dict, List
+
+from home_agent.integrations.llm import LLMClient, LLMToolCall, LLMTextResponse
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,29 @@ class LLMRouter:
                     temperature=temperature,
                 )
                 return LLMReply(provider=name, text=text)
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError("All LLM providers failed") from last_err
+
+    async def chat_with_tools(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> "LLMToolCall | LLMTextResponse":
+        last_err: Optional[Exception] = None
+        for name, client in self._providers:
+            try:
+                result = await client.chat_with_tools(
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return result
             except Exception as e:
                 last_err = e
                 continue

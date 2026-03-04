@@ -331,7 +331,9 @@ async def run_morning_briefing_agent() -> None:
                 "- Keep event titles verbatim.\n"
                 "- If there are zero events, say there are no calendar events today.\n"
                 '- End with exactly: "Mind how you go."\n'
-                "- Do not use bullet characters.\n\n"
+                "- Do not use bullet characters.\n"
+                "- Format ALL output for spoken audio: spell out numbers, times, dates, currency, and percentages as words.\n"
+                "- No URLs, markdown, or special characters.\n\n"
                 f"Forecast sentence (use verbatim, or omit if blank):\n{weather_sentence}\n"
                 f"Calendar JSON (do not repeat verbatim; use it to narrate):\n{calendar_json}\n"
             )

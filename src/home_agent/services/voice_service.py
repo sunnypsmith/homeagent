@@ -33,9 +33,9 @@ _WHISPER_HALLUCINATIONS = {
 ROOM_HEADER_SIZE = 4
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2
-# openWakeWord needs 80ms frames = 1280 samples
-OWW_FRAME_SAMPLES = 1280
-OWW_FRAME_BYTES = OWW_FRAME_SAMPLES * SAMPLE_WIDTH
+# Wake word frame sizes (set at runtime based on engine)
+WW_FRAME_SAMPLES = 512  # default for Porcupine; 1280 for openWakeWord
+WW_FRAME_BYTES = WW_FRAME_SAMPLES * SAMPLE_WIDTH
 # webrtcvad needs 30ms frames = 480 samples
 VAD_FRAME_MS = 30
 VAD_FRAME_SAMPLES = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
@@ -55,6 +55,7 @@ class Room:
     friendly_name: str
     state: str = RoomState.LISTENING
     oww_model: Any = None
+    porcupine: Any = None
 
     # Stats
     frames_received: int = 0
@@ -71,6 +72,7 @@ class Room:
 
     # Timing
     last_wake_time: float = 0.0
+    last_model_reset: float = 0.0
     last_speech_time: float = 0.0
     command_start_time: float = 0.0
 
@@ -156,15 +158,33 @@ async def run_voice_service() -> None:
     mqttc.subscribe("%s/sonos/playback" % settings.mqtt.base_topic)
 
 
-    # Wake word model
-    wake_model_path = str(Path(settings.voice_wake_model))
-    if not Path(wake_model_path).is_absolute():
-        wake_model_path = str(Path(__file__).resolve().parents[3] / wake_model_path)
-    wake_threshold = settings.voice_wake_threshold
+    # Wake word engine
+    global WW_FRAME_SAMPLES, WW_FRAME_BYTES
+    wake_engine = settings.voice_wake_engine
     wake_cooldown = settings.voice_wake_cooldown
+    wake_threshold = settings.voice_wake_threshold
+    porcupine = None
 
-    from openwakeword.model import Model as OWWModel
-    log.info("loading_wake_model", path=wake_model_path)
+    if wake_engine == "porcupine":
+        import pvporcupine
+        ppn_path = str(Path(settings.voice_porcupine_model))
+        if not Path(ppn_path).is_absolute():
+            ppn_path = str(Path(__file__).resolve().parents[3] / ppn_path)
+        porcupine = pvporcupine.create(
+            access_key=settings.voice_porcupine_key,
+            keyword_paths=[ppn_path],
+        )
+        WW_FRAME_SAMPLES = porcupine.frame_length
+        WW_FRAME_BYTES = WW_FRAME_SAMPLES * SAMPLE_WIDTH
+        log.info("wake_engine_porcupine", model=ppn_path, frame_length=porcupine.frame_length)
+    else:
+        from openwakeword.model import Model as OWWModel
+        oww_path = str(Path(settings.voice_wake_model))
+        if not Path(oww_path).is_absolute():
+            oww_path = str(Path(__file__).resolve().parents[3] / oww_path)
+        WW_FRAME_SAMPLES = 1280
+        WW_FRAME_BYTES = WW_FRAME_SAMPLES * SAMPLE_WIDTH
+        log.info("wake_engine_openwakeword", model=oww_path)
 
     # VAD
     import webrtcvad
@@ -179,12 +199,20 @@ async def run_voice_service() -> None:
     if not stt_api_key:
         log.warning("no_stt_api_key", hint="Set VOICE_STT_API_KEY in .env")
 
-    # Rooms — each gets its own openWakeWord model instance (maintains internal state)
+    # Rooms — each gets its own wake word instance (models are stateful)
     rooms: Dict[str, Room] = {}
     for name, room_id in room_configs.items():
-        oww = OWWModel(wakeword_model_paths=[wake_model_path], enable_speex_noise_suppression=False)
-        rooms[room_id] = Room(room_id=room_id, friendly_name=name, oww_model=oww)
-        log.info("room_registered", name=name, room_id=room_id, wake_model=list(oww.models.keys()))
+        oww_model = None
+        room_porcupine = None
+        if wake_engine == "porcupine":
+            room_porcupine = pvporcupine.create(
+                access_key=settings.voice_porcupine_key,
+                keyword_paths=[ppn_path],
+            )
+        else:
+            oww_model = OWWModel(wakeword_model_paths=[oww_path], enable_speex_noise_suppression=False)
+        rooms[room_id] = Room(room_id=room_id, friendly_name=name, oww_model=oww_model, porcupine=room_porcupine)
+        log.info("room_registered", name=name, room_id=room_id, engine=wake_engine)
 
     # UDP listener
     loop = asyncio.get_running_loop()
@@ -259,9 +287,9 @@ async def run_voice_service() -> None:
     # Per-room audio processing
     def _process_room_audio(room: Room) -> Optional[bytes]:
         """Process buffered audio for one room. Returns command PCM if complete, else None."""
-        while len(room.raw_buffer) >= OWW_FRAME_BYTES:
-            frame_bytes = bytes(room.raw_buffer[:OWW_FRAME_BYTES])
-            room.raw_buffer = room.raw_buffer[OWW_FRAME_BYTES:]
+        while len(room.raw_buffer) >= WW_FRAME_BYTES:
+            frame_bytes = bytes(room.raw_buffer[:WW_FRAME_BYTES])
+            room.raw_buffer = room.raw_buffer[WW_FRAME_BYTES:]
             frame_np = np.frombuffer(frame_bytes, dtype=np.int16)
 
             if room.state == RoomState.LISTENING:
@@ -270,28 +298,42 @@ async def run_voice_service() -> None:
                 if len(room.pre_wake_frames) > 6:
                     room.pre_wake_frames.pop(0)
 
-                # Cooldown check
                 now = time.monotonic()
+
+                # Cooldown check
                 if now - room.last_wake_time < wake_cooldown:
                     continue
 
                 # Wake word detection
-                pred = room.oww_model.predict(frame_np)
-                for model_name, score in pred.items():
-                    if score >= wake_threshold:
-                        room.state = RoomState.CAPTURING
-                        room.last_wake_time = now
-                        room.command_start_time = now
-                        room.last_speech_time = now
-                        room.wake_detections += 1
-                        room.command_buffer = bytearray()
-                        for pf in room.pre_wake_frames:
-                            room.command_buffer.extend(pf)
-                        room.pre_wake_frames.clear()
-                        log.info("wake_detected", room=room.friendly_name,
-                                 model=model_name, score=round(score, 3))
-                        _set_led(room.room_id, "capturing")
-                        break
+                detected = False
+                if room.porcupine is not None:
+                    result = room.porcupine.process(frame_np.tolist())
+                    if result >= 0:
+                        detected = True
+                        log.info("wake_detected", room=room.friendly_name, engine="porcupine")
+                elif room.oww_model is not None:
+                    if now - room.last_model_reset > 900:
+                        room.oww_model.reset()
+                        room.last_model_reset = now
+                    pred = room.oww_model.predict(frame_np)
+                    for model_name, score in pred.items():
+                        if score >= wake_threshold:
+                            detected = True
+                            log.info("wake_detected", room=room.friendly_name,
+                                     engine="openwakeword", score=round(score, 3))
+                            break
+
+                if detected:
+                    room.state = RoomState.CAPTURING
+                    room.last_wake_time = now
+                    room.command_start_time = now
+                    room.last_speech_time = now
+                    room.wake_detections += 1
+                    room.command_buffer = bytearray()
+                    for pf in room.pre_wake_frames:
+                        room.command_buffer.extend(pf)
+                    room.pre_wake_frames.clear()
+                    _set_led(room.room_id, "capturing")
 
             elif room.state == RoomState.CAPTURING:
                 room.command_buffer.extend(frame_bytes)
@@ -330,10 +372,17 @@ async def run_voice_service() -> None:
             for room in rooms.values():
                 if room.state in (RoomState.PROCESSING, RoomState.DEAF):
                     continue
-                if len(room.raw_buffer) >= OWW_FRAME_BYTES:
+                if len(room.raw_buffer) >= WW_FRAME_BYTES:
                     result = _process_room_audio(room)
                     if result is not None:
                         room.state = RoomState.PROCESSING
+                        # Play acknowledgment immediately
+                        speakers = settings.voice_room_speakers_parsed.get(room.room_id)
+                        if speakers:
+                            from home_agent.bus.envelope import make_event as _mke
+                            ack_evt = _mke(source="voice-service", typ="announce.request",
+                                data={"text": "One moment.", "offline_audio_key": "voice_ack", "targets": speakers})
+                            mqttc.publish_json("%s/announce/request" % settings.mqtt.base_topic, ack_evt)
                         asyncio.create_task(_process_command(room, result))
                     processed_any = True
             if not processed_any:
@@ -428,7 +477,7 @@ async def run_voice_service() -> None:
 
     try:
         log.info("voice_service_ready", rooms=list(room_configs.keys()), udp_port=udp_port,
-                 wake_model=wake_model_path, wake_threshold=wake_threshold,
+                 wake_engine=wake_engine, wake_threshold=wake_threshold,
                  stt_provider=settings.voice_stt_provider)
         await asyncio.Event().wait()
     finally:

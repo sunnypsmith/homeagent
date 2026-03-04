@@ -119,6 +119,41 @@ _CSS_VARS = """
 """
 
 
+
+def _get_system_stats() -> Dict[str, Any]:
+    import os
+    try:
+        load1, load5, load15 = os.getloadavg()
+        cpus = os.cpu_count() or 1
+        with open('/proc/meminfo') as f:
+            mem = {}
+            for line in f:
+                parts = line.split()
+                if parts[0].rstrip(':') in ('MemTotal', 'MemAvailable'):
+                    mem[parts[0].rstrip(':')] = int(parts[1])
+        mem_total = mem.get('MemTotal', 0) / 1024 / 1024
+        mem_avail = mem.get('MemAvailable', 0) / 1024 / 1024
+        mem_used = mem_total - mem_avail
+        st = os.statvfs('/')
+        disk_total = st.f_blocks * st.f_frsize / 1024 / 1024 / 1024
+        disk_free = st.f_bavail * st.f_frsize / 1024 / 1024 / 1024
+        disk_used = disk_total - disk_free
+        return {
+            "cpu_cores": cpus,
+            "load_1m": round(load1, 2),
+            "load_5m": round(load5, 2),
+            "load_15m": round(load15, 2),
+            "mem_used_gb": round(mem_used, 1),
+            "mem_total_gb": round(mem_total, 1),
+            "mem_pct": round(100 * mem_used / max(1, mem_total)),
+            "disk_used_gb": round(disk_used, 1),
+            "disk_total_gb": round(disk_total, 1),
+            "disk_pct": round(100 * disk_used / max(1, disk_total)),
+        }
+    except Exception:
+        return {}
+
+
 def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[str]) -> str:
     cards = []
     cards.append(
@@ -277,6 +312,7 @@ def _status_html(*, title: str) -> str:
 <div class="w">
   <header><h1>System Status</h1><div class="nav"><span class="pulse" id="pulse"></span><a href="/">&#x2190; Controls</a></div></header>
   <div class="bar" id="bar">Connecting...</div>
+  <div class="bar" id="sys" style="margin-bottom:8px">System loading...</div>
   <div class="st">Services</div>
   <div class="grid" id="grid"></div>
   <div class="cols">
@@ -320,6 +356,16 @@ async function refresh(){{
       +`sources: <span>${{srcs.length}}</span> \u00b7 `
       +`updated: <span>${{ts(d.ts)}}</span>`;
     $('bar').innerHTML=bh;
+
+    const sys=d.system||{{}};
+    if(sys.cpu_cores){{
+      const loadColor=sys.load_1m>sys.cpu_cores*0.8?'r':sys.load_1m>sys.cpu_cores*0.5?'y':'g';
+      const memColor=sys.mem_pct>85?'r':sys.mem_pct>70?'y':'g';
+      const diskColor=sys.disk_pct>90?'r':sys.disk_pct>80?'y':'g';
+      $('sys').innerHTML=`CPU: <span class="${{loadColor}}">${{sys.load_1m}}</span>/${{sys.cpu_cores}} cores `
+        +`\u00b7 RAM: <span class="${{memColor}}">${{sys.mem_used_gb}}G</span>/${{sys.mem_total_gb}}G (${{sys.mem_pct}}%) `
+        +`\u00b7 Disk: <span class="${{diskColor}}">${{sys.disk_used_gb}}G</span>/${{sys.disk_total_gb}}G (${{sys.disk_pct}}%)`;
+    }}
 
     const wk=Object.keys(w).sort();
     let gh='';
@@ -638,6 +684,7 @@ async def run_ui_gateway() -> None:
             },
             "voice_rooms": dict(_voice_rooms),
             "voice_commands": list(_voice_commands),
+            "system": _get_system_stats(),
             "ts": datetime.now(timezone.utc).isoformat(),
         }
 

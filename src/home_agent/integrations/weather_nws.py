@@ -69,22 +69,31 @@ class NWSClient:
     def _set_cached(self, key: str, data: Any) -> None:
         self._cache[key] = {"data": data, "ts": time.monotonic()}
 
+    async def _fetch_json(self, url: str) -> dict:
+        """Fetch JSON with one retry on timeout/network error."""
+        import asyncio
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout, headers=_HEADERS) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    return resp.json()
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt == 0:
+                    await asyncio.sleep(2.0)
+                    continue
+                raise
+
     async def _ensure_grid(self) -> None:
         if self._forecast_url and self._station_url:
             return
         url = "%s/points/%s,%s" % (_BASE, self._lat, self._lon)
-        async with httpx.AsyncClient(timeout=self._timeout, headers=_HEADERS) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            props = resp.json().get("properties", {})
+        props = (await self._fetch_json(url)).get("properties", {})
         self._forecast_url = props.get("forecast")
         self._forecast_hourly_url = props.get("forecastHourly")
         station_url = props.get("observationStations")
         if station_url:
-            async with httpx.AsyncClient(timeout=self._timeout, headers=_HEADERS) as client:
-                resp = await client.get(station_url)
-                resp.raise_for_status()
-                stations = resp.json().get("features", [])
+            stations = (await self._fetch_json(station_url)).get("features", [])
             if stations:
                 self._station_url = stations[0].get("id")
 
@@ -98,10 +107,7 @@ class NWSClient:
             raise RuntimeError("No NWS observation station found")
 
         url = "%s/observations/latest" % self._station_url
-        async with httpx.AsyncClient(timeout=self._timeout, headers=_HEADERS) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            props = resp.json().get("properties", {})
+        props = (await self._fetch_json(url)).get("properties", {})
 
         temp_c = _val(props, "temperature")
         wind_ms = _val(props, "windSpeed")
@@ -139,10 +145,7 @@ class NWSClient:
         if not self._forecast_url:
             raise RuntimeError("No NWS forecast URL found")
 
-        async with httpx.AsyncClient(timeout=self._timeout, headers=_HEADERS) as client:
-            resp = await client.get(self._forecast_url)
-            resp.raise_for_status()
-            props = resp.json().get("properties", {})
+        props = (await self._fetch_json(self._forecast_url)).get("properties", {})
 
         periods = props.get("periods", [])
         day_period = None

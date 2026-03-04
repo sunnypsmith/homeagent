@@ -419,7 +419,9 @@ async def run_exec_briefing_agent() -> None:
                 "- Keep event titles verbatim.\n"
                 "- If there are zero events, say the calendar is clear today.\n"
                 '- End with exactly: "Mind how you go."\n'
-                "- Do not use bullet characters.\n\n"
+                "- Do not use bullet characters.\n"
+                "- Format ALL output for spoken audio: spell out numbers, times, dates, currency, and percentages as words.\n"
+                "- No URLs, markdown, or special characters.\n\n"
                 f"Forecast sentence (use verbatim, or omit if blank):\n{weather_sentence}\n\n"
                 f"Financial snapshot sentence (use verbatim, or omit if blank):\n{finance_sentence}\n\n"
                 f"Dashboard sentence (use verbatim, or omit if blank):\n{dashboard_sentence}\n\n"
