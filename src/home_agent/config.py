@@ -928,8 +928,9 @@ class CameraLightingSettings(BaseSettings):
     caseta_device_id: str = Field(default="10", alias="CAMERA_LIGHTING_CASETA_DEVICE_ID")
     duration_seconds: int = Field(default=600, alias="CAMERA_LIGHTING_DURATION_SECONDS")
     min_retrigger_seconds: int = Field(default=30, alias="CAMERA_LIGHTING_MIN_RETRIGGER_SECONDS")
+    rules: str = Field(default="", alias="CAMERA_LIGHTING_RULES")
 
-    @field_validator("camera_name", "detected_obj", "caseta_device_id", mode="before")
+    @field_validator("camera_name", "detected_obj", "caseta_device_id", "rules", mode="before")
     @classmethod
     def _norm_str(cls, v: object) -> str:
         return _strip_quotes(str(v)).strip()

@@ -193,14 +193,39 @@ async def run_camera_lighting_agent() -> None:
     mqttc.subscribe(sub_topic)
     log.info("subscribed", topic=sub_topic)
 
-    target_cam_raw = (settings.camera_lighting.camera_name or "").strip()
-    target_cams = _parse_camera_name_list(target_cam_raw)
-    target_obj_raw = (settings.camera_lighting.detected_obj or "").strip()
-    target_objs = _expand_detected_obj_tokens(_parse_token_list(target_obj_raw))
-    device_ids = _parse_device_id_list(settings.camera_lighting.caseta_device_id or "")
-    if not device_ids:
-        log.error("missing_config", key="CAMERA_LIGHTING_CASETA_DEVICE_ID")
+    # Parse rules: each rule maps cameras -> device(s) with detection filters
+    # Format: "cam1,cam2:device_id:obj1,obj2;cam3:device_id:obj3"
+    rules_raw = (settings.camera_lighting.rules or "").strip()
+    rules = []
+    if rules_raw:
+        for rule_str in rules_raw.split(";"):
+            rule_str = rule_str.strip()
+            if not rule_str:
+                continue
+            parts = rule_str.split(":")
+            if len(parts) >= 2:
+                cams = _parse_camera_name_list(parts[0])
+                devs = _parse_device_id_list(parts[1])
+                objs = _expand_detected_obj_tokens(_parse_token_list(parts[2])) if len(parts) > 2 else set()
+                if cams and devs:
+                    rules.append({"cameras": cams, "devices": devs, "objects": objs})
+                    log.info("rule_loaded", cameras=cams, devices=devs, objects=len(objs))
+    # Fallback to legacy single-rule config if no rules defined
+    if not rules:
+        target_cam_raw = (settings.camera_lighting.camera_name or "").strip()
+        target_cams = _parse_camera_name_list(target_cam_raw)
+        target_obj_raw = (settings.camera_lighting.detected_obj or "").strip()
+        target_objs = _expand_detected_obj_tokens(_parse_token_list(target_obj_raw))
+        device_ids = _parse_device_id_list(settings.camera_lighting.caseta_device_id or "")
+        if device_ids:
+            rules.append({"cameras": target_cams, "devices": device_ids, "objects": target_objs})
+    if not rules:
+        log.error("no_rules_configured")
         return
+    all_device_ids = set()
+    for r in rules:
+        all_device_ids.update(r["devices"])
+    log.info("rules_ready", count=len(rules), devices=sorted(all_device_ids))
     duration = max(1, int(settings.camera_lighting.duration_seconds))
     min_retrigger = max(0, int(settings.camera_lighting.min_retrigger_seconds))
 
@@ -234,9 +259,9 @@ async def run_camera_lighting_agent() -> None:
         finally:
             timers.pop(device_id, None)
 
-    def trigger_lights(*, reason: str) -> None:
+    def trigger_lights(*, reason: str, trigger_device_ids: list) -> None:
         now_mono = time.monotonic()
-        for device_id in device_ids:
+        for device_id in trigger_device_ids:
             t = timers.get(device_id)
 
             # Extend timer: cancel existing off task.
@@ -285,21 +310,28 @@ async def run_camera_lighting_agent() -> None:
                 continue
 
             cam_name = str(data.get("camera_name") or "").strip()
-            if target_cams and cam_name.lower() not in target_cams:
-                continue
-
             evt_obj = ""
             evt_payload = data.get("event")
             if isinstance(evt_payload, dict):
                 evt_obj = _normalize_detected_obj(evt_payload.get("detected_obj"))
-            if target_objs and evt_obj not in target_objs:
+
+            # Check which rules match this event
+            matched_devices = []
+            for rule in rules:
+                if rule["cameras"] and cam_name.lower() not in rule["cameras"]:
+                    continue
+                if rule["objects"] and evt_obj not in rule["objects"]:
+                    continue
+                matched_devices.extend(rule["devices"])
+
+            if not matched_devices:
                 continue
 
             if not is_dark_now():
                 log.info("ignored", reason="not_dark", camera=cam_name, detected_obj=evt_obj)
                 continue
 
-            trigger_lights(reason=f"{cam_name}:{evt_obj or 'event'}")
+            trigger_lights(reason=f"{cam_name}:{evt_obj or 'event'}", trigger_device_ids=matched_devices)
     finally:
         await mqttc.close()
 
