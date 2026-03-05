@@ -22,3 +22,6 @@ build/
 
 # ESPHome firmware (contains secrets, build artifacts)
 esphome/
+
+# Wake word models (binary, device-specific)
+models/
