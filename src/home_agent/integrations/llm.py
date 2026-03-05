@@ -133,12 +133,14 @@ class LLMClient:
 
         tool_calls = msg.get("tool_calls")
         if tool_calls and len(tool_calls) > 0:
-            tc = tool_calls[0]
             import json as _json
-            args = tc["function"].get("arguments", "{}")
-            if isinstance(args, str):
-                args = _json.loads(args)
-            return LLMToolCall(name=tc["function"]["name"], arguments=args)
+            results = []
+            for tc in tool_calls:
+                args = tc["function"].get("arguments", "{}")
+                if isinstance(args, str):
+                    args = _json.loads(args)
+                results.append(LLMToolCall(name=tc["function"]["name"], arguments=args))
+            return results if len(results) > 1 else results[0]
 
         return LLMTextResponse(text=(msg.get("content") or "").strip())
 

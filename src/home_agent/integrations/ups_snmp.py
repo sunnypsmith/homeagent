@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-try:  # Optional dependency
-    from pysnmp.hlapi.v1arch.asyncio import (  # type: ignore
+try:
+    from pysnmp.hlapi.v1arch.asyncio import (
         CommunityData,
         ObjectIdentity,
         ObjectType,
@@ -15,7 +15,7 @@ try:  # Optional dependency
     )
 
     _HAS_PYSNMP = True
-except Exception:  # pragma: no cover - import guarded at runtime
+except Exception:
     _HAS_PYSNMP = False
 
 
@@ -62,6 +62,7 @@ class UpsSnmpClient:
         error_indication, error_status, error_index, var_binds = await get_cmd(
             self._dispatcher,
             CommunityData(self._community, mpModel=mp_model),
+            target,
             *[ObjectType(ObjectIdentity(oid)) for oid in oids],
         )
         if error_indication:

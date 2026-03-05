@@ -28,6 +28,8 @@ _topic_events: collections.deque = collections.deque(maxlen=_TOPIC_WINDOW)
 _db_activity: Dict[str, Any] = {}
 _voice_rooms: Dict[str, Dict[str, Any]] = {}
 _voice_commands: collections.deque = collections.deque(maxlen=20)
+_voice_responses: collections.deque = collections.deque(maxlen=20)
+_chat_history: collections.deque = collections.deque(maxlen=50)
 
 
 def _update_source(source: str, typ: str, topic: str) -> None:
@@ -242,7 +244,7 @@ def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[
   <div class="w">
     <header>
       <h1>{title}</h1>
-      <div class="nav"><a href="/status">System Status &#x2192;</a></div>
+      <div class="nav"><a href="/chat">Chat</a> &middot; <a href="/status">Status</a></div>
     </header>
     <div class="grid">
       {cards_html}
@@ -253,6 +255,95 @@ def _html_page(*, title: str, actions: list[dict[str, object]], toast: Optional[
 </body>
 </html>
 """
+
+
+def _chat_html(*, title: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0a0e1a"/>
+<title>{title} — Chat</title>
+<style>
+{_CSS_VARS}
+.w{{max-width:700px;margin:0 auto;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(80px + env(safe-area-inset-bottom));display:flex;flex-direction:column;min-height:100vh}}
+header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-shrink:0}}
+h1{{font-size:17px;font-weight:700}}
+.nav a{{color:var(--blue);font-size:12px;text-decoration:none}}
+.chat{{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding-bottom:8px}}
+.msg{{max-width:85%;padding:10px 14px;border-radius:14px;font-size:14px;line-height:1.5;word-wrap:break-word}}
+.msg.user{{align-self:flex-end;background:var(--blue);color:#fff;border-bottom-right-radius:4px}}
+.msg.assistant{{align-self:flex-start;background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px}}
+.msg .meta{{font-size:10px;color:var(--dim);margin-top:4px}}
+.input-bar{{position:fixed;bottom:0;left:0;right:0;padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom));background:var(--bg);border-top:1px solid var(--border);display:flex;gap:8px}}
+.input-bar input{{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 14px;color:var(--text);font-size:15px;outline:none}}
+.input-bar input:focus{{border-color:var(--blue)}}
+.input-bar button{{background:var(--blue);color:#fff;border:none;border-radius:10px;padding:10px 18px;font-size:15px;font-weight:600;cursor:pointer}}
+.empty{{color:var(--dim);text-align:center;margin-top:40px;font-size:14px}}
+</style>
+</head>
+<body>
+<div class="w">
+<header><h1>Higgins Chat</h1><div class="nav"><a href="/">Controls</a> &middot; <a href="/status">Status</a></div></header>
+<div class="chat" id="chat"><div class="empty">Say something to Higgins...</div></div>
+</div>
+<div class="input-bar">
+<input type="text" id="input" placeholder="Type a command or question..." autocomplete="off"/>
+<button id="send">Send</button>
+</div>
+<script>
+(function(){{
+const chat=document.getElementById('chat');
+const input=document.getElementById('input');
+const send=document.getElementById('send');
+let lastLen=0;
+
+function ts(t){{if(!t)return'';try{{return new Date(t).toLocaleTimeString([],{{hour:'2-digit',minute:'2-digit'}})}}catch(e){{return''}}}}
+function esc(s){{const d=document.createElement('div');d.textContent=s;return d.innerHTML}}
+
+async function sendMsg(){{
+  const text=input.value.trim();
+  if(!text)return;
+  input.value='';
+  // Add user message immediately
+  chat.innerHTML+=`<div class="msg user">${{esc(text)}}</div>`;
+  chat.scrollTop=chat.scrollHeight;
+  try{{
+    await fetch('/api/chat',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{text:text}})}});
+  }}catch(e){{}}
+}}
+
+async function poll(){{
+  try{{
+    const r=await fetch('/api/health');
+    const d=await r.json();
+    const hist=d.chat_history||[];
+    if(hist.length!==lastLen){{
+      lastLen=hist.length;
+      const reversed=[...hist].reverse();
+      let h='';
+      for(const m of reversed){{
+        if(m.role==='user'){{
+          h+=`<div class="msg user">${{esc(m.text)}}${{m.room?`<div class="meta">${{esc(m.room)}} ${{ts(m.ts)}}</div>`:``}}</div>`;
+        }}else{{
+          h+=`<div class="msg assistant">${{esc(m.text)}}<div class="meta">${{ts(m.ts)}}</div></div>`;
+        }}
+      }}
+      chat.innerHTML=h||'<div class="empty">Say something to Higgins...</div>';
+      chat.scrollTop=chat.scrollHeight;
+    }}
+  }}catch(e){{}}
+}}
+
+send.addEventListener('click',sendMsg);
+input.addEventListener('keydown',e=>{{if(e.key==='Enter')sendMsg()}});
+poll();setInterval(poll,2000);
+input.focus();
+}})();
+</script>
+</body>
+</html>"""
 
 
 def _status_html(*, title: str) -> str:
@@ -314,7 +405,7 @@ summary:hover{{color:var(--text)}}
 <div class="w">
 <header>
 <h1><span class="pulse" id="pulse"></span>System Status</h1>
-<div class="nav"><a href="/">&#x2190; Controls</a></div>
+<div class="nav"><a href="/chat">Chat</a> &middot; <a href="/">Controls</a></div>
 </header>
 <div class="vitals" id="vitals">Loading...</div>
 
@@ -578,11 +669,29 @@ async def run_ui_gateway() -> None:
                             "ts": payload.get("ts", ""),
                         }
                 elif typ == "voice.command":
+                    _chat_history.appendleft({
+                        "role": "user",
+                        "text": data.get("text", ""),
+                        "room": data.get("room_name", ""),
+                        "ts": payload.get("ts", ""),
+                    })
                     _voice_commands.appendleft({
                         "ts": payload.get("ts", ""),
                         "room_id": data.get("room_id", ""),
                         "room_name": data.get("room_name", ""),
                         "text": data.get("text", ""),
+                    })
+                elif typ == "voice.response":
+                    _voice_responses.appendleft({
+                        "ts": payload.get("ts", ""),
+                        "room_id": data.get("room_id", ""),
+                        "room_name": data.get("room_name", ""),
+                        "text": data.get("text", ""),
+                    })
+                    _chat_history.appendleft({
+                        "role": "assistant",
+                        "text": data.get("text", ""),
+                        "ts": payload.get("ts", ""),
                     })
                 elif typ == "watchdog.health":
                     _latest_health.clear()
@@ -691,6 +800,7 @@ async def run_ui_gateway() -> None:
             },
             "voice_rooms": dict(_voice_rooms),
             "voice_commands": list(_voice_commands),
+            "chat_history": list(_chat_history),
             "system": _get_system_stats(),
             "ts": datetime.now(timezone.utc).isoformat(),
         }
@@ -698,6 +808,20 @@ async def run_ui_gateway() -> None:
     @app.get("/status", response_class=HTMLResponse)
     async def status_page() -> str:
         return _status_html(title=settings.ui.title)
+
+    @app.get("/chat", response_class=HTMLResponse)
+    async def chat_page() -> str:
+        return _chat_html(title=settings.ui.title)
+
+    @app.post("/api/chat")
+    async def api_chat_send(request_data: Dict[str, Any]) -> Dict[str, str]:
+        text = str(request_data.get("text", "")).strip()
+        if not text:
+            return {"status": "error", "message": "Empty text"}
+        evt = make_event(source="web-chat", typ="voice.command",
+            data={"room_id": "web", "room_name": "Web Chat", "text": text})
+        mqttc.publish_json("%s/voice/command" % settings.mqtt.base_topic, evt)
+        return {"status": "ok"}
 
     @app.post("/tone-test")
     async def tone_test() -> RedirectResponse:

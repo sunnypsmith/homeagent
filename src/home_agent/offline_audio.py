@@ -50,6 +50,16 @@ OFFLINE_AUDIO_ITEMS: List[OfflineAudioItem] = [
         "text": "Working on it.",
     },
     {
+        "key": "voice_reasoning",
+        "filename": "voice_reasoning.wav",
+        "text": "Let me think about that.",
+    },
+    {
+        "key": "voice_cancelled",
+        "filename": "voice_cancelled.wav",
+        "text": "Never mind. Cancelled.",
+    },
+    {
         "key": "voice_error",
         "filename": "voice_error.wav",
         "text": "I'm sorry, I had trouble with that request.",

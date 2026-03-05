@@ -1,14 +1,17 @@
-"""Voice intent agent — receives transcribed voice commands and executes them.
+"""Voice intent agent v2 — adaptive reasoning with confirmation.
 
-Subscribes to voice.command from the voice service, uses LLM with tool calling
-to classify commands vs questions, dispatches actions via MQTT, and speaks
-responses through the appropriate Sonos speaker.
+Receives voice.command from the voice service, uses registry-based tools
+with two-tier LLM (Groq for fast dispatch, Claude for reasoning),
+per-room conversation history, confirmation flow for custom actions,
+and learned actions store.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -19,213 +22,117 @@ from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 from home_agent.integrations.llm import LLMClient, LLMToolCall, LLMTextResponse
 from home_agent.integrations.llm_router import LLMRouter
+from home_agent.integrations.learned_actions import LearnedActionsStore
+from home_agent.services.voice_system_context import SystemContext
+from home_agent.services.voice_registrations import (
+    register_all, update_caseta_devices, update_caseta_scenes, update_watchdog_health,
+)
 
-SYSTEM_PROMPT = """You are Higgins, a helpful home assistant. You manage a smart home.
 
-When the user gives a COMMAND (e.g., "turn off the lights", "mute announcements", "call the kids to dinner"), use the appropriate tool to execute it.
+# ------------------------------------------------------------------
+# System prompt
+# ------------------------------------------------------------------
 
-When the user asks a QUESTION (e.g., "what time is it?", "what's the weather?"), answer conversationally in 1-3 short sentences. Format your answer for spoken audio: spell out numbers, avoid abbreviations, no URLs, no markdown.
+_BASE_SYSTEM_PROMPT = """You are Higgins, a helpful home assistant for the Smith family. You manage a smart home.
 
-After executing a command, do NOT respond with text. The system will generate a spoken confirmation automatically.
+RULES:
+- When the user gives a COMMAND, use the appropriate tool. Do NOT respond with text after a tool call.
+- When the user asks a QUESTION, use query_system if relevant data is available, otherwise answer conversationally.
+- For actions not covered by existing tools, use custom_action and construct the MQTT topic/payload.
 
-The user message is prefixed with [Room: name] indicating which room they are in. Use this for context — e.g., "turn off the lights" from the office means office lights.
+The user message is prefixed with [Room: name] indicating which room they are in.
 
 Format ALL output for spoken text-to-speech audio:
-- Spell out ALL numbers: '3' becomes 'three', '42' becomes 'forty two', '2026' becomes 'twenty twenty six'.
+- Spell out ALL numbers: '3' becomes 'three', '42' becomes 'forty two'.
 - Spell out times: '2:45 PM' becomes 'two forty five P M'.
 - Spell out dates: 'March 3rd' not 'March 3'.
-- Spell out currency: '$1,500' becomes 'fifteen hundred dollars', '$42.50' becomes 'forty two dollars and fifty cents'.
+- Spell out currency: '$1,500' becomes 'fifteen hundred dollars'.
 - Spell out percentages: '22%' becomes 'twenty two percent'.
-- Spell out abbreviations: 'Dr.' becomes 'Doctor', 'St.' becomes 'Street', 'Ave' becomes 'Avenue'.
 - No URLs, no markdown, no bullet points, no special characters.
-- Use short, natural sentences suitable for listening.
+- Use short, natural sentences.
 
 Be concise. You are speaking out loud to a person in their home."""
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "announce",
-            "description": "Make a spoken announcement on Sonos speakers. Use this when the user wants to broadcast a message to the household.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "The text to announce"},
-                    "targets": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional speaker aliases to target (e.g. ['kitchen_dining', 'office']). Omit for all speakers.",
-                    },
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "mute_announcements",
-            "description": "Temporarily mute all Sonos announcements for a number of minutes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "minutes": {"type": "integer", "description": "How many minutes to mute for"},
-                },
-                "required": ["minutes"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "unmute_announcements",
-            "description": "Unmute Sonos announcements (cancel any active mute).",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lights_on",
-            "description": "Turn on a light by device ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "device_id": {"type": "integer", "description": "Caseta device ID"},
-                },
-                "required": ["device_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lights_off",
-            "description": "Turn off a light by device ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "device_id": {"type": "integer", "description": "Caseta device ID"},
-                },
-                "required": ["device_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lights_level",
-            "description": "Set a light to a specific brightness level.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "device_id": {"type": "integer", "description": "Caseta device ID"},
-                    "level": {"type": "integer", "description": "Brightness 0-100"},
-                },
-                "required": ["device_id", "level"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "activate_scene",
-            "description": "Activate a Caseta lighting scene. Available scenes: Bedtime, Daytime, Sleep, Nighttime.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scene_name": {"type": "string", "description": "Scene name"},
-                },
-                "required": ["scene_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "trigger_briefing",
-            "description": "Trigger a briefing: 'morning' for the morning briefing, 'executive' for the executive briefing, 'chime' for the hourly time/weather chime.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "briefing_type": {
-                        "type": "string",
-                        "enum": ["morning", "executive", "chime"],
-                        "description": "Type of briefing to trigger",
-                    },
-                },
-                "required": ["briefing_type"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_time_and_weather",
-            "description": "Get the current time and outdoor temperature. Use this when the user asks what time it is, what the temperature is, or asks about current weather conditions.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_forecast",
-            "description": "Get the weather forecast for today or tomorrow. Use this when the user asks about the forecast, tomorrow's weather, or upcoming weather conditions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "day": {
-                        "type": "string",
-                        "enum": ["today", "tomorrow"],
-                        "description": "Which day to get the forecast for",
-                    },
-                },
-                "required": ["day"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "household_command",
-            "description": "Common household announcements: 'dinner' (call to dinner), 'bedtime' (kids bedtime), 'trash' (take out trash), 'dogs_out' (let dogs out), 'dogs_in' (let dogs in), 'answer_door' (answer the door), 'kids_upstairs' (kids come upstairs), 'kids_kitchen' (kids come to kitchen).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "enum": ["dinner", "bedtime", "trash", "dogs_out", "dogs_in", "answer_door", "kids_upstairs", "kids_kitchen"],
-                    },
-                },
-                "required": ["command"],
-            },
-        },
-    },
-]
 
-_HOUSEHOLD_TEXTS = {
-    "dinner": "Your attention please. Dinner is ready. Please come to the dining room now.",
-    "bedtime": "Your attention please. Bedtime is now. Please start getting ready now.",
-    "trash": "Your attention please. Please take out the trash now.",
-    "dogs_out": "Your attention please. Please let the dogs out now.",
-    "dogs_in": "Your attention please. Please let the dogs in now.",
-    "answer_door": "Your attention please. Please answer the door now.",
-    "kids_upstairs": "Your attention please. Kids, please come upstairs now.",
-    "kids_kitchen": "Your attention please. Kids, please come to the kitchen now.",
+# ------------------------------------------------------------------
+# Data structures
+# ------------------------------------------------------------------
+
+@dataclass
+class PendingAction:
+    description: str
+    mqtt_topic: str
+    mqtt_payload: Dict[str, Any]
+    original_text: str
+    created_at: float
+    room_id: str
+    room_name: str
+    timeout_seconds: float = 60.0
+
+    @property
+    def is_expired(self) -> bool:
+        return (time.monotonic() - self.created_at) > self.timeout_seconds
+
+
+@dataclass
+class RoomConversation:
+    messages: List[Dict[str, str]] = field(default_factory=list)
+    last_activity: float = 0.0
+
+    def add_user(self, text: str) -> None:
+        self.messages.append({"role": "user", "content": text})
+        self.last_activity = time.monotonic()
+        self._trim()
+
+    def add_assistant(self, text: str) -> None:
+        self.messages.append({"role": "assistant", "content": text})
+        self.last_activity = time.monotonic()
+        self._trim()
+
+    def _trim(self, max_messages: int = 40) -> None:
+        if len(self.messages) > max_messages:
+            self.messages = self.messages[-max_messages:]
+
+    def is_stale(self, max_age_seconds: float = 1800) -> bool:
+        return self.last_activity > 0 and (time.monotonic() - self.last_activity) > max_age_seconds
+
+    def get_messages(self) -> List[Dict[str, str]]:
+        return list(self.messages)
+
+    def clear(self) -> None:
+        self.messages.clear()
+        self.last_activity = 0.0
+
+
+# ------------------------------------------------------------------
+# Custom action tool (hard-coded intentionally — the escape hatch)
+# ------------------------------------------------------------------
+
+_CUSTOM_ACTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "custom_action",
+        "description": (
+            "For actions not covered by other tools. The system will describe your plan "
+            "and ask the user for confirmation before executing. Use the MQTT architecture "
+            "knowledge from the system context to construct the correct topic and payload."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "Human-readable description of the action"},
+                "mqtt_topic": {"type": "string", "description": "Full MQTT topic to publish to"},
+                "mqtt_payload": {"type": "object", "description": "Event data payload"},
+            },
+            "required": ["description", "mqtt_topic", "mqtt_payload"],
+        },
+    },
 }
 
-_HOUSEHOLD_CONFIRMATIONS = {
-    "dinner": "Done. I've called everyone to dinner.",
-    "bedtime": "Done. I've announced bedtime.",
-    "trash": "Done. I've asked someone to take out the trash.",
-    "dogs_out": "Done. I've asked someone to let the dogs out.",
-    "dogs_in": "Done. I've asked someone to let the dogs in.",
-    "answer_door": "Done. I've asked someone to answer the door.",
-    "kids_upstairs": "Done. I've called the kids upstairs.",
-    "kids_kitchen": "Done. I've called the kids to the kitchen.",
-}
 
+# ------------------------------------------------------------------
+# Main service
+# ------------------------------------------------------------------
 
 async def run_voice_intent_agent() -> None:
     settings = AppSettings()
@@ -246,211 +153,188 @@ async def run_voice_intent_agent() -> None:
 
     base = settings.mqtt.base_topic
     mqttc.subscribe("%s/voice/command" % base)
-    log.info("subscribed", topic="%s/voice/command" % base)
+    mqttc.subscribe("%s/lutron/event" % base)
+    mqttc.subscribe("%s/watchdog/health" % base)
+    log.info("subscribed")
 
-    providers = [
+    # --- LLM setup ---
+    fast_providers = [
         ("primary", LLMClient(
-            base_url=settings.llm.base_url,
-            api_key=settings.llm.api_key,
-            model=settings.llm.model,
-            timeout_seconds=settings.llm.timeout_seconds,
+            base_url=settings.llm.base_url, api_key=settings.llm.api_key,
+            model=settings.llm.model, timeout_seconds=settings.llm.timeout_seconds,
         )),
     ]
     if settings.llm_fallback.enabled:
-        providers.append(
+        fast_providers.append(
             ("fallback", LLMClient(
-                base_url=settings.llm_fallback.base_url,
-                api_key=settings.llm_fallback.api_key,
-                model=settings.llm_fallback.model,
-                timeout_seconds=settings.llm_fallback.timeout_seconds,
+                base_url=settings.llm_fallback.base_url, api_key=settings.llm_fallback.api_key,
+                model=settings.llm_fallback.model, timeout_seconds=settings.llm_fallback.timeout_seconds,
             ))
         )
-    llm = LLMRouter(providers)
-    log.info("llm_providers", count=len(providers), names=[p[0] for p in providers])
+    fast_llm = LLMRouter(fast_providers)
+    log.info("fast_llm", providers=[p[0] for p in fast_providers])
 
+    reasoning_llm = None
+    if settings.voice_reasoning_api_key:
+        from home_agent.integrations.llm_anthropic import AnthropicClient
+        reasoning_llm = AnthropicClient(
+            api_key=settings.voice_reasoning_api_key,
+            model=settings.voice_reasoning_model,
+            timeout_seconds=settings.voice_reasoning_timeout,
+        )
+        log.info("reasoning_llm", model=settings.voice_reasoning_model)
+
+    # --- System context ---
+    ctx = SystemContext()
+    register_all(ctx, settings, mqttc)
+
+    # --- State ---
     room_speakers = settings.voice_room_speakers_parsed
-    log.info("room_speaker_map", map=room_speakers)
+    pending_actions: Dict[str, PendingAction] = {}
+    conversations: Dict[str, RoomConversation] = {}
+    learned = LearnedActionsStore()
+    log.info("ready", queries=len(ctx.query_names), actions=len(ctx.action_names),
+             room_speakers=room_speakers, learned_actions=len(learned.all()))
 
+    # --- Response topic for web chat ---
+    response_topic = "%s/voice/response" % base
+
+    # --- Helpers ---
     def _speakers_for_room(room_id: str) -> Optional[List[str]]:
         return room_speakers.get(room_id)
 
-    def _publish_announce(text: str, targets: Optional[List[str]] = None) -> None:
-        data: Dict[str, Any] = {"text": text}
-        if targets:
-            data["targets"] = targets
-        evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
-        mqttc.publish_json("%s/announce/request" % base, evt)
+    def _get_conversation(room_id: str) -> RoomConversation:
+        if room_id not in conversations:
+            conversations[room_id] = RoomConversation()
+        conv = conversations[room_id]
+        if conv.is_stale():
+            conv.clear()
+        return conv
 
-    def _publish_mute(minutes: int) -> None:
-        muted_until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-        evt = make_event(
-            source="voice-intent-agent",
-            typ="announce.mute",
-            data={"muted_until_unix": int(muted_until.timestamp()), "duration_minutes": minutes},
-        )
-        mqttc.publish_json("%s/announce/mute" % base, evt, retain=True)
+    def _respond(text: str, room_id: str, room_name: str, speakers: Optional[List[str]]) -> None:
+        """Send a response via Sonos and/or MQTT response topic."""
+        # Always publish to response topic (for web chat)
+        evt = make_event(source="voice-intent-agent", typ="voice.response",
+            data={"room_id": room_id, "room_name": room_name, "text": text})
+        mqttc.publish_json(response_topic, evt)
 
-    def _publish_unmute() -> None:
-        evt = make_event(
-            source="voice-intent-agent",
-            typ="announce.mute",
-            data={"muted_until_unix": 0},
-        )
-        mqttc.publish_json("%s/announce/mute" % base, evt, retain=True)
+        # If room has speakers, announce on Sonos
+        if speakers and speakers != ["none"]:
+            data: Dict[str, Any] = {"text": text, "targets": speakers}
+            announce_evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
+            mqttc.publish_json("%s/announce/request" % base, announce_evt)
 
-    def _publish_lutron(action: str, **kwargs) -> None:
-        data: Dict[str, Any] = {"action": action}
-        data.update(kwargs)
-        evt = make_event(source="voice-intent-agent", typ="lutron.command", data=data)
-        mqttc.publish_json("%s/lutron/command" % base, evt)
+    def _respond_ack(key: str, speakers: Optional[List[str]]) -> None:
+        """Play a pre-recorded acknowledgment."""
+        if speakers and speakers != ["none"]:
+            data: Dict[str, Any] = {"text": key, "offline_audio_key": key, "targets": speakers}
+            evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
+            mqttc.publish_json("%s/announce/request" % base, evt)
 
-    def _publish_trigger(topic_suffix: str, event_type: str, **data_kwargs) -> None:
-        evt = make_event(source="voice-intent-agent", typ=event_type, data={"manual": True, **data_kwargs})
-        mqttc.publish_json("%s/%s" % (base, topic_suffix), evt)
-
-    async def _execute_tool(tc: LLMToolCall) -> str:
-        """Execute a tool call and return a confirmation sentence."""
+    async def _execute_tool_call(tc: LLMToolCall, room_id: str, room_name: str) -> Optional[str]:
+        """Execute a tool call. Returns confirmation text or None for special handling."""
         name = tc.name
         args = tc.arguments
         log.info("tool_execute", tool=name, args=args)
 
+        # query_system
+        if name == "query_system":
+            query = args.get("query", "")
+            return await ctx.execute_query(query)
+
+        # announce (special — needs text param)
         if name == "announce":
-            _publish_announce(args["text"], args.get("targets"))
+            text = args.get("text", "")
+            targets = args.get("targets")
+            if text:
+                data: Dict[str, Any] = {"text": text}
+                if targets:
+                    data["targets"] = targets
+                evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
+                mqttc.publish_json("%s/announce/request" % base, evt)
             return "Done. I've made the announcement."
 
-        elif name == "mute_announcements":
+        # mute (special — needs minutes param)
+        if name == "mute_announcements":
             minutes = int(args.get("minutes", 60))
-            _publish_mute(minutes)
-            return "Done. Announcements are muted for %d minutes." % minutes
+            muted_until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            evt = make_event(source="voice-intent-agent", typ="announce.mute",
+                data={"muted_until_unix": int(muted_until.timestamp()), "duration_minutes": minutes})
+            mqttc.publish_json("%s/announce/mute" % base, evt, retain=True)
+            return "Done. Announcements muted for %d minutes." % minutes
 
-        elif name == "unmute_announcements":
-            _publish_unmute()
-            return "Done. Announcements are unmuted."
+        # lighting (special — needs device_id/level params passed through)
+        if name in ("lights_on", "lights_off", "lights_level", "activate_scene"):
+            action_map = {"lights_on": "on", "lights_off": "off", "lights_level": "level", "activate_scene": "scene"}
+            lutron_data: Dict[str, Any] = {"action": action_map[name]}
+            if "device_id" in args:
+                lutron_data["device_id"] = int(args["device_id"])
+            if "level" in args:
+                lutron_data["level"] = int(args["level"])
+            if "scene_name" in args:
+                lutron_data["scene_name"] = str(args["scene_name"])
+            evt = make_event(source="voice-intent-agent", typ="lutron.command", data=lutron_data)
+            mqttc.publish_json("%s/lutron/command" % base, evt)
 
-        elif name == "lights_on":
-            _publish_lutron("on", device_id=int(args["device_id"]))
-            return "Done. I've turned on the light."
+            if name == "activate_scene":
+                return "Done. I've activated the %s scene." % args.get("scene_name", "")
+            return "Done."
 
-        elif name == "lights_off":
-            _publish_lutron("off", device_id=int(args["device_id"]))
-            return "Done. I've turned off the light."
+        # Category compound tools (briefing_command, household_command)
+        if name.endswith("_command"):
+            cmd = args.get("command", "")
+            reg = ctx.find_category_action(name, cmd)
+            if reg:
+                return await ctx.execute_action(cmd)
+            return "I didn't recognize that command."
 
-        elif name == "lights_level":
-            level = int(args["level"])
-            _publish_lutron("level", device_id=int(args["device_id"]), level=level)
-            return "Done. I've set the light to %d percent." % level
-
-        elif name == "activate_scene":
-            scene = str(args["scene_name"])
-            _publish_lutron("scene", scene_name=scene)
-            return "Done. I've activated the %s scene." % scene
-
-        elif name == "trigger_briefing":
-            bt = str(args.get("briefing_type", ""))
-            if bt == "morning":
-                now_local = datetime.now()
-                variant = "weekend" if now_local.weekday() >= 5 else "weekday"
-                _publish_trigger("time/cron/morning_briefing", "time.cron.morning_briefing", variant=variant)
-                return "Done. The morning briefing is on its way."
-            elif bt == "executive":
-                _publish_trigger("time/cron/exec_briefing", "time.cron.exec_briefing")
-                return "Done. The executive briefing is on its way."
-            elif bt == "chime":
-                _publish_trigger("time/cron/hourly_chime", "time.cron.hourly_chime")
-                return "Done. Here comes the time check."
-            return "I didn't recognize that briefing type."
-
-        elif name == "get_time_and_weather":
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            try:
-                from home_agent.integrations.weather import create_weather_client
-                tz = ZoneInfo(settings.timezone)
-                now_local = datetime.now(tz=tz)
-                time_str = now_local.strftime("%I:%M %p").lstrip("0")
-                day_str = now_local.strftime("%A, %B %d").replace(" 0", " ")
-
-                weather_client = create_weather_client(
-                    provider=settings.weather.provider,
-                    latitude=settings.weather.latitude,
-                    longitude=settings.weather.longitude,
-                    units=settings.weather.units,
-                    timeout_seconds=settings.weather.timeout_seconds,
-                )
-                current = await weather_client.current()
-                temp = int(round(current.temperature)) if current.temperature is not None else None
-                if temp is not None:
-                    return "It is %s on %s, and the current temperature is %d degrees." % (time_str, day_str, temp)
-                else:
-                    return "It is %s on %s." % (time_str, day_str)
-            except Exception:
-                from datetime import datetime
-                from zoneinfo import ZoneInfo
-                tz = ZoneInfo(settings.timezone)
-                now_local = datetime.now(tz=tz)
-                time_str = now_local.strftime("%I:%M %p").lstrip("0")
-                return "It is %s." % time_str
-
-        elif name == "get_forecast":
-            from home_agent.integrations.weather import create_weather_client
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            try:
-                day = str(args.get("day", "today"))
-                tz = ZoneInfo(settings.timezone)
-                weather_client = create_weather_client(
-                    provider=settings.weather.provider,
-                    latitude=settings.weather.latitude,
-                    longitude=settings.weather.longitude,
-                    units=settings.weather.units,
-                    timeout_seconds=settings.weather.timeout_seconds,
-                )
-                fc = await weather_client.forecast_today()
-                parts = []
-                if day == "tomorrow":
-                    # NWS forecast includes tonight/tomorrow in the periods
-                    # For now, use today's forecast as approximation
-                    # TODO: add multi-day forecast support to weather client
-                    now_local = datetime.now(tz=tz)
-                    import calendar
-                    tomorrow_name = calendar.day_name[(now_local.weekday() + 1) % 7]
-                    prefix = "The forecast for tomorrow, %s" % tomorrow_name
-                else:
-                    now_local = datetime.now(tz=tz)
-                    prefix = "Today's forecast"
-                if fc.temp_max is not None and fc.temp_min is not None:
-                    parts.append("a high of %d and a low of %d degrees" % (int(round(fc.temp_max)), int(round(fc.temp_min))))
-                if fc.precip_probability_max is not None and fc.precip_probability_max > 0:
-                    parts.append("%d percent chance of precipitation" % int(round(fc.precip_probability_max)))
-                if fc.wind_speed_max is not None:
-                    parts.append("winds up to %d miles per hour" % int(round(fc.wind_speed_max)))
-                current = await weather_client.current()
-                if current.description:
-                    parts.append("currently %s" % current.description.lower())
-                if parts:
-                    return "%s: %s." % (prefix, ", ".join(parts))
-                return "%s is not available right now." % prefix
-            except Exception:
-                return "I was unable to get the forecast right now."
-
-        elif name == "household_command":
-            cmd = str(args.get("command", ""))
-            text = _HOUSEHOLD_TEXTS.get(cmd)
-            if text:
-                _publish_announce(text)
-                return _HOUSEHOLD_CONFIRMATIONS.get(cmd, "Done.")
-            return "I didn't recognize that household command."
+        # Direct action from registry
+        reg = ctx.find_action(name)
+        if reg:
+            return await ctx.execute_action(name)
 
         return "I executed the command."
 
-    # Status loop
+    # --- Background tasks ---
+
+    async def _timeout_loop() -> None:
+        """Cancel expired pending actions."""
+        while True:
+            await asyncio.sleep(10.0)
+            now = time.monotonic()
+            expired = [rid for rid, pa in pending_actions.items() if pa.is_expired]
+            for rid in expired:
+                pa = pending_actions.pop(rid)
+                speakers = _speakers_for_room(rid)
+                _respond_ack("voice_cancelled", speakers)
+                log.info("pending_expired", room=pa.room_name)
+
+    async def _midnight_cleanup() -> None:
+        """Clear all conversation histories at midnight."""
+        while True:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(settings.timezone)
+            now = datetime.now(tz=tz)
+            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            wait_seconds = (tomorrow - now).total_seconds()
+            await asyncio.sleep(wait_seconds)
+            for conv in conversations.values():
+                conv.clear()
+            log.info("midnight_cleanup", rooms=len(conversations))
+
     async def _status_loop() -> None:
         while True:
             await asyncio.sleep(60.0)
-            log.info("status", mqtt_connected=mqttc.is_connected, room_speakers=len(room_speakers))
+            log.info("status", mqtt_connected=mqttc.is_connected,
+                     conversations=len(conversations),
+                     pending=len(pending_actions),
+                     learned=len(learned.all()))
 
+    timeout_task = asyncio.create_task(_timeout_loop())
+    midnight_task = asyncio.create_task(_midnight_cleanup())
     status_task = asyncio.create_task(_status_loop())
 
+    # --- Main loop ---
     try:
         while True:
             msg = await mqttc.next_message()
@@ -460,10 +344,31 @@ async def run_voice_intent_agent() -> None:
                 continue
 
             typ = payload.get("type", "")
+            data = payload.get("data") or {}
+
+            # --- MQTT event routing ---
+
+            # Caseta device discovery
+            if typ == "lutron.devices":
+                devices = data.get("devices", [])
+                update_caseta_devices(ctx, devices)
+                continue
+
+            # Caseta scene discovery
+            if typ == "lutron.scenes":
+                scenes = data.get("scenes", [])
+                update_caseta_scenes(ctx, scenes)
+                continue
+
+            # Watchdog health
+            if typ == "watchdog.health":
+                update_watchdog_health(ctx, data.get("services", {}))
+                continue
+
+            # Voice command
             if typ != "voice.command":
                 continue
 
-            data = payload.get("data") or {}
             text = str(data.get("text") or "").strip()
             room_id = str(data.get("room_id") or "")
             room_name = str(data.get("room_name") or room_id)
@@ -472,42 +377,190 @@ async def run_voice_intent_agent() -> None:
                 continue
 
             speakers = _speakers_for_room(room_id)
-            log.info("voice_command", room=room_name, room_id=room_id, text=text, speakers=speakers)
+            conv = _get_conversation(room_id)
+            log.info("voice_command", room=room_name, text=text, speakers=speakers)
 
             try:
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                # --- Check for pending confirmation ---
+                if room_id in pending_actions:
+                    pa = pending_actions[room_id]
+                    if not pa.is_expired:
+                        # Use fast LLM to interpret confirmation
+                        confirm_result = await fast_llm.chat(
+                            system="The user was asked to confirm an action. They said the following. Reply with exactly CONFIRM if they are agreeing/confirming, CANCEL if they are rejecting/cancelling, or NEW if this is an unrelated new command.",
+                            user=text,
+                            max_tokens=10,
+                            temperature=0.0,
+                        )
+                        interpretation = confirm_result.text.strip().upper()
+                        log.info("confirmation_check", room=room_name, text=text, interpretation=interpretation)
+
+                        if "CONFIRM" in interpretation:
+                            # Execute the pending action
+                            evt = make_event(source="voice-intent-agent", typ=pa.mqtt_payload.get("type", "custom"),
+                                data=pa.mqtt_payload)
+                            mqttc.publish_json(pa.mqtt_topic, evt)
+                            confirmation = "Done. %s" % pa.description
+                            _respond(confirmation, room_id, room_name, speakers)
+                            conv.add_user(pa.original_text)
+                            conv.add_assistant(confirmation)
+                            # Save as learned action
+                            learned.save_action(
+                                phrase=pa.original_text, room_id=room_id,
+                                mqtt_topic=pa.mqtt_topic, mqtt_payload=pa.mqtt_payload,
+                                description=pa.description,
+                            )
+                            log.info("pending_confirmed", room=room_name, description=pa.description)
+                            del pending_actions[room_id]
+                            continue
+
+                        elif "CANCEL" in interpretation:
+                            _respond("Cancelled.", room_id, room_name, speakers)
+                            conv.add_assistant("Cancelled.")
+                            log.info("pending_cancelled", room=room_name)
+                            del pending_actions[room_id]
+                            continue
+
+                        else:
+                            # Treat as new command
+                            del pending_actions[room_id]
+                            log.info("pending_replaced", room=room_name)
+
+                    else:
+                        del pending_actions[room_id]
+
+                # --- Check learned actions ---
+                candidates = learned.find_candidates(room_id)
+                if candidates:
+                    # Use fast LLM to check for match
+                    phrases = "\n".join("%d. %s" % (i+1, c.phrase) for i, c in enumerate(candidates[:10]))
+                    match_result = await fast_llm.chat(
+                        system="The user said something. Check if it matches any of these previously learned commands. Reply with JUST the number (1, 2, etc.) if there's a match, or NONE if no match. Context: home automation voice commands.",
+                        user="User said: \"%s\"\n\nKnown commands:\n%s" % (text, phrases),
+                        max_tokens=10,
+                        temperature=0.0,
+                    )
+                    match_text = match_result.text.strip()
+                    try:
+                        match_idx = int(match_text) - 1
+                        if 0 <= match_idx < len(candidates):
+                            matched = candidates[match_idx]
+                            log.info("learned_match", room=room_name, phrase=matched.phrase)
+                            evt = make_event(source="voice-intent-agent",
+                                typ=matched.mqtt_payload.get("type", "custom"),
+                                data=matched.mqtt_payload)
+                            mqttc.publish_json(matched.mqtt_topic, evt)
+                            confirmation = "Done. %s" % matched.description
+                            _respond(confirmation, room_id, room_name, speakers)
+                            conv.add_user(text)
+                            conv.add_assistant(confirmation)
+                            learned.record_use(matched)
+                            continue
+                    except (ValueError, IndexError):
+                        pass
+
+                # --- Build messages with conversation history ---
+                system_prompt = _BASE_SYSTEM_PROMPT + "\n\n" + ctx.build_prompt_context()
+                messages = conv.get_messages() + [
                     {"role": "user", "content": "[Room: %s] %s" % (room_name, text)},
                 ]
-                result = await llm.chat_with_tools(
-                    messages=messages,
-                    tools=TOOLS,
+
+                # --- Build tools ---
+                tools = ctx.build_all_tools() + [_CUSTOM_ACTION_TOOL]
+
+                # --- Call fast LLM ---
+                result = await fast_llm.chat_with_tools(
+                    messages=[{"role": "system", "content": system_prompt}] + messages,
+                    tools=tools,
                     max_tokens=512,
                     temperature=0.3,
                 )
 
+                # --- Handle result ---
                 if isinstance(result, LLMToolCall):
-                    confirmation = await _execute_tool(result)
-                    log.info("tool_confirmed", tool=result.name, confirmation=confirmation)
-                    _publish_announce(confirmation, speakers)
+                    if result.name == "custom_action":
+                        # Escalate to reasoning LLM if available
+                        description = result.arguments.get("description", "")
+                        mqtt_topic = result.arguments.get("mqtt_topic", "")
+                        mqtt_payload = result.arguments.get("mqtt_payload", {})
+
+                        if reasoning_llm and (not mqtt_topic or not mqtt_payload):
+                            # Fast model couldn't construct the payload — ask Claude
+                            _respond_ack("voice_reasoning", speakers)
+                            reason_result = await reasoning_llm.chat_with_tools(
+                                system=system_prompt + "\n\nConstruct the exact MQTT topic and payload for the user's request. Use custom_action.",
+                                messages=messages,
+                                tools=[_CUSTOM_ACTION_TOOL],
+                                max_tokens=512,
+                                temperature=0.2,
+                            )
+                            if isinstance(reason_result, LLMToolCall) and reason_result.name == "custom_action":
+                                description = reason_result.arguments.get("description", description)
+                                mqtt_topic = reason_result.arguments.get("mqtt_topic", mqtt_topic)
+                                mqtt_payload = reason_result.arguments.get("mqtt_payload", mqtt_payload)
+                            elif isinstance(reason_result, LLMTextResponse):
+                                _respond(reason_result.text, room_id, room_name, speakers)
+                                conv.add_user(text)
+                                conv.add_assistant(reason_result.text)
+                                continue
+
+                        if mqtt_topic and mqtt_payload:
+                            # Store as pending, ask for confirmation
+                            pending_actions[room_id] = PendingAction(
+                                description=description,
+                                mqtt_topic=mqtt_topic,
+                                mqtt_payload=mqtt_payload,
+                                original_text=text,
+                                created_at=time.monotonic(),
+                                room_id=room_id,
+                                room_name=room_name,
+                            )
+                            confirm_text = "I can %s. Shall I go ahead?" % description
+                            _respond(confirm_text, room_id, room_name, speakers)
+                            conv.add_user(text)
+                            conv.add_assistant(confirm_text)
+                            log.info("pending_created", room=room_name, description=description)
+                        else:
+                            _respond("I'm not sure how to do that.", room_id, room_name, speakers)
+                            conv.add_user(text)
+                            conv.add_assistant("I'm not sure how to do that.")
+                    else:
+                        # Known tool — execute immediately
+                        confirmation = await _execute_tool_call(result, room_id, room_name)
+                        if confirmation:
+                            _respond(confirmation, room_id, room_name, speakers)
+                            conv.add_user(text)
+                            conv.add_assistant(confirmation)
 
                 elif isinstance(result, LLMTextResponse):
                     answer = result.text
                     if answer:
-                        log.info("question_answered", room=room_name, answer=answer[:100])
-                        _publish_announce(answer, speakers)
-                    else:
-                        log.warning("empty_llm_response", room=room_name)
+                        _respond(answer, room_id, room_name, speakers)
+                        conv.add_user(text)
+                        conv.add_assistant(answer)
+
+                elif isinstance(result, list):
+                    # Multiple tool calls
+                    responses = []
+                    for tc in result:
+                        if isinstance(tc, LLMToolCall):
+                            r = await _execute_tool_call(tc, room_id, room_name)
+                            if r:
+                                responses.append(r)
+                    if responses:
+                        combined = " ".join(responses)
+                        _respond(combined, room_id, room_name, speakers)
+                        conv.add_user(text)
+                        conv.add_assistant(combined)
 
             except Exception as e:
                 log.exception("intent_processing_failed", room=room_name, text=text)
                 reporter.report_error("intent_processing_failed", e)
-                _publish_announce(
-                    "I'm sorry, I had trouble processing that request.",
-                    speakers,
-                )
+                _respond("I'm sorry, I had trouble processing that request.", room_id, room_name, speakers)
 
     finally:
+        timeout_task.cancel()
+        midnight_task.cancel()
         status_task.cancel()
         await mqttc.close()
 

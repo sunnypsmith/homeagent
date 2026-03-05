@@ -1085,6 +1085,9 @@ class AppSettings(BaseSettings):
     voice_stt_model: str = Field(default="whisper-large-v3", alias="VOICE_STT_MODEL")
     voice_stt_language: str = Field(default="en", alias="VOICE_STT_LANGUAGE")
     voice_room_speakers: str = Field(default="", alias="VOICE_ROOM_SPEAKERS")
+    voice_reasoning_api_key: str = Field(default="", alias="VOICE_REASONING_API_KEY")
+    voice_reasoning_model: str = Field(default="claude-sonnet-4-20250514", alias="VOICE_REASONING_MODEL")
+    voice_reasoning_timeout: float = Field(default=30.0, alias="VOICE_REASONING_TIMEOUT")
 
     @property
     def voice_room_speakers_parsed(self) -> Dict[str, List[str]]:
