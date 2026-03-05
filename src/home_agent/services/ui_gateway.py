@@ -78,7 +78,7 @@ def _fetch_db_activity_cached(settings: Any) -> Dict[str, Any]:
                            (SELECT count(*) FROM events WHERE ingested_at > now() - interval '60 seconds')
                 """)
                 now_utc, last_at, last_60 = cur.fetchone()
-                cur.execute("SELECT ingested_at, topic, source, type FROM events WHERE type NOT IN ('service.heartbeat', 'voice.room_status', 'watchdog.health', 'service.error') ORDER BY ingested_at DESC LIMIT 8")
+                cur.execute("SELECT ingested_at, topic, source, type FROM events WHERE type NOT IN ('service.heartbeat', 'voice.room_status', 'watchdog.health', 'service.error', 'raw') ORDER BY ingested_at DESC LIMIT 8")
                 rows = cur.fetchall()
         finally:
             conn.close()
@@ -259,82 +259,103 @@ def _status_html(*, title: str) -> str:
     return f"""<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-  <meta name="theme-color" content="#0a0e1a"/>
-  <title>{title} &#x2014; Status</title>
-  <style>
-    {_CSS_VARS}
-    .w{{max-width:1100px;margin:0 auto;padding:14px;padding-top:calc(14px + env(safe-area-inset-top));padding-bottom:calc(20px + env(safe-area-inset-bottom))}}
-    header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}}
-    h1{{font-size:17px;font-weight:700}}
-    .nav{{display:flex;gap:10px;align-items:center}}
-    .nav a{{color:var(--blue);font-size:12px;text-decoration:none}}
-    .pulse{{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;animation:p 2s infinite}}
-    @keyframes p{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
-    .bar{{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:10px 14px;margin-bottom:12px;font-size:11px;font-family:var(--mono);color:var(--dim);display:flex;flex-wrap:wrap;gap:6px 18px}}
-    .bar span{{color:var(--text)}}
-    .bar .g{{color:var(--green)}} .bar .y{{color:var(--yellow)}} .bar .r{{color:var(--red)}}
-    .st{{font-size:13px;font-weight:600;margin:14px 0 8px;display:flex;align-items:center;gap:8px}}
-    .badge{{font-size:10px;font-weight:700;font-family:var(--mono);padding:1px 6px;border-radius:7px}}
-    .bg{{background:rgba(52,211,153,.12);color:var(--green)}} .br{{background:rgba(248,113,113,.15);color:var(--red)}}
-    .grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:4px}}
-    @media(min-width:540px){{.grid{{grid-template-columns:repeat(3,1fr)}}}}
-    @media(min-width:800px){{.grid{{grid-template-columns:repeat(4,1fr)}}}}
-    .c{{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;transition:border-color .2s}}
-    .c:hover{{border-color:var(--border2)}}
-    .c .n{{font-size:12px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:5px;white-space:nowrap;overflow:hidden}}
-    .dot{{width:7px;height:7px;border-radius:50%;flex-shrink:0}}
-    .dot.ok{{background:var(--green)}}.dot.error{{background:var(--yellow)}}.dot.down{{background:var(--red)}}.dot.u{{background:var(--dim)}}
-    .c .s{{font-size:10px;color:var(--dim);font-family:var(--mono);line-height:1.65}}
-    .c .s b{{color:var(--text);font-weight:500}}
-    .cols{{display:grid;grid-template-columns:1fr;gap:12px;margin-top:4px}}
-    @media(min-width:700px){{.cols{{grid-template-columns:1fr 1fr}}}}
-    .pan{{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}}
-    .pan-t{{font-size:12px;font-weight:600;padding:8px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px}}
-    .pan-t .ico{{font-size:14px}}
-    table{{width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono)}}
-    th{{text-align:left;color:var(--dim);font-weight:500;padding:5px 10px;border-bottom:1px solid var(--border)}}
-    td{{padding:4px 10px;border-bottom:1px solid rgba(255,255,255,.03);color:var(--dim)}}
-    td b{{color:var(--text);font-weight:500}}
-    tr:last-child td{{border-bottom:none}}
-    .err-row{{padding:8px 12px;border-bottom:1px solid var(--border);font-size:11px;line-height:1.5}}
-    .err-row:last-child{{border-bottom:none}}
-    .ets{{color:var(--dim);font-family:var(--mono);font-size:10px}}
-    .esvc{{color:var(--yellow);font-weight:600}}
-    .ectx{{color:var(--dim)}}
-    .emsg{{color:var(--red);font-family:var(--mono);font-size:10px;margin-top:2px;word-break:break-all}}
-    .etb{{color:var(--dim);font-family:var(--mono);font-size:9px;margin-top:3px;white-space:pre-wrap;max-height:100px;overflow-y:auto;background:rgba(0,0,0,.3);padding:5px 7px;border-radius:7px}}
-    .empty{{color:var(--dim);font-size:12px;padding:16px;text-align:center}}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0a0e1a"/>
+<title>{title} — Status</title>
+<style>
+{_CSS_VARS}
+.w{{max-width:1100px;margin:0 auto;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(20px + env(safe-area-inset-bottom))}}
+header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}}
+h1{{font-size:17px;font-weight:700;display:flex;align-items:center;gap:8px}}
+.pulse{{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;animation:p 2s infinite}}
+@keyframes p{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
+.nav a{{color:var(--blue);font-size:12px;text-decoration:none}}
+.vitals{{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:11px;font-family:var(--mono);color:var(--dim);margin-bottom:12px}}
+.vitals b{{color:var(--text);font-weight:500}}
+.vitals .g{{color:var(--green)}}.vitals .y{{color:#fbbf24}}.vitals .r{{color:#f87171}}
+.section{{margin-bottom:16px}}
+.sh{{font-size:13px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:6px}}
+.sh .ct{{font-size:10px;font-weight:700;font-family:var(--mono);padding:1px 6px;border-radius:7px;background:rgba(52,211,153,.12);color:var(--green)}}
+.sh .ct.warn{{background:rgba(248,113,113,.15);color:#f87171}}
+.svc-strip{{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;margin-bottom:4px}}
+.svc-strip .s{{display:flex;align-items:center;gap:4px;color:var(--dim)}}
+.svc-strip .s b{{color:var(--text);font-weight:500}}
+.dot{{width:7px;height:7px;border-radius:50%;flex-shrink:0}}
+.dot.ok{{background:var(--green)}}.dot.err{{background:#fbbf24}}.dot.dn{{background:#f87171}}.dot.u{{background:var(--dim)}}
+.vgrid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}}
+@media(min-width:540px){{.vgrid{{grid-template-columns:repeat(3,1fr)}}}}
+@media(min-width:800px){{.vgrid{{grid-template-columns:repeat(5,1fr)}}}}
+.vc{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:10px 12px}}
+.vc .vn{{font-size:13px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:5px}}
+.vc .vs{{font-size:10px;color:var(--dim);font-family:var(--mono);line-height:1.6}}
+.vc .vs b{{color:var(--text);font-weight:500}}
+.pan{{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}}
+table{{width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono)}}
+th{{text-align:left;color:var(--dim);font-weight:500;padding:6px 10px;border-bottom:1px solid var(--border)}}
+td{{padding:5px 10px;border-bottom:1px solid rgba(255,255,255,.03);color:var(--dim)}}
+td b{{color:var(--text);font-weight:500}}
+tr:last-child td{{border-bottom:none}}
+.err-row{{padding:8px 12px;border-bottom:1px solid var(--border);font-size:11px}}
+.err-row:last-child{{border-bottom:none}}
+.ets{{color:var(--dim);font-family:var(--mono);font-size:10px}}
+.esvc{{color:#fbbf24;font-weight:600}}
+.emsg{{color:#f87171;font-family:var(--mono);font-size:10px;margin-top:2px;word-break:break-all}}
+.etb{{color:var(--dim);font-family:var(--mono);font-size:9px;margin-top:3px;white-space:pre-wrap;max-height:80px;overflow-y:auto;background:rgba(0,0,0,.3);padding:5px 7px;border-radius:7px}}
+.empty{{color:var(--dim);font-size:12px;padding:14px;text-align:center}}
+.cols{{display:grid;grid-template-columns:1fr;gap:12px}}
+@media(min-width:700px){{.cols{{grid-template-columns:1fr 1fr}}}}
+details{{margin-bottom:12px}}
+summary{{cursor:pointer;font-size:13px;font-weight:600;color:var(--dim);padding:6px 0}}
+summary:hover{{color:var(--text)}}
+</style>
 </head>
 <body>
 <div class="w">
-  <header><h1>System Status</h1><div class="nav"><span class="pulse" id="pulse"></span><a href="/">&#x2190; Controls</a></div></header>
-  <div class="bar" id="bar">Connecting...</div>
-  <div class="bar" id="sys" style="margin-bottom:8px">System loading...</div>
-  <div class="st">Services</div>
-  <div class="grid" id="grid"></div>
-  <div class="cols">
-    <div>
-      <div class="st">MQTT Sources <span class="badge bg" id="src-n">0</span></div>
-      <div class="pan"><div class="pan-t"><span class="ico">&#x1f4e1;</span>Activity by source</div><div id="src-tbl"><div class="empty">Loading...</div></div></div>
-      <div class="st" style="margin-top:14px">Top Topics (60s)</div>
-      <div class="pan"><div class="pan-t"><span class="ico">&#x1f4ca;</span>Message rates</div><div id="top-tbl"><div class="empty">Loading...</div></div></div>
-    </div>
-    <div>
-      <div class="st">Recent Activity</div>
-      <div class="pan" style="max-height:300px;overflow-y:auto"><div class="pan-t"><span class="ico">&#x26a1;</span>Live feed</div><div id="feed"><div class="empty">Loading...</div></div></div>
-      <div class="st" style="margin-top:14px">Database <span class="badge bg" id="db-badge">&#x2014;</span></div>
-      <div class="pan"><div class="pan-t"><span class="ico">&#x1f5c4;&#xfe0f;</span>Recent ingested events</div><div id="db-tbl"><div class="empty">Loading...</div></div></div>
-    </div>
-  </div>
-  <div class="st">Voice Assistants</div>
-  <div class="grid" id="voice-grid"></div>
-  <div class="st" style="margin-top:10px">Recent Voice Commands</div>
-  <div class="pan" id="voice-cmds" style="max-height:200px;overflow-y:auto"><div class="empty">No commands yet</div></div>
-  <div class="st" style="margin-top:14px">Errors <span class="badge bg" id="err-badge">0</span></div>
-  <div class="pan" id="errors" style="max-height:350px;overflow-y:auto"><div class="empty">No errors</div></div>
+<header>
+<h1><span class="pulse" id="pulse"></span>System Status</h1>
+<div class="nav"><a href="/">&#x2190; Controls</a></div>
+</header>
+<div class="vitals" id="vitals">Loading...</div>
+
+<div class="section" id="err-section" style="display:none">
+<div class="sh">Errors <span class="ct warn" id="err-badge">0</span></div>
+<div class="pan" id="errors" style="max-height:200px;overflow-y:auto"></div>
+</div>
+
+<div class="section">
+<div class="sh">Services <span class="ct" id="svc-ct">0</span></div>
+<div class="svc-strip" id="svcs"></div>
+</div>
+
+<div class="section">
+<div class="sh">Voice Assistants</div>
+<div class="vgrid" id="voice"></div>
+</div>
+
+<div class="section">
+<div class="sh">Recent Commands</div>
+<div class="pan" id="cmds"><div class="empty">No commands yet</div></div>
+</div>
+
+<div class="cols">
+<div class="section">
+<div class="sh">Live Feed</div>
+<div class="pan" id="feed"><div class="empty">Loading...</div></div>
+</div>
+<div class="section">
+<div class="sh">Database <span class="ct" id="db-ct">&#x2014;</span></div>
+<div class="pan" id="db"><div class="empty">Loading...</div></div>
+</div>
+</div>
+
+<details>
+<summary>MQTT Details</summary>
+<div class="cols">
+<div class="pan" id="src-tbl"><div class="empty">Loading...</div></div>
+<div class="pan" id="top-tbl"><div class="empty">Loading...</div></div>
+</div>
+</details>
 </div>
 <script>
 (function(){{
@@ -344,108 +365,94 @@ function ts(t){{if(!t)return'';try{{return new Date(t).toLocaleTimeString([],{{h
 function esc(s){{const d=document.createElement('div');d.textContent=s;return d.innerHTML}}
 
 async function refresh(){{
-  try{{
-    const r=await fetch('/api/health');
-    const d=await r.json();
-    const w=d.watchdog||{{}};const srcs=d.sources||[];const feed=d.feed||[];
-    const topics=d.topics||[];const errs=d.errors||[];const db=d.db;const mq=d.mqtt||{{}};
+try{{
+const r=await fetch('/api/health');
+const d=await r.json();
+const w=d.watchdog||{{}};const srcs=d.sources||[];const feed=d.feed||[];
+const topics=d.topics||[];const errs=d.errors||[];const db=d.db;const mq=d.mqtt||{{}};
+const sys=d.system||{{}};const vr=d.voice_rooms||{{}};const vc=d.voice_commands||[];
 
-    let bh=`MQTT: <span class="${{mq.connected?'g':'r'}}">${{mq.connected?'connected':'disconnected'}}</span> \u00b7 `
-      +`recv: <span>${{mq.received_total||0}}</span> \u00b7 dropped: <span>${{mq.dropped_total||0}}</span> \u00b7 `
-      +`queue: <span>${{mq.queue_size||0}}</span> \u00b7 `
-      +`sources: <span>${{srcs.length}}</span> \u00b7 `
-      +`updated: <span>${{ts(d.ts)}}</span>`;
-    $('bar').innerHTML=bh;
+// vitals bar
+let v=`MQTT: <b class="${{mq.connected?'g':'r'}}">${{mq.connected?'connected':'disconnected'}}</b>`;
+if(sys.cpu_cores){{
+const lc=sys.load_1m>sys.cpu_cores*0.8?'r':sys.load_1m>sys.cpu_cores*0.5?'y':'g';
+const mc=sys.mem_pct>85?'r':sys.mem_pct>70?'y':'g';
+v+=` \\u00b7 CPU: <b class="${{lc}}">${{sys.load_1m}}</b>/${{sys.cpu_cores}}`;
+v+=` \\u00b7 RAM: <b class="${{mc}}">${{sys.mem_pct}}%</b>`;
+v+=` \\u00b7 Disk: <b>${{sys.disk_pct}}%</b>`;
+}}
+v+=` \\u00b7 Sources: <b>${{srcs.length}}</b> \\u00b7 ${{ts(d.ts)}}`;
+$('vitals').innerHTML=v;
 
-    const sys=d.system||{{}};
-    if(sys.cpu_cores){{
-      const loadColor=sys.load_1m>sys.cpu_cores*0.8?'r':sys.load_1m>sys.cpu_cores*0.5?'y':'g';
-      const memColor=sys.mem_pct>85?'r':sys.mem_pct>70?'y':'g';
-      const diskColor=sys.disk_pct>90?'r':sys.disk_pct>80?'y':'g';
-      $('sys').innerHTML=`CPU: <span class="${{loadColor}}">${{sys.load_1m}}</span>/${{sys.cpu_cores}} cores `
-        +`\u00b7 RAM: <span class="${{memColor}}">${{sys.mem_used_gb}}G</span>/${{sys.mem_total_gb}}G (${{sys.mem_pct}}%) `
-        +`\u00b7 Disk: <span class="${{diskColor}}">${{sys.disk_used_gb}}G</span>/${{sys.disk_total_gb}}G (${{sys.disk_pct}}%)`;
-    }}
+// errors (show section only if errors exist)
+if(errs.length){{
+$('err-section').style.display='';
+$('err-badge').textContent=errs.length;
+let eh='';
+for(const e of errs)eh+=`<div class="err-row"><span class="ets">${{ts(e.ts)}}</span> <span class="esvc">${{esc(e.service)}}</span> <span style="color:var(--dim)">${{esc(e.context)}}</span><div class="emsg">${{esc(e.error_type)}}: ${{esc((e.error||'').substring(0,200))}}</div>`+(e.traceback?`<div class="etb">${{esc(e.traceback)}}</div>`:'')+`</div>`;
+$('errors').innerHTML=eh;
+}}else{{$('err-section').style.display='none'}}
 
-    const wk=Object.keys(w).sort();
-    let gh='';
-    for(const k of wk){{
-      const s=w[k];const st=s.status||'unknown';
-      const src=srcs.find(x=>x.source===k);
-      gh+=`<div class="c"><div class="n"><span class="dot ${{st==='ok'?'ok':st==='error'?'error':st==='down'?'down':'u'}}"></span>${{esc(k)}}</div>`
-        +`<div class="s">Status: <b>${{st.toUpperCase()}}</b><br>HB: <b>${{ago(s.heartbeat_age_seconds)}}</b>`
-        +`<br>Errs: <b>${{s.error_count||0}}</b> \u00b7 PID: <b>${{s.pid||'\u2014'}}</b>`
-        +(src?`<br>Rate: <b>${{src.rate}}/s</b> \u00b7 Msgs: <b>${{src.total}}</b>`:'')
-        +(s.restart_attempted?'<br><span style="color:var(--yellow)">restarted</span>':'')
-        +`</div></div>`;
-    }}
-    $('grid').innerHTML=gh||'<div class="empty">Waiting for watchdog...</div>';
+// services strip
+const wk=Object.keys(w).sort();
+$('svc-ct').textContent=wk.length;
+let sh='';
+for(const k of wk){{
+const s=w[k];const st=s.status||'unknown';
+const dc=st==='ok'?'ok':st==='error'?'err':st==='down'?'dn':'u';
+sh+=`<div class="s"><span class="dot ${{dc}}"></span><b>${{esc(k.replace(/-agent$/,''))}}</b></div>`;
+}}
+$('svcs').innerHTML=sh||'<span style="color:var(--dim)">Waiting for watchdog...</span>';
 
-    $('src-n').textContent=srcs.length;
-    if(srcs.length){{
-      let st='<table><tr><th>Source</th><th>Age</th><th>Rate</th><th>Total</th><th>Last Type</th></tr>';
-      for(const s of srcs)st+=`<tr><td><b>${{esc(s.source)}}</b></td><td>${{ago(s.age_s)}}</td><td>${{s.rate}}/s</td><td>${{s.total}}</td><td>${{esc((s.last_type||'').substring(0,30))}}</td></tr>`;
-      $('src-tbl').innerHTML=st+'</table>';
-    }}
+// voice rooms
+const vrk=Object.keys(vr).sort();
+if(vrk.length){{
+let vh='';
+for(const k of vrk){{
+const rm=vr[k];const act=rm.active;const st=rm.state||'?';
+const dc=st==='deaf'?'err':act?'ok':'dn';
+vh+=`<div class="vc"><div class="vn"><span class="dot ${{dc}}"></span>${{esc(rm.room_name||k)}}</div>`
++`<div class="vs">${{st.toUpperCase()}}<br>Wakes: <b>${{rm.wakes||0}}</b> STT: <b>${{rm.stt_reqs||0}}</b></div></div>`;
+}}
+$('voice').innerHTML=vh;
+}}else{{$('voice').innerHTML='<div class="empty">No voice data yet</div>'}}
 
-    if(topics.length){{
-      let tt='<table><tr><th>Topic</th><th>Count</th><th>Rate</th></tr>';
-      for(const t of topics)tt+=`<tr><td><b>${{esc(t.topic)}}</b></td><td>${{t.count}}</td><td>${{t.rate}}/s</td></tr>`;
-      $('top-tbl').innerHTML=tt+'</table>';
-    }}else{{$('top-tbl').innerHTML='<div class="empty">No traffic</div>'}}
+// commands
+if(vc.length){{
+let ch='<table><tr><th>Time</th><th>Room</th><th>Command</th></tr>';
+for(const c of vc.slice(0,8))ch+=`<tr><td>${{ts(c.ts)}}</td><td><b>${{esc(c.room_name||c.room_id)}}</b></td><td>${{esc(c.text)}}</td></tr>`;
+$('cmds').innerHTML=ch+'</table>';
+}}
 
-    if(feed.length){{
-      let fh='<table><tr><th>Time</th><th>Source</th><th>Type</th></tr>';
-      for(const f of feed.slice(0,25))fh+=`<tr><td>${{ts(f.ts)}}</td><td><b>${{esc(f.source)}}</b></td><td>${{esc((f.type||'').substring(0,35))}}</td></tr>`;
-      $('feed').innerHTML=fh+'</table>';
-    }}
+// feed
+if(feed.length){{
+let fh='<table><tr><th>Time</th><th>Source</th><th>Type</th></tr>';
+for(const f of feed.slice(0,15))fh+=`<tr><td>${{ts(f.ts)}}</td><td><b>${{esc(f.source)}}</b></td><td>${{esc((f.type||'').substring(0,30))}}</td></tr>`;
+$('feed').innerHTML=fh+'</table>';
+}}
 
-    if(db&&db.rows){{
-      $('db-badge').textContent=`${{db.events_last_60s||0}}/60s`;
-      let dh=`<div style="padding:6px 10px;font-size:10px;font-family:var(--mono);color:var(--dim)">last ingest: <b style="color:var(--text)">${{ago(db.last_ingest_age_s)}}</b> \u00b7 events/60s: <b style="color:var(--text)">${{db.events_last_60s||0}}</b></div>`;
-      if(db.rows.length){{
-        dh+='<table><tr><th>Age</th><th>Source</th><th>Type</th></tr>';
-        for(const r of db.rows)dh+=`<tr><td>${{ago(r.age_s)}}</td><td><b>${{esc(r.source)}}</b></td><td>${{esc((r.type||'').substring(0,30))}}</td></tr>`;
-        dh+='</table>';
-      }}
-      $('db-tbl').innerHTML=dh;
-    }}else{{$('db-tbl').innerHTML='<div class="empty">DB unavailable</div>'}}
+// db
+if(db&&db.rows){{
+$('db-ct').textContent=`${{db.events_last_60s||0}}/min`;
+let dh='<table><tr><th>Age</th><th>Source</th><th>Type</th></tr>';
+for(const r of db.rows)dh+=`<tr><td>${{ago(r.age_s)}}</td><td><b>${{esc(r.source)}}</b></td><td>${{esc((r.type||'').substring(0,28))}}</td></tr>`;
+$('db').innerHTML=dh+'</table>';
+}}
 
-    // voice rooms
-    const vr=d.voice_rooms||{{}};
-    const vrk=Object.keys(vr).sort();
-    if(vrk.length){{
-      let vh='';
-      for(const k of vrk){{
-        const v=vr[k];
-        const act=v.active;
-        vh+=`<div class="c"><div class="n"><span class="dot ${{act?'ok':'down'}}"></span>${{esc(v.room_name||k)}}</div>`
-          +`<div class="s">State: <b>${{esc(v.state||'?')}}</b><br>`
-          +`Active: <b>${{act?'yes':'no'}}</b><br>`
-          +`Wakes: <b>${{v.wakes||0}}</b> \u00b7 STT: <b>${{v.stt_reqs||0}}</b><br>`
-          +`Frames: <b>${{v.frames||0}}</b>`
-          +`</div></div>`;
-      }}
-      $('voice-grid').innerHTML=vh;
-    }}else{{$('voice-grid').innerHTML='<div class="empty">No voice data yet</div>'}}
+// mqtt details (collapsed)
+if(srcs.length){{
+let st='<table><tr><th>Source</th><th>Age</th><th>Rate</th><th>Total</th></tr>';
+for(const s of srcs)st+=`<tr><td><b>${{esc(s.source)}}</b></td><td>${{ago(s.age_s)}}</td><td>${{s.rate}}/s</td><td>${{s.total}}</td></tr>`;
+$('src-tbl').innerHTML=st+'</table>';
+}}
+if(topics.length){{
+let tt='<table><tr><th>Topic</th><th>Count</th><th>Rate</th></tr>';
+for(const t of topics)tt+=`<tr><td><b>${{esc(t.topic)}}</b></td><td>${{t.count}}</td><td>${{t.rate}}/s</td></tr>`;
+$('top-tbl').innerHTML=tt+'</table>';
+}}
 
-    // voice commands
-    const vc=d.voice_commands||[];
-    if(vc.length){{
-      let vch='<table><tr><th>Time</th><th>Room</th><th>Command</th></tr>';
-      for(const c of vc.slice(0,10))vch+=`<tr><td>${{ts(c.ts)}}</td><td><b>${{esc(c.room_name||c.room_id)}}</b></td><td>${{esc(c.text)}}</td></tr>`;
-      $('voice-cmds').innerHTML=vch+'</table>';
-    }}
-
-    const eb=$('err-badge');
-    if(errs.length){{
-      let eh='';
-      for(const e of errs)eh+=`<div class="err-row"><span class="ets">${{ts(e.ts)}}</span> <span class="esvc">${{esc(e.service)}}</span> <span class="ectx">${{esc(e.context)}}</span><div class="emsg">${{esc(e.error_type)}}: ${{esc((e.error||'').substring(0,200))}}</div>`+(e.traceback?`<div class="etb">${{esc(e.traceback)}}</div>`:'')+`</div>`;
-      $('errors').innerHTML=eh;eb.textContent=errs.length;eb.className='badge br';
-    }}else{{$('errors').innerHTML='<div class="empty">No errors</div>';eb.textContent='0';eb.className='badge bg'}}
-
-    $('pulse').style.background='var(--green)';
-  }}catch(e){{$('pulse').style.background='var(--red)';$('bar').innerHTML='Connection error'}}
+$('pulse').style.background='var(--green)';
+}}catch(e){{$('pulse').style.background='var(--red)';$('vitals').innerHTML='Connection error'}}
 }}
 refresh();setInterval(refresh,5000);
 }})();

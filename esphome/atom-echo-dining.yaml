@@ -36,6 +36,8 @@ esp32:
     version: recommended
 
 logger:
+  logs:
+    mqtt: NONE
   level: INFO
 
 wifi:

@@ -53,6 +53,8 @@ esp32:
       CONFIG_ESP32_DEFAULT_CPU_FREQ_240: "y"
 
 logger:
+  logs:
+    mqtt: NONE
   level: INFO
 
 wifi:
