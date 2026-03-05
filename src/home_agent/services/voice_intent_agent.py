@@ -184,6 +184,16 @@ async def run_voice_intent_agent() -> None:
         )
         log.info("reasoning_llm", model=settings.voice_reasoning_model)
 
+    perplexity_llm = None
+    if settings.voice_perplexity_api_key:
+        perplexity_llm = LLMClient(
+            base_url="https://api.perplexity.ai",
+            api_key=settings.voice_perplexity_api_key,
+            model=settings.voice_perplexity_model,
+            timeout_seconds=settings.voice_perplexity_timeout,
+        )
+        log.info("perplexity_llm", model=settings.voice_perplexity_model)
+
     # --- System context ---
     ctx = SystemContext()
     register_all(ctx, settings, mqttc)
@@ -534,6 +544,27 @@ async def run_voice_intent_agent() -> None:
 
                 elif isinstance(result, LLMTextResponse):
                     answer = result.text
+                    # If the fast model gave a generic answer and we have Perplexity,
+                    # try to get a better web-searched answer
+                    if answer and perplexity_llm:
+                        try:
+                            pplx_answer = await perplexity_llm.chat(
+                                system="You are a helpful assistant. Answer concisely in one to three sentences. Format for spoken audio: spell out numbers, no URLs, no markdown.",
+                                user=text,
+                                max_tokens=256,
+                                temperature=0.2,
+                            )
+                            if pplx_answer and len(pplx_answer.strip()) > 10:
+                                import re
+                                pplx_answer = re.sub(r"\[\d+\]", "", pplx_answer)  # [1] [2] etc
+                                pplx_answer = re.sub(r"(?<=\.)(\d{2,})", "", pplx_answer)  # .12367 trailing refs
+                                pplx_answer = re.sub(r"(?<=\w)(\d{4,})", "", pplx_answer)  # word12367
+                                pplx_answer = re.sub(r"\*\*", "", pplx_answer)  # **bold**
+                                pplx_answer = re.sub(r"\s{2,}", " ", pplx_answer).strip()  # cleanup
+                                answer = pplx_answer.strip()
+                                log.info("perplexity_answer", room=room_name, answer=answer[:80])
+                        except Exception as e:
+                            log.warning("perplexity_failed", error=str(e)[:100])
                     if answer:
                         _respond(answer, room_id, room_name, speakers)
                         conv.add_user(text)

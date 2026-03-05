@@ -1088,6 +1088,9 @@ class AppSettings(BaseSettings):
     voice_reasoning_api_key: str = Field(default="", alias="VOICE_REASONING_API_KEY")
     voice_reasoning_model: str = Field(default="claude-sonnet-4-20250514", alias="VOICE_REASONING_MODEL")
     voice_reasoning_timeout: float = Field(default=30.0, alias="VOICE_REASONING_TIMEOUT")
+    voice_perplexity_api_key: str = Field(default="", alias="VOICE_PERPLEXITY_API_KEY")
+    voice_perplexity_model: str = Field(default="sonar", alias="VOICE_PERPLEXITY_MODEL")
+    voice_perplexity_timeout: float = Field(default=15.0, alias="VOICE_PERPLEXITY_TIMEOUT")
 
     @property
     def voice_room_speakers_parsed(self) -> Dict[str, List[str]]:

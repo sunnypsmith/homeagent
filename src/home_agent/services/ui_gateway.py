@@ -297,7 +297,7 @@ h1{{font-size:17px;font-weight:700}}
 const chat=document.getElementById('chat');
 const input=document.getElementById('input');
 const send=document.getElementById('send');
-let lastLen=0;
+let lastHash="";
 
 function ts(t){{if(!t)return'';try{{return new Date(t).toLocaleTimeString([],{{hour:'2-digit',minute:'2-digit'}})}}catch(e){{return''}}}}
 function esc(s){{const d=document.createElement('div');d.textContent=s;return d.innerHTML}}
@@ -319,8 +319,9 @@ async function poll(){{
     const r=await fetch('/api/health');
     const d=await r.json();
     const hist=d.chat_history||[];
-    if(hist.length!==lastLen){{
-      lastLen=hist.length;
+    const newHash=JSON.stringify(hist.slice(0,10));
+    if(newHash!==lastHash){{
+      lastHash=newHash;
       const reversed=[...hist].reverse();
       let h='';
       for(const m of reversed){{
