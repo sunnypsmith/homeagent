@@ -43,10 +43,11 @@ fi
 run() {
   # $1 = tag, $2... = command
   local tag="$1"; shift
-  printf "cd /workspace && %s 2>&1 | sed -u 's/^/[%s] /'\n" "$*" "$tag"
+  printf "export PYTHONDONTWRITEBYTECODE=1; cd /workspace && %s 2>&1 | sed -u 's/^/[%s] /'\n" "$*" "$tag"
 }
 
 tmux new-session -d -s "$SESSION" -n core
+tmux set-environment -t "$SESSION" PYTHONDONTWRITEBYTECODE 1
 tmux set-option -g -t "$SESSION" pane-border-status top
 tmux set-option -g -t "$SESSION" pane-border-format "#{pane_title}"
 
