@@ -411,7 +411,7 @@ summary:hover{{color:var(--text)}}
 <div class="vitals" id="vitals">Loading...</div>
 
 <div class="section" id="err-section" style="display:none">
-<div class="sh">Errors <span class="ct warn" id="err-badge">0</span></div>
+<div class="sh">Errors <span class="ct warn" id="err-badge">0</span> <button id="err-clear" onclick="fetch('/api/clear-errors',{{method:'POST'}}).then(()=>refresh())" style="display:none;background:none;border:1px solid var(--dim);color:var(--dim);border-radius:6px;padding:1px 8px;font-size:10px;cursor:pointer;margin-left:6px">Clear</button></div>
 <div class="pan" id="errors" style="max-height:200px;overflow-y:auto"></div>
 </div>
 
@@ -479,6 +479,7 @@ $('vitals').innerHTML=v;
 // errors (show section only if errors exist)
 if(errs.length){{
 $('err-section').style.display='';
+      var ec=$('err-clear');if(ec)ec.style.display='inline';
 $('err-badge').textContent=errs.length;
 let eh='';
 for(const e of errs)eh+=`<div class="err-row"><span class="ets">${{ts(e.ts)}}</span> <span class="esvc">${{esc(e.service)}}</span> <span style="color:var(--dim)">${{esc(e.context)}}</span><div class="emsg">${{esc(e.error_type)}}: ${{esc((e.error||'').substring(0,200))}}</div>`+(e.traceback?`<div class="etb">${{esc(e.traceback)}}</div>`:'')+`</div>`;
@@ -809,6 +810,11 @@ async def run_ui_gateway() -> None:
     @app.get("/status", response_class=HTMLResponse)
     async def status_page() -> str:
         return _status_html(title=settings.ui.title)
+
+    @app.post("/api/clear-errors")
+    async def api_clear_errors() -> Dict[str, str]:
+        _recent_errors.clear()
+        return {"status": "ok"}
 
     @app.get("/chat", response_class=HTMLResponse)
     async def chat_page() -> str:
