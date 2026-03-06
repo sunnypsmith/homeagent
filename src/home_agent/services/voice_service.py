@@ -69,6 +69,7 @@ class Room:
     raw_buffer: bytearray = field(default_factory=bytearray)
     command_buffer: bytearray = field(default_factory=bytearray)
     pre_wake_frames: List[bytes] = field(default_factory=list)
+    oww_buffer: bytearray = field(default_factory=bytearray)
 
     # Timing
     last_wake_time: float = 0.0
@@ -199,7 +200,21 @@ async def run_voice_service() -> None:
     if not stt_api_key:
         log.warning("no_stt_api_key", hint="Set VOICE_STT_API_KEY in .env")
 
-    # Rooms — each gets its own wake word instance (models are stateful)
+    # Rooms — each gets BOTH wake word engines for dual detection
+    oww_available = False
+    oww_path = None
+    try:
+        from openwakeword.model import Model as OWWModel
+        oww_path_raw = str(Path(settings.voice_wake_model))
+        if not Path(oww_path_raw).is_absolute():
+            oww_path_raw = str(Path(__file__).resolve().parents[3] / oww_path_raw)
+        if Path(oww_path_raw).exists():
+            oww_path = oww_path_raw
+            oww_available = True
+            log.info("oww_available", model=oww_path)
+    except Exception:
+        pass
+
     rooms: Dict[str, Room] = {}
     for name, room_id in room_configs.items():
         oww_model = None
@@ -209,10 +224,15 @@ async def run_voice_service() -> None:
                 access_key=settings.voice_porcupine_key,
                 keyword_paths=[ppn_path],
             )
-        else:
+        if oww_available:
             oww_model = OWWModel(wakeword_model_paths=[oww_path], enable_speex_noise_suppression=False)
+        elif wake_engine != "porcupine":
+            oww_model = OWWModel(wakeword_model_paths=[oww_path_raw], enable_speex_noise_suppression=False)
         rooms[room_id] = Room(room_id=room_id, friendly_name=name, oww_model=oww_model, porcupine=room_porcupine)
-        log.info("room_registered", name=name, room_id=room_id, engine=wake_engine)
+        engines = []
+        if room_porcupine: engines.append("porcupine")
+        if oww_model: engines.append("openwakeword")
+        log.info("room_registered", name=name, room_id=room_id, engines=engines)
 
     # UDP listener
     loop = asyncio.get_running_loop()
@@ -304,24 +324,29 @@ async def run_voice_service() -> None:
                 if now - room.last_wake_time < wake_cooldown:
                     continue
 
-                # Wake word detection
+                # Wake word detection — dual engine (trigger if EITHER detects)
                 detected = False
                 if room.porcupine is not None:
                     result = room.porcupine.process(frame_np.tolist())
                     if result >= 0:
                         detected = True
                         log.info("wake_detected", room=room.friendly_name, engine="porcupine")
-                elif room.oww_model is not None:
-                    if now - room.last_model_reset > 900:
-                        room.oww_model.reset()
-                        room.last_model_reset = now
-                    pred = room.oww_model.predict(frame_np)
-                    for model_name, score in pred.items():
-                        if score >= wake_threshold:
-                            detected = True
-                            log.info("wake_detected", room=room.friendly_name,
-                                     engine="openwakeword", score=round(score, 3))
-                            break
+                if not detected and room.oww_model is not None:
+                    # OWW needs 1280-sample frames; accumulate from 512-sample Porcupine frames
+                    room.oww_buffer.extend(frame_bytes)
+                    if len(room.oww_buffer) >= 2560:  # 1280 samples * 2 bytes
+                        oww_frame = np.frombuffer(bytes(room.oww_buffer[:2560]), dtype=np.int16)
+                        room.oww_buffer = room.oww_buffer[2560:]
+                        if now - room.last_model_reset > 900:
+                            room.oww_model.reset()
+                            room.last_model_reset = now
+                        pred = room.oww_model.predict(oww_frame)
+                        for model_name, score in pred.items():
+                            if score >= wake_threshold:
+                                detected = True
+                                log.info("wake_detected", room=room.friendly_name,
+                                         engine="openwakeword", score=round(score, 3))
+                                break
 
                 if detected:
                     room.state = RoomState.CAPTURING
