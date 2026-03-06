@@ -232,38 +232,16 @@ async def run_voice_service() -> None:
         log.warning("no_stt_api_key", hint="Set VOICE_STT_API_KEY in .env")
 
     # Rooms — each gets BOTH wake word engines for dual detection
-    oww_available = False
-    oww_path = None
-    try:
-        from openwakeword.model import Model as OWWModel
-        oww_path_raw = str(Path(settings.voice_wake_model))
-        if not Path(oww_path_raw).is_absolute():
-            oww_path_raw = str(Path(__file__).resolve().parents[3] / oww_path_raw)
-        if Path(oww_path_raw).exists():
-            oww_path = oww_path_raw
-            oww_available = True
-            log.info("oww_available", model=oww_path)
-    except Exception:
-        pass
-
     rooms: Dict[str, Room] = {}
     for name, room_id in room_configs.items():
-        oww_model = None
         room_porcupine = None
         if wake_engine == "porcupine":
             room_porcupine = pvporcupine.create(
                 access_key=settings.voice_porcupine_key,
                 keyword_paths=[ppn_path],
             )
-        if oww_available:
-            oww_model = OWWModel(wakeword_model_paths=[oww_path], enable_speex_noise_suppression=False)
-        elif wake_engine != "porcupine":
-            oww_model = OWWModel(wakeword_model_paths=[oww_path_raw], enable_speex_noise_suppression=False)
-        rooms[room_id] = Room(room_id=room_id, friendly_name=name, oww_model=oww_model, porcupine=room_porcupine)
-        engines = []
-        if room_porcupine: engines.append("porcupine")
-        if oww_model: engines.append("openwakeword")
-        log.info("room_registered", name=name, room_id=room_id, engines=engines)
+        rooms[room_id] = Room(room_id=room_id, friendly_name=name, porcupine=room_porcupine)
+        log.info("room_registered", name=name, room_id=room_id, engine=wake_engine)
 
     # UDP listener
     loop = asyncio.get_running_loop()
@@ -337,9 +315,9 @@ async def run_voice_service() -> None:
             room.pre_wake_frames.clear()
             if hasattr(room, 'oww_buffer'):
                 room.oww_buffer.clear()
-            room.state = RoomState.LISTENING
-            room.last_state_change = time.monotonic()
-            _set_led(room.room_id, "listening")
+            # Keep room DEAF — playback_done will set LISTENING when Sonos finishes
+            pass
+            
 
     # Per-room audio processing
     def _process_room_audio(room: Room) -> Optional[bytes]:
@@ -381,8 +359,7 @@ async def run_voice_service() -> None:
                     if hasattr(room, 'oww_buffer'):
                         room.oww_buffer.clear()
                     _set_led(room.room_id, "capturing")
-                    # Play "How may I serve you?" — room stays PROMPTING
-                    # until playback_done transitions it to CAPTURING
+                    # Play "How may I serve you?" and start capturing after a delay
                     speakers = settings.voice_room_speakers_parsed.get(room.room_id)
                     if speakers and speakers != ["none"]:
                         from home_agent.bus.envelope import make_event as _mkp
@@ -390,9 +367,21 @@ async def run_voice_service() -> None:
                             data={"text": "How may I serve you?", "offline_audio_key": "voice_prompt", "targets": speakers})
                         mqttc.publish_json("%s/announce/request" % settings.mqtt.base_topic, prompt_evt)
                         log.info("wake_prompting", room=room.friendly_name)
+                        # Start capturing after prompt plays (~2s)
+                        async def _delayed_capture(r=room):
+                            await asyncio.sleep(2.5)
+                            if r.state == RoomState.PROMPTING:
+                                r.raw_buffer.clear()
+                                r.command_buffer = bytearray()
+                                r.command_start_time = time.monotonic()
+                                r.last_speech_time = time.monotonic()
+                                r.state = RoomState.CAPTURING
+                                r.last_state_change = time.monotonic()
+                                log.info("capturing_start", room=r.friendly_name)
+                        asyncio.create_task(_delayed_capture())
                     else:
-                        # No speakers (web room) — go straight to capturing
                         room.state = RoomState.CAPTURING
+                        room.last_state_change = time.monotonic()
                         room.command_start_time = time.monotonic()
                         room.last_speech_time = time.monotonic()
 
@@ -526,6 +515,7 @@ async def run_voice_service() -> None:
                                     room.raw_buffer.clear()
                                     room.pre_wake_frames.clear()
                                     room.state = RoomState.LISTENING
+                                    room.last_wake_time = time.monotonic()  # force cooldown
                                     log.info("room_listening", room=room.friendly_name)
                                     from home_agent.bus.envelope import make_event as _mk3
                                     mqttc.publish_json("%s/voice/room_status" % settings.mqtt.base_topic, _mk3(source="voice-service", typ="voice.room_status", data={"room_id": room.room_id, "room_name": room.friendly_name, "active": True, "state": "listening", "frames": room.frames_received, "wakes": room.wake_detections, "stt_reqs": room.stt_requests}))
