@@ -46,6 +46,7 @@ class RoomState:
     LISTENING = "listening"
     CAPTURING = "capturing"
     PROCESSING = "processing"
+    PROMPTING = "prompting"
     DEAF = "deaf"
 
 
@@ -74,6 +75,7 @@ class Room:
     # Timing
     last_wake_time: float = 0.0
     last_model_reset: float = 0.0
+    last_state_change: float = 0.0
     last_speech_time: float = 0.0
     command_start_time: float = 0.0
 
@@ -290,8 +292,7 @@ async def run_voice_service() -> None:
         room.state = RoomState.PROCESSING
         _set_led(room.room_id, "processing")
         duration_s = len(audio_pcm) / (SAMPLE_RATE * SAMPLE_WIDTH)
-        log.info("stt_start", room=room.friendly_name, audio_seconds=round(duration_s, 1),
-                 audio_bytes=len(audio_pcm))
+        log.info("stt_start", room=room.friendly_name, audio_seconds=round(duration_s, 1), audio_bytes=len(audio_pcm))
         room.stt_requests += 1
         try:
             if not stt_api_key:
@@ -337,6 +338,7 @@ async def run_voice_service() -> None:
             if hasattr(room, 'oww_buffer'):
                 room.oww_buffer.clear()
             room.state = RoomState.LISTENING
+            room.last_state_change = time.monotonic()
             _set_led(room.room_id, "listening")
 
     # Per-room audio processing
@@ -369,16 +371,30 @@ async def run_voice_service() -> None:
                 # openWakeWord disabled — too many false triggers on Sonos playback
 
                 if detected:
-                    room.state = RoomState.CAPTURING
+                    room.state = RoomState.PROMPTING
+                    room.last_state_change = time.monotonic()
                     room.last_wake_time = now
-                    room.command_start_time = now
-                    room.last_speech_time = now
                     room.wake_detections += 1
-                    room.command_buffer = bytearray()
-                    for pf in room.pre_wake_frames:
-                        room.command_buffer.extend(pf)
+                    room.raw_buffer.clear()
                     room.pre_wake_frames.clear()
+                    room.command_buffer = bytearray()
+                    if hasattr(room, 'oww_buffer'):
+                        room.oww_buffer.clear()
                     _set_led(room.room_id, "capturing")
+                    # Play "How may I serve you?" — room stays PROMPTING
+                    # until playback_done transitions it to CAPTURING
+                    speakers = settings.voice_room_speakers_parsed.get(room.room_id)
+                    if speakers and speakers != ["none"]:
+                        from home_agent.bus.envelope import make_event as _mkp
+                        prompt_evt = _mkp(source="voice-service", typ="announce.request",
+                            data={"text": "How may I serve you?", "offline_audio_key": "voice_prompt", "targets": speakers})
+                        mqttc.publish_json("%s/announce/request" % settings.mqtt.base_topic, prompt_evt)
+                        log.info("wake_prompting", room=room.friendly_name)
+                    else:
+                        # No speakers (web room) — go straight to capturing
+                        room.state = RoomState.CAPTURING
+                        room.command_start_time = time.monotonic()
+                        room.last_speech_time = time.monotonic()
 
             elif room.state == RoomState.CAPTURING:
                 room.command_buffer.extend(frame_bytes)
@@ -403,7 +419,7 @@ async def run_voice_service() -> None:
 
                 if silence_elapsed >= silence_duration or total_elapsed >= max_command_duration:
                     reason = "silence" if silence_elapsed >= silence_duration else "max_duration"
-                    log.info("command_complete", room=room.friendly_name, reason=reason,
+                    log.info("command_complete", room=room.friendly_name, reason=reason, audio_bytes=len(room.command_buffer),
                              duration=round(total_elapsed, 1))
                     audio = bytes(room.command_buffer)
                     room.command_buffer.clear()
@@ -415,8 +431,15 @@ async def run_voice_service() -> None:
         while True:
             processed_any = False
             for room in rooms.values():
-                if room.state in (RoomState.PROCESSING, RoomState.DEAF):
-                    continue
+                if room.state in (RoomState.PROCESSING, RoomState.PROMPTING, RoomState.DEAF):
+                    # Safety: auto-recover if stuck for >30 seconds
+                    if room.last_state_change > 0 and (time.monotonic() - room.last_state_change) > 30.0:
+                        log.warning("auto_recover", room=room.friendly_name, stuck_state=room.state)
+                        room.state = RoomState.LISTENING
+                        room.raw_buffer.clear()
+                        room.last_state_change = time.monotonic()
+                    else:
+                        continue
                 if len(room.raw_buffer) >= WW_FRAME_BYTES:
                     result = _process_room_audio(room)
                     if result is not None:
@@ -471,22 +494,35 @@ async def run_voice_service() -> None:
                         evt = msg.json()
                         evt_type = evt.get("type", "")
                         evt_data = evt.get("data", {})
-                        if evt_type == "sonos.playback_start" and (time.monotonic() - _startup_time) > 5.0:
+                        if evt_type == "sonos.playback_start" and (time.monotonic() - _startup_time) > 15.0:
                             pb_targets = evt_data.get("targets", [])
                             room_speakers = settings.voice_room_speakers_parsed
                             for room in rooms.values():
                                 speakers = room_speakers.get(room.room_id, [])
                                 if any(s in pb_targets for s in speakers) or not pb_targets:
-                                    room.state = RoomState.DEAF
-                                    room.raw_buffer.clear()
-                                    room.pre_wake_frames.clear()
-                                    room.command_buffer.clear()
-                                    log.info("room_deaf", room=room.friendly_name)
-                                    from home_agent.bus.envelope import make_event as _mk2
-                                    mqttc.publish_json("%s/voice/room_status" % settings.mqtt.base_topic, _mk2(source="voice-service", typ="voice.room_status", data={"room_id": room.room_id, "room_name": room.friendly_name, "active": True, "state": "deaf", "frames": room.frames_received, "wakes": room.wake_detections, "stt_reqs": room.stt_requests}))
+                                    if room.state == RoomState.PROMPTING:
+                                        pass  # stay PROMPTING — waiting for playback_done to start capturing
+                                    else:
+                                        room.state = RoomState.DEAF
+                                        room.last_state_change = time.monotonic()
+                                        room.raw_buffer.clear()
+                                        room.pre_wake_frames.clear()
+                                        room.command_buffer.clear()
+                                        log.info("room_deaf", room=room.friendly_name)
+
                         elif evt_type == "sonos.playback_done":
                             for room in rooms.values():
-                                if room.state == RoomState.DEAF:
+                                if room.state == RoomState.PROMPTING:
+                                    # Prompt finished — start capturing command
+                                    room.raw_buffer.clear()
+                                    room.pre_wake_frames.clear()
+                                    room.command_buffer = bytearray()
+                                    room.command_start_time = time.monotonic()
+                                    room.last_speech_time = time.monotonic()
+                                    room.state = RoomState.CAPTURING
+                                    room.last_state_change = time.monotonic()
+                                    log.info("capturing_start", room=room.friendly_name)
+                                elif room.state == RoomState.DEAF:
                                     room.raw_buffer.clear()
                                     room.pre_wake_frames.clear()
                                     room.state = RoomState.LISTENING
