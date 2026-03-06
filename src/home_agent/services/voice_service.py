@@ -27,7 +27,7 @@ _WHISPER_HALLUCINATIONS = {
     "thank you for watching", "thank you for listening",
     "please subscribe", "like and subscribe",
     "see you next time", "bye", "goodbye",
-    "you", "the end", "...",
+    "you", "the end", "...", "one moment",
 }
 
 ROOM_HEADER_SIZE = 4
@@ -124,11 +124,40 @@ async def _transcribe_groq(audio_wav: bytes, *, api_key: str, model: str, langua
     headers = {"Authorization": "Bearer %s" % api_key}
     files = {"file": ("command.wav", audio_wav, "audio/wav")}
     data_fields = {"model": model, "language": language}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(url, headers=headers, files=files, data=data_fields)
         resp.raise_for_status()
         result = resp.json()
         return (result.get("text") or "").strip() or None
+
+
+async def _transcribe_openai(audio_wav: bytes, *, api_key: str, language: str) -> Optional[str]:
+    import httpx
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": "Bearer %s" % api_key}
+    files = {"file": ("command.wav", audio_wav, "audio/wav")}
+    data_fields = {"model": "whisper-1", "language": language}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, headers=headers, files=files, data=data_fields)
+        resp.raise_for_status()
+        result = resp.json()
+        return (result.get("text") or "").strip() or None
+
+
+async def _transcribe_with_fallback(audio_wav: bytes, *, stt_api_key: str, stt_model: str,
+                                     stt_language: str, fallback_api_key: str, log) -> Optional[str]:
+    try:
+        return await _transcribe_groq(audio_wav, api_key=stt_api_key, model=stt_model, language=stt_language)
+    except Exception as e:
+        log.warning("stt_primary_failed", error=type(e).__name__)
+        if fallback_api_key:
+            try:
+                result = await _transcribe_openai(audio_wav, api_key=fallback_api_key, language=stt_language)
+                log.info("stt_fallback_used", provider="openai")
+                return result
+            except Exception as e2:
+                log.warning("stt_fallback_failed", error=type(e2).__name__)
+        raise
 
 
 async def run_voice_service() -> None:
@@ -250,6 +279,7 @@ async def run_voice_service() -> None:
         if flushed:
             log.info("buffer_flushed", room=room.friendly_name, bytes=flushed)
 
+    _startup_time = time.monotonic()
     # LED control helper
     def _set_led(room_id: str, color: str) -> None:
         topic = "%s/voice/%s/led" % (settings.mqtt.base_topic, room_id)
@@ -275,7 +305,9 @@ async def run_voice_service() -> None:
                 return
 
             wav = _pcm_to_wav(audio_pcm)
-            text = await _transcribe_groq(wav, api_key=stt_api_key, model=stt_model, language=stt_language)
+            fallback_key = settings.llm_fallback.api_key if settings.llm_fallback.enabled else ""
+            text = await _transcribe_with_fallback(wav, stt_api_key=stt_api_key, stt_model=stt_model,
+                                                    stt_language=stt_language, fallback_api_key=fallback_key, log=log)
             if text:
                 # Filter known Whisper hallucinations
                 if text.lower().rstrip(".!?,") in _WHISPER_HALLUCINATIONS:
@@ -298,9 +330,12 @@ async def run_voice_service() -> None:
             reporter.report_error("stt_failed", e)
             _set_led(room.room_id, "error")
             await asyncio.sleep(2.0)
+            room.last_wake_time = time.monotonic() + 3.0  # extra cooldown after failure
         finally:
             room.raw_buffer.clear()
             room.pre_wake_frames.clear()
+            if hasattr(room, 'oww_buffer'):
+                room.oww_buffer.clear()
             room.state = RoomState.LISTENING
             _set_led(room.room_id, "listening")
 
@@ -331,22 +366,7 @@ async def run_voice_service() -> None:
                     if result >= 0:
                         detected = True
                         log.info("wake_detected", room=room.friendly_name, engine="porcupine")
-                if not detected and room.oww_model is not None:
-                    # OWW needs 1280-sample frames; accumulate from 512-sample Porcupine frames
-                    room.oww_buffer.extend(frame_bytes)
-                    if len(room.oww_buffer) >= 2560:  # 1280 samples * 2 bytes
-                        oww_frame = np.frombuffer(bytes(room.oww_buffer[:2560]), dtype=np.int16)
-                        room.oww_buffer = room.oww_buffer[2560:]
-                        if now - room.last_model_reset > 900:
-                            room.oww_model.reset()
-                            room.last_model_reset = now
-                        pred = room.oww_model.predict(oww_frame)
-                        for model_name, score in pred.items():
-                            if score >= wake_threshold:
-                                detected = True
-                                log.info("wake_detected", room=room.friendly_name,
-                                         engine="openwakeword", score=round(score, 3))
-                                break
+                # openWakeWord disabled — too many false triggers on Sonos playback
 
                 if detected:
                     room.state = RoomState.CAPTURING
@@ -400,10 +420,14 @@ async def run_voice_service() -> None:
                 if len(room.raw_buffer) >= WW_FRAME_BYTES:
                     result = _process_room_audio(room)
                     if result is not None:
-                        room.state = RoomState.PROCESSING
-                        # Play acknowledgment immediately
+                        # Go DEAF immediately to prevent re-triggering on ack playback
+                        room.state = RoomState.DEAF
+                        room.raw_buffer.clear()
+                        room.oww_buffer.clear()
+                        room.pre_wake_frames.clear()
+                        # Play acknowledgment
                         speakers = settings.voice_room_speakers_parsed.get(room.room_id)
-                        if speakers:
+                        if speakers and speakers != ["none"]:
                             from home_agent.bus.envelope import make_event as _mke
                             ack_evt = _mke(source="voice-service", typ="announce.request",
                                 data={"text": "One moment.", "offline_audio_key": "voice_ack", "targets": speakers})
@@ -447,7 +471,7 @@ async def run_voice_service() -> None:
                         evt = msg.json()
                         evt_type = evt.get("type", "")
                         evt_data = evt.get("data", {})
-                        if evt_type == "sonos.playback_start":
+                        if evt_type == "sonos.playback_start" and (time.monotonic() - _startup_time) > 5.0:
                             pb_targets = evt_data.get("targets", [])
                             room_speakers = settings.voice_room_speakers_parsed
                             for room in rooms.values():

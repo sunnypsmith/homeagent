@@ -431,7 +431,10 @@ async def run_sonos_gateway() -> None:
                     except Exception:
                         pass
                 if not played_fallback:
-                    active_players.add(player2)
+                    try:
+                        active_players.add(player2)
+                    except UnboundLocalError:
+                        pass
                     err_total += 1
                     last_err_at = loop.time()
                     last_err_kind = "announce_failed"
