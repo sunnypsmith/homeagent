@@ -72,11 +72,13 @@ def register_all(
             c = await wc.current()
             parts = []
             if c.temperature is not None:
-                parts.append("temperature is %d degrees" % int(round(c.temperature)))
+                parts.append("temperature is %d degrees Fahrenheit" % int(round(c.temperature)))
             if c.description:
                 parts.append(c.description.lower())
             if c.wind_speed is not None:
-                parts.append("wind %d %s" % (int(round(c.wind_speed)), c.wind_unit))
+                wu = (c.wind_unit or "").strip().lower()
+                spoken_unit = "miles per hour" if wu in ("mph", "mi/h") else c.wind_unit
+                parts.append("wind %d %s" % (int(round(c.wind_speed)), spoken_unit))
             return "Currently: %s." % ", ".join(parts) if parts else "Weather data unavailable."
 
         async def _query_weather_forecast() -> str:
@@ -94,9 +96,11 @@ def register_all(
                 parts.append("winds up to %d miles per hour" % int(round(fc.wind_speed_max)))
             return "Today's forecast: %s." % ", ".join(parts) if parts else "Forecast unavailable."
 
-        ctx.register_query("weather_current", "Current weather conditions", _query_weather_current,
-                            context_fn=lambda: "Weather: %s provider at %s/%s" % (settings.weather.provider, settings.weather.latitude, settings.weather.longitude))
-        ctx.register_query("weather_forecast", "Weather forecast for today", _query_weather_forecast)
+        ctx.register_query("weather_current",
+                            "Current outdoor weather at the home (temperature, conditions, wind)",
+                            _query_weather_current,
+                            context_fn=lambda: "Weather: use weather_current for outside temperature/conditions, weather_forecast for today's forecast")
+        ctx.register_query("weather_forecast", "Today's weather forecast (high, low, precipitation, wind)", _query_weather_forecast)
 
     # --- UPS ---
     if settings.ups.enabled:

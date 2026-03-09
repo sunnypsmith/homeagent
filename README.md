@@ -23,7 +23,7 @@ Event-driven home automation / “house agent” stack in Python.
 - **Sunset scene (optional)**: trigger a Caséta scene at local sunset
 - **Home checks (optional)**: scheduled health checks (e.g., Temp Stick thresholds)
 - **Executive briefing (optional)**: M-F briefing with weather, calendar, financial summary (SimpleFIN), dashboard metrics, and configurable news feeds
-- **Voice assistant (optional)**: M5Stack Atom Echo devices stream UDP audio to a voice service (Porcupine or openWakeWord wake detection, WebRTC VAD, Groq Whisper STT) which publishes commands to a voice-intent agent (LLM tool-calling for actions + Sonos spoken responses)
+- **Voice assistant (optional)**: M5Stack Atom Echo devices stream UDP audio to a voice service (Porcupine wake detection, WebRTC VAD, audio processing pipeline with noise reduction + normalization + silence trimming, Groq Whisper STT) which publishes commands to a voice-intent agent (LLM tool-calling for actions + Sonos spoken responses)
 - **NWS weather provider (optional)**: National Weather Service API as an alternative to Open-Meteo (no API key, US-only, built-in response caching)
 - **LLM fallback**: automatic failover to a secondary LLM provider when the primary is down (`LLM_FALLBACK_*` config)
 - **Status dashboard**: real-time `/status` page on the UI gateway showing service health, MQTT activity, DB events, voice room status, recent commands, and errors
@@ -89,7 +89,7 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent hourly-house-check-agent`: scheduled checks (e.g., Temp Stick thresholds)
 - `home-agent exec-briefing-agent`: daily executive briefing (weather + calendar + financial)
 - `home-agent watchdog`: monitors all services via heartbeats/errors, announces failures, restarts crashed processes
-- `home-agent voice-service`: UDP audio receiver (Atom Echo) → Porcupine/openWakeWord → VAD → Groq Whisper STT → MQTT `voice.command`
+- `home-agent voice-service`: UDP audio receiver (Atom Echo) → Porcupine → VAD → noise reduction + normalization → Groq Whisper STT → MQTT `voice.command`
 - `home-agent voice-intent-agent`: voice commands → LLM tool-calling → actions + Sonos spoken responses
 - `home-agent monitor`: terminal dashboard (rich TUI) for MQTT activity and service status
 
@@ -202,9 +202,11 @@ WATCHDOG_TMUX_MAP=sonos-gateway:homeagent:0.1,camect-agent:homeagent:2.0,time-tr
 
 Hands-free voice control via M5Stack Atom Echo devices running custom ESPHome firmware.
 The Atom Echos stream 16 kHz PCM audio over UDP to the voice service, which runs
-openWakeWord wake-word detection, WebRTC VAD, and Groq Whisper STT. Transcribed commands
-are published to MQTT and processed by the voice-intent agent (LLM with tool calling).
-Responses are spoken back on the nearest Sonos speaker.
+Porcupine wake-word detection, WebRTC VAD, and an audio processing pipeline
+(noise reduction, silence trimming, peak normalization) before Groq Whisper STT.
+Transcribed commands are published to MQTT and processed by the voice-intent agent
+(LLM with tool calling). Responses are normalized for TTS (abbreviation expansion,
+number spelling) and spoken back on the nearest Sonos speaker.
 
 ```bash
 # Voice service config
@@ -212,16 +214,10 @@ VOICE_UDP_PORT=9100
 VOICE_ROOMS=office=offi,kitchen=ktch
 VOICE_ROOM_SPEAKERS=offi:office,ktch:kitchen_dining
 
-# Wake word — Porcupine (recommended)
-VOICE_WAKE_ENGINE=porcupine
+# Wake word (Porcupine)
 VOICE_PORCUPINE_KEY=YOUR_PICOVOICE_KEY
 VOICE_PORCUPINE_MODEL=models/Master-Higgins_en_linux_v4_0_0.ppn
 VOICE_WAKE_COOLDOWN=2.0
-
-# Wake word — openWakeWord (alternative)
-# VOICE_WAKE_ENGINE=openwakeword
-# VOICE_WAKE_MODEL=models/master_higgins.onnx
-# VOICE_WAKE_THRESHOLD=0.5
 
 # STT
 VOICE_STT_PROVIDER=groq

@@ -41,7 +41,7 @@ class AnthropicClient:
         system: str,
         user: str,
         max_tokens: int = 1024,
-        temperature: Optional[float] = None,
+        temperature: Optional[float] = 0.3,
     ) -> str:
         """Simple chat without tools. Returns text."""
         kwargs: Dict[str, Any] = {
@@ -66,7 +66,7 @@ class AnthropicClient:
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         max_tokens: int = 1024,
-        temperature: Optional[float] = None,
+        temperature: Optional[float] = 0.3,
     ) -> "LLMToolCall | LLMTextResponse | List[LLMToolCall]":
         """Chat with tool calling. Returns LLMToolCall(s) or LLMTextResponse.
 

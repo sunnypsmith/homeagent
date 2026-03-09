@@ -46,6 +46,11 @@ run() {
   printf "export PYTHONDONTWRITEBYTECODE=1; cd /workspace && %s 2>&1 | sed -u 's/^/[%s] /'\n" "$*" "$tag"
 }
 
+# NFS cache bust: force attribute revalidation for all Python sources
+# and remove any leaked __pycache__ dirs (belt-and-suspenders for actimeo=0)
+find /workspace/src -name '*.py' -exec stat {} + > /dev/null 2>&1 || true
+find /workspace -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
 tmux new-session -d -s "$SESSION" -n core
 tmux set-environment -t "$SESSION" PYTHONDONTWRITEBYTECODE 1
 tmux set-option -g -t "$SESSION" pane-border-status top

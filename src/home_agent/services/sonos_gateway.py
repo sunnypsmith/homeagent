@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import httpx
 from zoneinfo import ZoneInfo
 
 from home_agent.bus.envelope import make_event
@@ -17,6 +18,54 @@ from home_agent.integrations.audio_host import AudioHost
 from home_agent.integrations.sonos_playback import SonosPlayback
 from home_agent.integrations.tts_elevenlabs import ElevenLabsTTSClient
 from home_agent.offline_audio import OFFLINE_AUDIO_ITEMS
+
+
+_TTS_NORMALIZE_PROMPT = (
+    "You prepare text for a text-to-speech engine. Rewrite the input so it "
+    "sounds natural when spoken aloud.\n\n"
+    "Rules:\n"
+    "- Expand ALL abbreviations: mph → miles per hour, F → Fahrenheit, "
+    "NW → northwest, ft → feet, lbs → pounds, hrs → hours, min → minutes, "
+    "govt → government, etc.\n"
+    "- Spell out numbers as words: 42 → forty two, 3 → three.\n"
+    "- Spell out times: 2:45 PM → two forty five P M.\n"
+    "- Spell out currency: $1,500 → fifteen hundred dollars.\n"
+    "- Spell out percentages: 22% → twenty two percent.\n"
+    "- Fix broken punctuation or grammar only if obviously wrong.\n"
+    "- Do NOT add, remove, or rephrase content. Keep the meaning identical.\n"
+    "- Output ONLY the rewritten text, nothing else."
+)
+
+
+async def _normalize_for_tts(
+    text: str, *, base_url: str, api_key: str, model: str, log,
+) -> str:
+    """Run text through a fast LLM to expand abbreviations and fix formatting."""
+    if not api_key or not text.strip():
+        return text
+    try:
+        headers = {"Authorization": "Bearer %s" % api_key, "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "max_tokens": 1024,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": _TTS_NORMALIZE_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        }
+        url = "%s/chat/completions" % base_url.rstrip("/")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        result = (data["choices"][0]["message"]["content"] or "").strip()
+        if result and len(result) > 10:
+            log.info("tts_normalized", original_len=len(text), result_len=len(result))
+            return result
+    except Exception as e:
+        log.warning("tts_normalize_failed", error=type(e).__name__)
+    return text
 
 
 def _parse_hhmm(s: str) -> int:
@@ -350,6 +399,13 @@ async def run_sonos_gateway() -> None:
                     play_targets = list(resolved)
 
             log.info("announce_request", id=event_id, trace_id=trace_id, source=source)
+
+            # Normalize text for TTS (expand abbreviations, spell out numbers)
+            if not offline_key and settings.llm.api_key:
+                text = await _normalize_for_tts(
+                    text, base_url=settings.llm.base_url,
+                    api_key=settings.llm.api_key, model=settings.llm.model, log=log)
+
             # Notify voice service that speakers are about to play
             _pb_targets = data_targets if isinstance(data_targets, list) else list(settings.sonos.speaker_alias_map.keys())
             _pb_start = make_event(source="sonos-gateway", typ="sonos.playback_start", data={"targets": _pb_targets})

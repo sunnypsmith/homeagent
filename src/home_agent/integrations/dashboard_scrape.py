@@ -82,6 +82,7 @@ class DashboardScraper:
         payload = {
             "model": self._vision_model,
             "max_tokens": 256,
+            "temperature": 0.0,
             "messages": [
                 {
                     "role": "user",

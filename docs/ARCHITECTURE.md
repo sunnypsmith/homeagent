@@ -22,7 +22,7 @@ All messages on MQTT use the same JSON envelope:
 - **`event-recorder`**: subscribes to MQTT topics and records all events to TimescaleDB (`events` table)
 - **`ui-gateway`** (optional): LAN web UI with controls (`/`) and a real-time system status dashboard (`/status`) showing service health, MQTT activity, DB events, voice room status, recent voice commands, and errors
 - **`watchdog`**: monitors all services via heartbeats and error events, announces failures, and attempts restarts via tmux (`WATCHDOG_TMUX_MAP`)
-- **`voice-service`** (optional): receives UDP audio from M5Stack Atom Echo devices, runs wake-word detection (Porcupine or openWakeWord), WebRTC VAD, and Groq Whisper STT; publishes `voice.command` events to MQTT
+- **`voice-service`** (optional): receives UDP audio from M5Stack Atom Echo devices, runs Porcupine wake-word detection, WebRTC VAD, and an audio processing pipeline (noise reduction, silence trimming, peak normalization) before Groq Whisper STT; publishes `voice.command` events to MQTT. Goes "deaf" during Sonos playback to prevent feedback loops.
 - **`voice-intent-agent`** (optional): subscribes to `voice.command`, uses LLM with tool calling to classify commands vs questions, dispatches actions via MQTT, and speaks responses through the room's Sonos speaker
 
 ### Agents (examples)
@@ -38,8 +38,8 @@ All messages on MQTT use the same JSON envelope:
 
 ### Voice pipeline
 The voice system is split into two services:
-1. **`voice-service`**: runs one wake-word engine instance per room (Porcupine or openWakeWord, configured via `VOICE_WAKE_ENGINE`), each fed 16 kHz PCM frames from an Atom Echo over UDP. On wake detection, it captures speech (WebRTC VAD), transcribes via Groq Whisper STT, and publishes `voice.command` to MQTT.
-2. **`voice-intent-agent`**: receives `voice.command`, builds an LLM prompt with tool definitions (announce, mute, lights, scenes, briefings, household commands, time/weather), and either executes a tool call or responds conversationally. Responses are targeted to the room's Sonos speaker via `VOICE_ROOM_SPEAKERS`.
+1. **`voice-service`**: runs one Porcupine wake-word engine instance per room, each fed 16 kHz PCM frames from an Atom Echo over UDP. On wake detection, it plays a prompt ("How may I assist you?"), captures speech (WebRTC VAD with a 1-second pre-capture buffer to avoid clipping the first word), processes the audio (noise reduction via spectral gating, silence trimming, peak normalization to ~80% of int16 range), transcribes via Groq Whisper STT, and publishes `voice.command` to MQTT.
+2. **`voice-intent-agent`**: receives `voice.command`, builds an LLM prompt with tool definitions (announce, mute, lights, scenes, briefings, household commands, time/weather), and either executes a tool call or responds conversationally. For general knowledge questions, Perplexity is used as a web-search fallback (skipped for queries that match local tools). Responses are targeted to the room's Sonos speaker via `VOICE_ROOM_SPEAKERS`.
 
 Feedback suppression: when the Sonos gateway starts playback it publishes `sonos.playback_start`; the voice service goes "deaf" (drops audio buffers) until `sonos.playback_done` arrives, preventing the mic from picking up its own announcements.
 
@@ -89,6 +89,7 @@ Pluggable unit of behavior. A module's `start(ctx)` typically:
 ### Sonos
 Sonos output is handled by the dedicated `sonos-gateway` service:
 - subscribes to `homeagent/announce/request`
+- normalizes text for TTS via a fast LLM pass (expands abbreviations like mph → miles per hour, spells out numbers, fixes punctuation)
 - generates TTS audio (ElevenLabs)
 - hosts the audio over HTTP on the LAN
 - plays it on Sonos (SoCo), batching successive announcements before restoring the previous state
@@ -128,4 +129,4 @@ Camera integration is handled by the `camect-agent` service:
 `integrations/simplefin.py` fetches account balances via SimpleFIN API (read-only financial data).
 
 ### Voice STT
-The voice service uses Groq's Whisper API (`whisper-large-v3`) for speech-to-text. Audio is converted from raw PCM to WAV before upload. Known Whisper hallucination phrases (e.g. "thank you", "thanks for watching") are filtered out.
+The voice service uses Groq's Whisper API (`whisper-large-v3`) for speech-to-text. Before transcription, captured audio goes through a processing pipeline: noise reduction (spectral gating via `noisereduce`), leading/trailing silence trimming, and peak normalization to ~80% of int16 range. This dramatically improves STT accuracy for rooms with background noise or distant microphones. Audio is then converted from raw PCM to WAV before upload. Known Whisper hallucination phrases (e.g. "thank you", "thanks for watching") are filtered out.

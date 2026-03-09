@@ -33,7 +33,7 @@ from home_agent.services.voice_registrations import (
 # System prompt
 # ------------------------------------------------------------------
 
-_BASE_SYSTEM_PROMPT = """You are Higgins, a helpful home assistant for the Smith family. You manage a smart home.
+_BASE_SYSTEM_PROMPT = """You are Higgins, a helpful home assistant for the Smith family. You manage a smart home located in Lynchburg, Virginia.
 
 RULES:
 - When the user gives a COMMAND, use the appropriate tool. Do NOT respond with text after a tool call.
@@ -48,6 +48,7 @@ Format ALL output for spoken text-to-speech audio:
 - Spell out dates: 'March 3rd' not 'March 3'.
 - Spell out currency: '$1,500' becomes 'fifteen hundred dollars'.
 - Spell out percentages: '22%' becomes 'twenty two percent'.
+- Expand ALL abbreviations and units to spoken words: 'mph' becomes 'miles per hour', 'F' becomes 'Fahrenheit', 'ft' becomes 'feet', 'lbs' becomes 'pounds', 'min' becomes 'minutes', 'hrs' becomes 'hours', 'NW' becomes 'northwest', etc.
 - No URLs, no markdown, no bullet points, no special characters.
 - Use short, natural sentences.
 
@@ -350,7 +351,8 @@ async def run_voice_intent_agent() -> None:
             msg = await mqttc.next_message()
             try:
                 payload = msg.json()
-            except Exception:
+            except Exception as e:
+                log.warning("mqtt_payload_decode_failed", topic=msg.topic, error=str(e)[:100])
                 continue
 
             typ = payload.get("type", "")
@@ -382,8 +384,10 @@ async def run_voice_intent_agent() -> None:
             text = str(data.get("text") or "").strip()
             room_id = str(data.get("room_id") or "")
             room_name = str(data.get("room_name") or room_id)
+            log.info("voice_command_received", room_id=room_id, room_name=room_name, text=text[:80] if text else "")
 
             if not text:
+                log.warning("voice_command_skipped", reason="empty_text", room_id=room_id)
                 continue
 
             speakers = _speakers_for_room(room_id)
@@ -544,12 +548,18 @@ async def run_voice_intent_agent() -> None:
 
                 elif isinstance(result, LLMTextResponse):
                     answer = result.text
-                    # If the fast model gave a generic answer and we have Perplexity,
-                    # try to get a better web-searched answer
-                    if answer and perplexity_llm:
+                    # If the fast model gave a text response and we have Perplexity,
+                    # try to get a better web-searched answer — but only for general
+                    # knowledge questions, not queries our local tools can handle.
+                    _local_keywords = {"weather", "temperature", "forecast", "wind",
+                                       "light", "lights", "scene", "camera", "sensor",
+                                       "humidity", "ups", "battery", "briefing", "mute"}
+                    _text_lower = text.lower()
+                    _skip_perplexity = any(kw in _text_lower for kw in _local_keywords)
+                    if answer and perplexity_llm and not _skip_perplexity:
                         try:
                             pplx_answer = await perplexity_llm.chat(
-                                system="You are a helpful assistant. Answer concisely in one to three sentences. Format for spoken audio: spell out numbers, no URLs, no markdown.",
+                                system="You are a helpful assistant for a family in Lynchburg, Virginia. Answer concisely in one to three sentences. Format for spoken audio: spell out numbers, no URLs, no markdown.",
                                 user=text,
                                 max_tokens=256,
                                 temperature=0.2,

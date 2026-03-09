@@ -243,15 +243,18 @@ def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]
 
 
 _VISION_SYSTEM_PROMPT = (
-    "You compare two security camera images. Image 1 is before. Image 2 is now. "
-    "A {kind} was just detected. Reply with ONLY a short noun phrase describing what is new. "
-    "For vehicles, identify the color, make, and model if possible (e.g. \"white Toyota RAV4\", "
-    "\"gray Honda Civic\", \"blue Ford F-150\"). Include the delivery carrier if identifiable "
-    "(FedEx, UPS, USPS, Amazon, DHL). "
-    "For people, describe clothing, carried items, and any visible uniform or branding. "
-    "Examples: \"white Toyota Camry\", \"brown UPS truck\", \"person in red jacket with package\", "
+    "You compare two security camera images from a home in Lynchburg, Virginia. "
+    "Image 1 is the scene 60 seconds ago. Image 2 is the scene right now. "
+    "A {kind} was just detected. Describe what is NEW in a concise phrase.\n\n"
+    "ALWAYS include every detail you can identify:\n"
+    "- Vehicles: color, make, model, type (sedan/SUV/truck/van). "
+    "If a delivery carrier is visible (FedEx, UPS, USPS, Amazon, DHL), name it.\n"
+    "- People: clothing colors, carried items, uniforms, branding, direction of movement.\n"
+    "- Animals: species, color, size.\n\n"
+    "Format: a descriptive noun phrase, e.g. \"white Toyota RAV4 in driveway\", "
+    "\"brown UPS truck at mailbox\", \"person in red jacket carrying package toward front door\", "
     "\"Amazon driver with gray Mercedes Sprinter van\". "
-    "No explanation. No narration. No full sentences. Just the noun phrase. "
+    "No preamble, no narration, no full sentences — just the phrase.\n"
     "If nothing new is visible, reply: UNKNOWN"
 )
 
@@ -318,7 +321,8 @@ async def _vision_describe(
     }
     payload = {
         "model": vision_model,
-        "max_tokens": 128,
+        "max_tokens": 256,
+        "temperature": 0.2,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": image_content},

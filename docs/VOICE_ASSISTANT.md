@@ -7,13 +7,15 @@ The voice assistant provides hands-free voice control via M5Stack Atom Echo devi
 ```
 Atom Echo mics (ESPHome, UDP PCM)
   → voice-service (UDP listener)
-    → Wake word detection (Porcupine or openWakeWord)
-      → WebRTC VAD (speech capture)
-        → STT (Groq Whisper)
-          → MQTT voice.command
-            → voice-intent-agent (LLM with tool calling)
-              → Actions (announce, lights, scenes, etc.)
-                → Sonos spoken response
+    → Wake word detection (Porcupine)
+      → Prompt ("How may I assist you?" on Sonos)
+        → WebRTC VAD (speech capture with 1s pre-buffer)
+          → Audio processing (noise reduction → silence trim → peak normalize)
+            → STT (Groq Whisper)
+              → MQTT voice.command
+                → voice-intent-agent (LLM with tool calling)
+                  → TTS text normalization (LLM expands abbreviations)
+                    → Sonos spoken response
 ```
 
 Two services work together:
@@ -93,11 +95,8 @@ All config is set via environment variables in `.env`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VOICE_WAKE_ENGINE` | `openwakeword` | Wake word engine: `porcupine` or `openwakeword` |
-| `VOICE_PORCUPINE_KEY` | — | Picovoice access key (required when engine=porcupine) |
+| `VOICE_PORCUPINE_KEY` | — | Picovoice access key (required) |
 | `VOICE_PORCUPINE_MODEL` | — | Path to `.ppn` keyword model file |
-| `VOICE_WAKE_MODEL` | — | Path to openWakeWord `.onnx` model file (used when engine=openwakeword) |
-| `VOICE_WAKE_THRESHOLD` | `0.5` | openWakeWord detection threshold (0.0–1.0) |
 | `VOICE_WAKE_COOLDOWN` | `2.0` | Seconds to ignore wake word after a detection (prevents double-triggers) |
 
 ### VAD settings
@@ -124,8 +123,10 @@ The voice-intent-agent subscribes to `voice.command` MQTT events and uses an LLM
 
 - Uses the primary LLM provider (with fallback if configured via `LLM_FALLBACK_*`)
 - System prompt instructs the LLM to distinguish commands (use tools) from questions (answer conversationally)
-- All LLM text output is formatted for spoken TTS (spelled-out numbers, no markdown, no URLs)
+- All LLM text output is formatted for spoken TTS (spelled-out numbers, expanded abbreviations, no markdown, no URLs)
+- For general knowledge questions, Perplexity is used as a web-search fallback (skipped for queries about weather, lights, sensors, and other local data)
 - Responses are targeted to the room's Sonos speaker via `VOICE_ROOM_SPEAKERS` mapping
+- Before TTS synthesis, the sonos-gateway runs a fast LLM normalization pass to expand any remaining abbreviations (mph → miles per hour, F → Fahrenheit, etc.) and spell out numbers
 
 ### Available tools
 
@@ -176,20 +177,33 @@ To provide immediate feedback while the LLM processes a command, the system uses
 
 | Key | Text | Purpose |
 |-----|------|---------|
+| `voice_prompt` | "How may I assist you?" | Wake word response prompt |
 | `voice_ack` | "One moment." | Primary acknowledgment |
 | `voice_ack_2` | "Let me check." | Alternate acknowledgment |
 | `voice_ack_3` | "Working on it." | Alternate acknowledgment |
+| `voice_reasoning` | "Let me think about that." | Reasoning escalation acknowledgment |
+| `voice_cancelled` | "Never mind. Cancelled." | Pending action cancelled |
 | `voice_error` | "I'm sorry, I had trouble with that request." | Error feedback |
 
 These are generated ahead of time via `python scripts/generate_offline_audio.py` using ElevenLabs TTS settings from `.env`, and stored in `OFFLINE_AUDIO_DIR` (default: `assets/offline`).
 
-## Pre-wake Buffer
+## Pre-capture Buffer
 
-The voice service maintains a rolling buffer of the last ~500ms of audio per room (approximately 6 wake-word frames). When a wake word is detected, this pre-wake audio is prepended to the command buffer to capture speech that started slightly before the wake word trigger.
+After the prompt plays, the voice service keeps the last 1 second of audio in the buffer before starting capture. This prevents the first word of the user's command from being clipped if they start talking during or right after the prompt.
+
+## Audio Processing Pipeline
+
+Before sending captured audio to Whisper STT, the voice service runs three processing steps:
+
+1. **Noise reduction** — spectral gating (`noisereduce` library, stationary mode) strips out background noise (HVAC, fans, hum) while preserving speech. ~46ms for 5 seconds of audio.
+2. **Silence trimming** — leading and trailing silence is removed based on frame energy analysis (30ms frames, energy threshold 30, with 150ms padding on each side). Reduces wasted audio sent to Whisper.
+3. **Peak normalization** — scales the audio so the loudest sample reaches ~80% of the int16 range. This dramatically improves STT accuracy for rooms with distant microphones or quiet speech.
+
+Diagnostic logging (`audio_processed`) reports raw vs. final RMS, duration, and trimmed seconds for every command.
 
 ## Whisper Hallucination Filtering
 
-Groq Whisper sometimes returns hallucinated text on silence or noise. The voice service filters out known hallucination phrases including: "thank you", "thanks for watching", "thanks for listening", "please subscribe", "see you next time", "bye", etc.
+Groq Whisper sometimes returns hallucinated text on silence or noise. The voice service filters out known hallucination phrases including: "thank you", "thanks for watching", "thanks for listening", "please subscribe", "see you next time", "bye", "how may i assist you", etc.
 
 Additionally, audio with very low RMS energy (< 50) is skipped as a likely false wake.
 
@@ -203,13 +217,8 @@ Additionally, audio with very low RMS energy (< 50) is skipped as a likely false
 - For Porcupine: verify your `VOICE_PORCUPINE_KEY` is valid
 - Ensure `VOICE_WAKE_COOLDOWN` isn't too high (default 2s)
 
-### Model drift / reset (openWakeWord)
-
-openWakeWord models are stateful and can drift over time, leading to missed detections. The voice service periodically resets model state to mitigate this. If detection degrades, restarting the voice service clears all model state.
-
 ### False triggers
 
-- Increase `VOICE_WAKE_THRESHOLD` (for openWakeWord) to require higher confidence
 - Increase `VOICE_WAKE_COOLDOWN` to add a longer refractory period after each detection
 - Check if Sonos playback is causing triggers — the DEAF state should prevent this, but verify `sonos.playback_start`/`sonos.playback_done` events are flowing
 - The RMS energy check (threshold 50) filters out very quiet false wakes
@@ -218,6 +227,15 @@ openWakeWord models are stateful and can drift over time, leading to missed dete
 
 - Verify `VOICE_STT_API_KEY` is set and valid
 - Check audio duration: very short captures (< 0.5s) often produce poor results
+- The hallucination filter catches common Whisper artifacts, but unusual noise may still produce nonsensical transcriptions
+
+### No Sonos response after command
+
+- Verify `VOICE_ROOM_SPEAKERS` maps the room ID to a valid Sonos speaker alias
+- Check that `sonos-gateway` is running and processing `announce.request` events
+- Verify quiet hours are not suppressing the response
+ocessed` log: if `raw_rms` is very low (under 200), the mic is too far away or the room is too noisy for usable capture
+- The noise reduction and normalization pipeline helps significantly, but audio with RMS below 50 is rejected entirely
 - The hallucination filter catches common Whisper artifacts, but unusual noise may still produce nonsensical transcriptions
 
 ### No Sonos response after command

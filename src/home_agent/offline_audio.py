@@ -37,7 +37,7 @@ OFFLINE_AUDIO_ITEMS: List[OfflineAudioItem] = [
     {
         "key": "voice_prompt",
         "filename": "voice_prompt.wav",
-        "text": "How may I serve you?",
+        "text": "How may I assist you?",
     },
     {
         "key": "voice_ack",

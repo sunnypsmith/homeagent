@@ -14,7 +14,8 @@ class DailyBriefing(Module):
             # Replace with real inputs: calendar, weather, tasks, commutes, etc.
             prompt = "Give a concise morning briefing for a household in 4 bullet points."
             try:
-                text = await ctx.llm.chat(system="You are a helpful home assistant.", user=prompt)
+                text = await ctx.llm.chat(system="You are a helpful home assistant.", user=prompt,
+                                         max_tokens=512, temperature=0.4)
             except Exception:
                 log.exception("briefing_llm_failed")
                 return

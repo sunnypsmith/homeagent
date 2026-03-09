@@ -68,8 +68,8 @@ class LLMClient:
         *,
         system: str,
         user: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = 1024,
+        temperature: Optional[float] = 0.3,
     ) -> str:
         if not self._api_key:
             raise RuntimeError("LLM_API_KEY is not set")
@@ -100,8 +100,8 @@ class LLMClient:
         *,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = 1024,
+        temperature: Optional[float] = 0.3,
     ) -> "LLMToolCall | LLMTextResponse":
         """Chat completions with OpenAI-compatible function/tool calling.
 
