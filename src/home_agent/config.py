@@ -764,6 +764,7 @@ class CamectSettings(BaseSettings):
     )
 
     enabled: bool = Field(default=False, alias="CAMECT_ENABLED")
+    hub_label: str = Field(default="", alias="CAMECT_HUB_LABEL")
     host: str = Field(default="", alias="CAMECT_HOST")  # e.g. 10.1.2.150:443
     username: str = Field(default="", alias="CAMECT_USERNAME")
     password: Optional[str] = Field(default=None, alias="CAMECT_PASSWORD")
@@ -789,6 +790,7 @@ class CamectSettings(BaseSettings):
     vision_timeout_seconds: float = Field(default=10.0, alias="CAMECT_VISION_TIMEOUT_SECONDS")
 
     @field_validator(
+        "hub_label",
         "host",
         "username",
         "camera_names",

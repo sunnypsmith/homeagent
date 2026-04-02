@@ -14,7 +14,8 @@ Layout:
   Window 1: agents     — wakeup, morning-briefing, hourly-chime, fixed-announcements
   Window 2: integr     — camect, caseta, camera-lighting, monitor
   Window 3: briefings  — hourly-house-check, exec-briefing, ui-gateway, voice-service
-  Window 4: shell      — free shell for ad-hoc commands
+  Window 4: voice      — voice-intent, camect-cr (Costa Rica), voice-logs
+  Window 5: shell      — free shell for ad-hoc commands
 
 Environment:
   HOMEAGENT_TMUX_SESSION  Session name (default: homeagent)
@@ -123,14 +124,18 @@ tmux send-keys -t "$SESSION:3.1" "$(run exec-briefing       'home-agent exec-bri
 tmux send-keys -t "$SESSION:3.2" "$(run ui-gateway          'home-agent ui-gateway')" C-m
 tmux send-keys -t "$SESSION:3.3" "$(run voice               'home-agent voice-service')" C-m
 
-# ── Window 4: voice + intent (2 panes) ────────────────────────────
+# ── Window 4: voice + intent + camect-cr (3 panes) ───────────────
 tmux new-window -t "$SESSION:4" -n voice
 tmux split-window -v -t "$SESSION:4"
+tmux split-window -v -t "$SESSION:4.0"
+tmux select-layout -t "$SESSION:4" even-vertical
 tmux select-pane -t "$SESSION:4.0" -T "voice-intent"
-tmux select-pane -t "$SESSION:4.1" -T "voice-logs"
+tmux select-pane -t "$SESSION:4.1" -T "camect-cr"
+tmux select-pane -t "$SESSION:4.2" -T "voice-logs"
 
 tmux send-keys -t "$SESSION:4.0" "$(run voice-intent 'home-agent voice-intent-agent')" C-m
-tmux send-keys -t "$SESSION:4.1" "cd /workspace" C-m
+tmux send-keys -t "$SESSION:4.1" "$(run camect-cr    'home-agent camect-agent --instance 2')" C-m
+tmux send-keys -t "$SESSION:4.2" "cd /workspace" C-m
 
 # ── Window 5: shell ───────────────────────────────────────────────
 tmux new-window -t "$SESSION:5" -n shell

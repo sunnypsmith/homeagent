@@ -110,18 +110,18 @@ class NWSClient:
         props = (await self._fetch_json(url)).get("properties", {})
 
         temp_c = _val(props, "temperature")
-        wind_ms = _val(props, "windSpeed")
-        gust_ms = _val(props, "windGust")
+        wind_kmh = _val(props, "windSpeed")
+        gust_kmh = _val(props, "windGust")
         humidity = _val(props, "relativeHumidity")
         desc = str(props.get("textDescription") or "")
 
         if self._units == "imperial":
             temp = _c_to_f(temp_c) if temp_c is not None else None
-            wind = _ms_to_mph(wind_ms) if wind_ms is not None else None
-            gusts = _ms_to_mph(gust_ms) if gust_ms is not None else None
+            wind = _kmh_to_mph(wind_kmh) if wind_kmh is not None else None
+            gusts = _kmh_to_mph(gust_kmh) if gust_kmh is not None else None
             t_unit, w_unit = "F", "mph"
         else:
-            temp, wind, gusts = temp_c, wind_ms, gust_ms
+            temp, wind, gusts = temp_c, wind_kmh, gust_kmh
             t_unit, w_unit = "C", "m/s"
 
         result = NWSCurrentWeather(
@@ -213,5 +213,5 @@ def _c_to_f(c: float) -> float:
     return c * 9.0 / 5.0 + 32.0
 
 
-def _ms_to_mph(ms: float) -> float:
-    return ms * 2.237
+def _kmh_to_mph(kmh: float) -> float:
+    return kmh / 1.609344

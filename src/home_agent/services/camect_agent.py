@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import base64
@@ -362,35 +363,68 @@ def _build_camera_map(cameras: List[Dict[str, Any]]) -> CameraMap:
     return CameraMap(id_to_name=id_to_name, name_to_id=name_to_id)
 
 
-async def run_camect_agent() -> None:
+def _load_camect_settings(prefix: str = "CAMECT"):
+    """Load CamectSettings from env vars with a custom prefix (e.g., CAMECT2)."""
+    import os
+    from home_agent.config import CamectSettings
+
+    if prefix == "CAMECT":
+        return AppSettings().camect
+
+    # Read .env file + actual env vars (actual env takes precedence)
+    env_vals: Dict[str, str] = {}
+    env_path = Path(__file__).resolve().parents[3] / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            env_vals[k.strip()] = v.strip().strip('"').strip("'")
+    env_vals.update(os.environ)
+
+    fields = {}
+    for field_name, field_info in CamectSettings.model_fields.items():
+        alias = field_info.alias or field_name.upper()
+        custom_key = alias.replace("CAMECT_", prefix + "_")
+        val = env_vals.get(custom_key)
+        if val is not None:
+            fields[alias] = val
+    return CamectSettings(**fields)
+
+
+async def run_camect_agent(instance: int = 1) -> None:
     settings = AppSettings()
     configure_logging(settings.log_level)
-    log = get_logger(service="camect_agent")
+    prefix = "CAMECT" if instance <= 1 else "CAMECT%d" % instance
+    camect_cfg = _load_camect_settings(prefix)
+    service_name = "camect_agent" if instance <= 1 else "camect_agent_%d" % instance
+    log = get_logger(service=service_name)
 
     # If the user enables Camect debug, turn up stdlib logging so we can see
     # camect/websocket connection + ping/pong details even if HOME_AGENT_LOG_LEVEL=INFO.
-    if settings.camect.debug:
+    if camect_cfg.debug:
         try:
             logging.getLogger().setLevel(logging.DEBUG)
         except Exception:
             pass
 
-    if not settings.camect.enabled:
+    if not camect_cfg.enabled:
         log.warning("camect_disabled", hint="Set CAMECT_ENABLED=true to run this service")
         return
 
-    if not settings.camect.host:
+    if not camect_cfg.host:
         log.error("missing_config", key="CAMECT_HOST")
         return
-    if not settings.camect.username:
+    if not camect_cfg.username:
         log.error("missing_config", key="CAMECT_USERNAME")
         return
-    if not settings.camect.password:
+    if not camect_cfg.password:
         log.error("missing_config", key="CAMECT_PASSWORD")
         return
 
-    rules_map = dict(settings.camect.camera_rules_map or {})
-    wanted_names = set(rules_map.keys()) if rules_map else set(settings.camect.camera_name_list)
+    rules_map = dict(camect_cfg.camera_rules_map or {})
+    wanted_names = set(rules_map.keys()) if rules_map else set(camect_cfg.camera_name_list)
     if not wanted_names:
         log.error("missing_config", key="CAMECT_CAMERA_RULES", hint="or set CAMECT_CAMERA_NAMES")
         return
@@ -402,7 +436,7 @@ async def run_camect_agent() -> None:
 
     # Surface camect's own connection/reconnect logs.
     try:
-        lib_level = logging.DEBUG if settings.camect.debug else logging.INFO
+        lib_level = logging.DEBUG if camect_cfg.debug else logging.INFO
         camect.set_log_level(lib_level)
         logging.getLogger("camect").setLevel(lib_level)
         # websockets can emit helpful ping/pong + reconnect debugging at DEBUG.
@@ -411,12 +445,13 @@ async def run_camect_agent() -> None:
         pass
 
     # Connect hub (sync) and start websocket listener thread internally.
-    hub = camect.Hub(settings.camect.host, settings.camect.username, settings.camect.password)
+    hub = camect.Hub(camect_cfg.host, camect_cfg.username, camect_cfg.password)
     hub_name = ""
     try:
         hub_name = str(hub.get_name() or "")
     except Exception:
         pass
+    hub_label = (camect_cfg.hub_label or hub_name or "").strip()
 
     cameras = []
     try:
@@ -435,13 +470,13 @@ async def run_camect_agent() -> None:
     mode = "rules" if rules_map else "camera_names+event_filter"
     log.info(
         "camect_connected",
-        hub=hub_name or settings.camect.host,
+        hub=hub_name or camect_cfg.host,
         cameras=len(cameras),
         mode=mode,
         rules_cameras=sorted(wanted_names),
-        filter=settings.camect.event_filter,
+        filter=camect_cfg.event_filter,
         rules=len(rules_map),
-        throttle_seconds=settings.camect.throttle_seconds,
+        throttle_seconds=camect_cfg.throttle_seconds,
     )
 
     mqttc = MqttClient(
@@ -449,11 +484,11 @@ async def run_camect_agent() -> None:
         port=settings.mqtt.port,
         username=settings.mqtt.username,
         password=settings.mqtt.password,
-        client_id="homeagent-camect-agent",
+        client_id="homeagent-%s" % service_name.replace("_", "-"),
     )
     await mqttc.connect()
 
-    reporter = ErrorReporter(mqttc=mqttc, service="camect-agent", base_topic=settings.mqtt.base_topic)
+    reporter = ErrorReporter(mqttc=mqttc, service=service_name.replace("_", "-"), base_topic=settings.mqtt.base_topic)
     reporter.start_heartbeat(interval_seconds=30.0)
 
     event_topic = "%s/camera/event" % settings.mqtt.base_topic
@@ -494,9 +529,9 @@ async def run_camect_agent() -> None:
 
     last_announce_by_cam: Dict[str, float] = {}
     last_email_by_cam: Dict[str, float] = {}
-    throttle = max(0, int(settings.camect.throttle_seconds))
+    throttle = max(0, int(camect_cfg.throttle_seconds))
     mailer = SmtpMailer(settings.smtp)
-    email_to = list(settings.camect.email_alert_pics_to_list or [])
+    email_to = list(camect_cfg.email_alert_pics_to_list or [])
     if email_to and not mailer.enabled:
         log.warning(
             "email_enabled_but_smtp_missing",
@@ -505,8 +540,8 @@ async def run_camect_agent() -> None:
 
     async def status_loop() -> None:
         nonlocal last_event_at, last_callback_at
-        interval = max(10, int(settings.camect.status_interval_seconds))
-        stale_warn = max(30, int(settings.camect.stale_warning_seconds))
+        interval = max(10, int(camect_cfg.status_interval_seconds))
+        stale_warn = max(30, int(camect_cfg.stale_warning_seconds))
         while True:
             await asyncio.sleep(float(interval))
             age = None
@@ -545,7 +580,7 @@ async def run_camect_agent() -> None:
                 v = _find_first_key_in_tree(evt, ("cam_name", "camera_name", "name"))
                 cam_name = str(v).strip() if isinstance(v, str) and v.strip() else cam_name
 
-            if settings.camect.debug:
+            if camect_cfg.debug:
                 det = evt.get("detected_obj")
                 desc = evt.get("desc")
                 log.debug(
@@ -566,12 +601,12 @@ async def run_camect_agent() -> None:
             if rules_map:
                 if cam_name:
                     if cam_name not in rules_map:
-                        if settings.camect.debug:
+                        if camect_cfg.debug:
                             log.debug("ignored_event", reason="camera_not_in_rules", camera=cam_name)
                         continue
                 else:
                     # Can't attribute to a camera name; ignore.
-                    if settings.camect.debug:
+                    if camect_cfg.debug:
                         log.debug("ignored_event", reason="no_camera_name_in_event")
                     continue
             else:
@@ -581,13 +616,13 @@ async def run_camect_agent() -> None:
                     continue
                 if (not cam_name) and (not cam_id):
                     # Can't attribute; ignore to avoid cross-camera noise.
-                    if settings.camect.debug:
+                    if camect_cfg.debug:
                         log.debug("ignored_event", reason="no_camera_in_event")
                     continue
 
-            token = rules_map.get(cam_name) if cam_name and rules_map else settings.camect.event_filter
+            token = rules_map.get(cam_name) if cam_name and rules_map else camect_cfg.event_filter
             if not _matches_filter(evt, token):
-                if settings.camect.debug:
+                if camect_cfg.debug:
                     log.debug("ignored_event", reason="filter_no_match", camera=cam_name, token=token)
                 continue
             matched_total += 1
@@ -598,7 +633,7 @@ async def run_camect_agent() -> None:
                 typ="camera.event",
                 data={
                     "provider": "camect",
-                    "hub": hub_name or settings.camect.host,
+                    "hub": hub_name or camect_cfg.host,
                     "camera_id": cam_id or None,
                     "camera_name": cam_name or None,
                     "filter": token,
@@ -715,7 +750,7 @@ async def run_camect_agent() -> None:
 
             # Vision analysis (optional): enrich the announcement with before/after comparison.
             vision_desc: Optional[str] = None
-            if settings.camect.vision_enabled and settings.llm.api_key:
+            if camect_cfg.vision_enabled and settings.llm.api_key:
                 try:
                     ts_ms_v = _extract_ts_ms(evt)
                     # Fetch "after" snapshot (current).
@@ -738,8 +773,8 @@ async def run_camect_agent() -> None:
                     except Exception as e_before:
                         log.warning("vision_before_snapshot_failed", camera=spoken_camera, error=type(e_before).__name__, detail=str(e_before)[:200])
 
-                    v_base = settings.camect.vision_base_url or settings.llm.base_url
-                    v_key = settings.camect.vision_api_key or settings.llm.api_key
+                    v_base = camect_cfg.vision_base_url or settings.llm.base_url
+                    v_key = camect_cfg.vision_api_key or settings.llm.api_key
                     vision_desc = await asyncio.wait_for(
                         _vision_describe(
                             jpeg_before=jpeg_before,
@@ -748,24 +783,26 @@ async def run_camect_agent() -> None:
                             kind=kind,
                             llm_base_url=v_base,
                             llm_api_key=v_key,
-                            vision_model=settings.camect.vision_model,
-                            detail=settings.camect.vision_detail,
-                            timeout_seconds=settings.camect.vision_timeout_seconds,
+                            vision_model=camect_cfg.vision_model,
+                            detail=camect_cfg.vision_detail,
+                            timeout_seconds=camect_cfg.vision_timeout_seconds,
                         ),
-                        timeout=float(settings.camect.vision_timeout_seconds),
+                        timeout=float(camect_cfg.vision_timeout_seconds),
                     )
                     if vision_desc:
                         log.info("vision_ok", camera=spoken_camera, desc=vision_desc[:100])
                 except Exception as e:
                     log.warning("vision_failed", camera=spoken_camera, error=type(e).__name__)
 
+            location_prefix = "%s: " % hub_label if hub_label else ""
             if vision_desc:
-                text = "Your attention please. %s detected at %s." % (vision_desc, spoken_camera)
+                text = "%sYour attention please. %s detected at %s." % (location_prefix, vision_desc, spoken_camera)
             else:
                 try:
-                    text = (settings.camect.announce_template or "").format(camera=spoken_camera, kind=kind)
+                    text = location_prefix + (camect_cfg.announce_template or "").format(
+                        camera=spoken_camera, kind=kind, hub=hub_label)
                 except Exception:
-                    text = "%s detected at %s." % (kind, spoken_camera)
+                    text = "%s%s detected at %s." % (location_prefix, kind, spoken_camera)
 
             announce = make_event(
                 source="camect-agent",
@@ -791,7 +828,7 @@ async def run_camect_agent() -> None:
         await mqttc.close()
 
 
-def main() -> int:
-    asyncio.run(run_camect_agent())
+def main(instance: int = 1) -> int:
+    asyncio.run(run_camect_agent(instance=instance))
     return 0
 

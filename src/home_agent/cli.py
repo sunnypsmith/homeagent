@@ -372,9 +372,11 @@ def caseta_agent() -> None:
     raise SystemExit(caseta_agent_main())
 
 @app.command("camect-agent")
-def camect_agent() -> None:
+def camect_agent(
+    instance: int = typer.Option(1, "--instance", help="Config instance (1=CAMECT_*, 2=CAMECT2_*, etc.)"),
+) -> None:
     """Run Camect agent (Camect hub -> MQTT camera/event + optional announce.request)."""
-    raise SystemExit(camect_agent_main())
+    raise SystemExit(camect_agent_main(instance=instance))
 
 
 @app.command("camera-lighting-agent")
