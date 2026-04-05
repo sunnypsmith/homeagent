@@ -32,7 +32,7 @@ _WHISPER_HALLUCINATIONS = {
     "thank you for watching", "thank you for listening",
     "please subscribe", "like and subscribe",
     "see you next time", "bye", "goodbye",
-    "you", "the end", "...", "one moment",
+    "you", "the end", "...", "one moment", "amen",
     "how may i serve you", "how may i assist you",
 }
 
@@ -343,6 +343,8 @@ async def run_voice_service() -> None:
         has_speakers = speakers and speakers != ["none"]
 
         try:
+            t0 = time.monotonic()
+
             # Step 1: Play "How may I assist you?"
             if has_speakers:
                 _announce("How may I assist you?", speakers, offline_key="voice_prompt")
@@ -358,17 +360,24 @@ async def run_voice_service() -> None:
             if len(room.raw_buffer) > pre_capture_bytes:
                 del room.raw_buffer[:len(room.raw_buffer) - pre_capture_bytes]
 
+            t1 = time.monotonic()
+            log.info("session_timing", room=room.friendly_name,
+                     step="prompt_wait", elapsed_ms=round((t1 - t0) * 1000))
+
             # Step 3: Capture command audio (async, same loop — no buffer race)
             log.info("session_capturing", room=room.friendly_name)
             audio_pcm = await _capture_audio(room, max_command_duration)
+
+            t2 = time.monotonic()
+            log.info("session_timing", room=room.friendly_name,
+                     step="capture", elapsed_ms=round((t2 - t1) * 1000),
+                     audio_bytes=len(audio_pcm))
 
             if len(audio_pcm) < ww_frame_bytes * 2:
                 log.info("session_too_short", room=room.friendly_name, bytes=len(audio_pcm))
                 return
 
-            # Step 4: Play "One moment" ack
-            if has_speakers:
-                _announce("One moment.", speakers, offline_key="voice_ack")
+            # "One moment" ack is now played by voice-intent-agent on receipt
 
             # Step 5: Check raw audio quality
             arr = np.frombuffer(audio_pcm, dtype=np.int16)
@@ -380,6 +389,10 @@ async def run_voice_service() -> None:
             # Step 6: Noise reduce, trim silence, normalize
             audio_pcm = _process_audio_for_stt(audio_pcm, log=log)
 
+            t3 = time.monotonic()
+            log.info("session_timing", room=room.friendly_name,
+                     step="audio_process", elapsed_ms=round((t3 - t2) * 1000))
+
             # Step 7: STT
             room.stt_requests += 1
             log.info("session_stt", room=room.friendly_name,
@@ -388,6 +401,10 @@ async def run_voice_service() -> None:
             text = await _transcribe_with_fallback(
                 wav, stt_api_key=stt_api_key, stt_model=stt_model,
                 stt_language=stt_language, fallback_api_key=fallback_key, log=log)
+
+            t4 = time.monotonic()
+            log.info("session_timing", room=room.friendly_name,
+                     step="stt", elapsed_ms=round((t4 - t3) * 1000))
 
             if not text:
                 log.info("session_stt_empty", room=room.friendly_name)
@@ -509,18 +526,22 @@ async def run_voice_service() -> None:
                                 speakers = room_speakers.get(room.room_id, [])
                                 if any(s in pb_targets for s in speakers) or not pb_targets:
                                     room.sonos_playing = True
-                                    room.raw_buffer.clear()
+                                    if room.state != RoomState.BUSY:
+                                        room.raw_buffer.clear()
                                     log.info("room_deaf", room=room.friendly_name,
-                                             reason="sonos_playback_start")
+                                             reason="sonos_playback_start",
+                                             busy=room.state == RoomState.BUSY)
 
                         elif evt_type == "sonos.playback_done":
                             for room in rooms.values():
                                 if room.sonos_playing:
                                     room.sonos_playing = False
-                                    room.raw_buffer.clear()
-                                    room.last_wake_time = time.monotonic()
+                                    if room.state != RoomState.BUSY:
+                                        room.raw_buffer.clear()
+                                        room.last_wake_time = time.monotonic()
                                     log.info("room_undeaf", room=room.friendly_name,
-                                             reason="sonos_playback_done")
+                                             reason="sonos_playback_done",
+                                             busy=room.state == RoomState.BUSY)
                     except Exception:
                         pass
 

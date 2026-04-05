@@ -207,28 +207,53 @@ async def _ups_check(settings: AppSettings, *, log, client: UpsSnmpClient) -> di
 
 
 async def _remote_site_check(*, host: str, label: str, ping_count: int = 5, timeout: float = 10.0) -> dict:
-    """Ping a remote site (e.g., across a VPN) and report reachability."""
+    """Check remote site reachability via TCP connect (more reliable than ICMP in containers)."""
+    import socket
     data: Dict[str, Any] = {"ok": False, "alerts": [], "label": label, "host": host}
-    try:
-        result = await asyncio.to_thread(
-            run_internet_check, host=host, duration_seconds=ping_count,
-            interval_seconds=1.0, timeout_seconds=timeout,
-        )
-        data["ok"] = True
-        data["sent"] = result.sent
-        data["received"] = result.received
-        data["loss_percent"] = result.loss_percent
-        data["avg_latency_ms"] = result.avg_latency_ms
 
-        if result.received == 0:
-            data["alerts"].append(
-                "Your attention please. %s is unreachable. "
-                "Repeating. %s is unreachable." % (label, label))
-        elif result.loss_percent >= 80:
-            data["alerts"].append("%s has significant packet loss" % label)
-    except Exception as e:
-        data["error"] = type(e).__name__
-        data["alerts"].append("%s check failed" % label)
+    port = 443
+    if ":" in host:
+        host, _, port_str = host.rpartition(":")
+        try:
+            port = int(port_str)
+        except ValueError:
+            pass
+
+    successes = 0
+    total = max(1, ping_count)
+    latencies: List[float] = []
+
+    def _try_connect() -> Optional[float]:
+        import time as _t
+        try:
+            t0 = _t.monotonic()
+            s = socket.create_connection((host, port), timeout=timeout)
+            elapsed = (_t.monotonic() - t0) * 1000
+            s.close()
+            return elapsed
+        except Exception:
+            return None
+
+    for _ in range(total):
+        ms = await asyncio.to_thread(_try_connect)
+        if ms is not None:
+            successes += 1
+            latencies.append(ms)
+
+    loss = 100.0 * (total - successes) / total
+    data["ok"] = True
+    data["sent"] = total
+    data["received"] = successes
+    data["loss_percent"] = round(loss, 1)
+    data["avg_latency_ms"] = round(sum(latencies) / len(latencies), 1) if latencies else None
+
+    if successes == 0:
+        data["alerts"].append(
+            "Your attention please. %s is unreachable. "
+            "Repeating. %s is unreachable." % (label, label))
+    elif loss >= 80:
+        data["alerts"].append("%s has significant packet loss" % label)
+
     return data
 
 
