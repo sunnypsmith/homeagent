@@ -165,14 +165,23 @@ class SonosPlayback:
             raise
 
     def _acquire_snapshot(self, spk) -> None:
-        """Take a snapshot if one isn't already held for this speaker."""
+        """Take a snapshot if one isn't already held for this speaker.
+
+        Skips snapshot entirely when the speaker is idle (not playing anything),
+        since there's nothing to restore afterwards.
+        """
         ip = getattr(spk, "ip_address", "unknown")
         with self._held_lock:
             if ip in self._held:
                 _log.info("snapshot_reused", speaker=ip)
                 return
-        snap = self._Snapshot(spk)
         was_playing = _is_playing(spk)
+        if not was_playing:
+            with self._held_lock:
+                self._held[ip] = _HeldSnapshot(snap=None, was_playing=False, device=spk, ip=ip)
+            _log.info("snapshot_skipped_idle", speaker=ip)
+            return
+        snap = self._Snapshot(spk)
         snap.snapshot()
         with self._held_lock:
             if ip not in self._held:
@@ -245,6 +254,14 @@ def _restore_one(held: _HeldSnapshot) -> None:
     spk = held.device
     snap = held.snap
     was_playing = held.was_playing
+
+    if snap is None:
+        _log.info("snapshot_restore_skipped_idle", speaker=ip)
+        try:
+            spk.stop()
+        except Exception:
+            pass
+        return
 
     try:
         snap.restore()

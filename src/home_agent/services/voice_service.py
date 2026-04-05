@@ -345,6 +345,12 @@ async def run_voice_service() -> None:
         try:
             t0 = time.monotonic()
 
+            # Tell sonos gateway to hold speakers open (skip restore between announcements)
+            if has_speakers:
+                mqttc.publish_json("%s/sonos/hold" % base, make_event(
+                    source="voice-service", typ="sonos.hold",
+                    data={"action": "start", "room_id": room.room_id}))
+
             # Step 1: Play "How may I assist you?"
             if has_speakers:
                 _announce("How may I assist you?", speakers, offline_key="voice_prompt")
@@ -424,6 +430,16 @@ async def run_voice_service() -> None:
             log.exception("session_failed", room=room.friendly_name)
             reporter.report_error("voice_session_failed", e)
         finally:
+            # Release sonos hold after a delay so the response has time to play
+            if has_speakers:
+                async def _release_hold():
+                    await asyncio.sleep(8.0)
+                    mqttc.publish_json("%s/sonos/hold" % base, make_event(
+                        source="voice-service", typ="sonos.hold",
+                        data={"action": "release", "room_id": room.room_id}))
+                    log.info("sonos_hold_released", room=room.friendly_name)
+                asyncio.create_task(_release_hold())
+
             # Session complete — return to listening
             room.raw_buffer.clear()
             room.state = RoomState.LISTENING

@@ -161,6 +161,8 @@ async def run_sonos_gateway() -> None:
     suppressed_topic = "%s/announce/suppressed" % settings.mqtt.base_topic
     mute_topic = "%s/announce/mute" % settings.mqtt.base_topic
     mqttc.subscribe(mute_topic)
+    hold_topic = "%s/sonos/hold" % settings.mqtt.base_topic
+    mqttc.subscribe(hold_topic)
     log.info("subscribed", topic=mute_topic)
 
     loop = asyncio.get_running_loop()
@@ -174,6 +176,8 @@ async def run_sonos_gateway() -> None:
     muted_until_unix = 0
     pending_msg = None
     active_players: set = set()
+    hold_active = False
+    hold_until = 0.0
 
     async def _restore_active() -> None:
         nonlocal active_players
@@ -236,8 +240,16 @@ async def run_sonos_gateway() -> None:
                 msg = pending_msg
                 pending_msg = None
             else:
+                # Expire stale holds (safety net)
+                if hold_active and loop.time() > hold_until:
+                    hold_active = False
+                    log.info("sonos_hold_expired")
+
                 if active_players:
-                    await _restore_active()
+                    if not hold_active:
+                        await _restore_active()
+                    else:
+                        active_players.clear()
                     _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
                     mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
                 msg = await mqttc.next_message()
@@ -301,6 +313,21 @@ async def run_sonos_gateway() -> None:
                         log.info("mute_cleared", id=event_id, trace_id=trace_id, source=source)
                 else:
                     log.warning("bad_event", reason="missing_muted_until_unix", id=event_id)
+                continue
+
+            if typ == "sonos.hold":
+                action = data.get("action", "")
+                if action == "start":
+                    hold_active = True
+                    hold_until = loop.time() + 30.0
+                    log.info("sonos_hold_start", id=event_id, source=source)
+                elif action == "release":
+                    hold_active = False
+                    if active_players:
+                        await _restore_active()
+                        _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
+                        mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
+                    log.info("sonos_hold_release", id=event_id, source=source)
                 continue
 
             if typ != "announce.request":
