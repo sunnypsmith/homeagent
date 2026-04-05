@@ -80,7 +80,7 @@ def _fetch_db_activity_cached(settings: Any) -> Dict[str, Any]:
                            (SELECT count(*) FROM events WHERE ingested_at > now() - interval '60 seconds')
                 """)
                 now_utc, last_at, last_60 = cur.fetchone()
-                cur.execute("SELECT ingested_at, topic, source, type FROM events WHERE type NOT IN ('service.heartbeat', 'voice.room_status', 'watchdog.health', 'service.error', 'raw') ORDER BY ingested_at DESC LIMIT 8")
+                cur.execute("SELECT ingested_at, topic, source, type FROM events WHERE ingested_at > now() - interval '1 hour' AND type NOT IN ('service.heartbeat', 'voice.room_status', 'watchdog.health', 'service.error', 'raw') ORDER BY ingested_at DESC LIMIT 8")
                 rows = cur.fetchall()
         finally:
             conn.close()

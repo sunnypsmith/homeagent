@@ -122,7 +122,26 @@ TEMPSTICK_HUMIDITY_LOW=20
 TEMPSTICK_HUMIDITY_HIGH=60
 ```
 
+Monitor additional sensors (e.g., remote locations) with per-sensor thresholds:
+
+```bash
+# Format: name:temp_high_f:humidity_high;name:temp_high_f:humidity_high
+TEMPSTICK_EXTRA_SENSORS=CR Upstairs:90:55;CR-Downstairs:90:55
+```
+
 Set these in your repo-root `.env`.
+
+### Remote site check (optional)
+
+Ping-based reachability check for a remote site (e.g., across a VPN):
+
+```bash
+REMOTE_SITE_CHECK_ENABLED=true
+REMOTE_SITE_CHECK_HOST=10.1.4.254
+REMOTE_SITE_CHECK_LABEL=Costa Rica
+REMOTE_SITE_CHECK_PING_COUNT=10
+REMOTE_SITE_CHECK_TIMEOUT_SECONDS=15
+```
 
 ### UPS line input thresholds (optional)
 

@@ -24,6 +24,7 @@ Run:
 docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0001_timescaledb.sql
 docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0002_events.sql
 docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0003_schedules.sql
+docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0004_events_ingested_idx.sql
 ```
 
 ## Verify

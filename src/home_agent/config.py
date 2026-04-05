@@ -429,11 +429,40 @@ class TempStickSettings(BaseSettings):
     humidity_low: Optional[float] = Field(default=None, alias="TEMPSTICK_HUMIDITY_LOW")
     humidity_high: Optional[float] = Field(default=None, alias="TEMPSTICK_HUMIDITY_HIGH")
     timeout_seconds: float = Field(default=15.0, alias="TEMPSTICK_TIMEOUT_SECONDS")
+    extra_sensors: str = Field(default="", alias="TEMPSTICK_EXTRA_SENSORS")
 
-    @field_validator("api_key", "sensor_id", "sensor_name", mode="before")
+    @field_validator("api_key", "sensor_id", "sensor_name", "extra_sensors", mode="before")
     @classmethod
     def _norm_str(cls, v: object) -> str:
         return _strip_quotes(str(v)).strip()
+
+    @property
+    def extra_sensors_parsed(self) -> List[Dict[str, Any]]:
+        """Parse TEMPSTICK_EXTRA_SENSORS into a list of sensor configs.
+
+        Format: name:temp_high:humidity_high;name:temp_high:humidity_high
+        Example: CR Upstairs:90:55;CR-Downstairs:90:55
+        """
+        raw = (self.extra_sensors or "").strip()
+        if not raw:
+            return []
+        out: List[Dict[str, Any]] = []
+        for chunk in raw.split(";"):
+            parts = [p.strip() for p in chunk.strip().split(":")]
+            if len(parts) < 2:
+                continue
+            entry: Dict[str, Any] = {"name": parts[0]}
+            try:
+                entry["temp_high_f"] = float(parts[1]) if parts[1] else None
+            except ValueError:
+                entry["temp_high_f"] = None
+            if len(parts) >= 3:
+                try:
+                    entry["humidity_high"] = float(parts[2]) if parts[2] else None
+                except ValueError:
+                    entry["humidity_high"] = None
+            out.append(entry)
+        return out
 
 
 class UpsSettings(BaseSettings):
@@ -509,6 +538,28 @@ class InternetSettings(BaseSettings):
     max_loss_percent: float = Field(default=1.0, alias="INTERNET_MAX_PACKET_LOSS_PERCENT")
 
     @field_validator("host", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+
+class RemoteSiteSettings(BaseSettings):
+    """Ping-based reachability check for a remote site (e.g., across a VPN)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="REMOTE_SITE_CHECK_ENABLED")
+    host: str = Field(default="", alias="REMOTE_SITE_CHECK_HOST")
+    label: str = Field(default="Remote site", alias="REMOTE_SITE_CHECK_LABEL")
+    ping_count: int = Field(default=5, alias="REMOTE_SITE_CHECK_PING_COUNT")
+    timeout_seconds: float = Field(default=10.0, alias="REMOTE_SITE_CHECK_TIMEOUT_SECONDS")
+
+    @field_validator("host", "label", mode="before")
     @classmethod
     def _norm_str(cls, v: object) -> str:
         return _strip_quotes(str(v)).strip()
@@ -1061,6 +1112,7 @@ class AppSettings(BaseSettings):
     tempstick: TempStickSettings = TempStickSettings()
     ups: UpsSettings = UpsSettings()
     internet: InternetSettings = InternetSettings()
+    remote_site: RemoteSiteSettings = RemoteSiteSettings()
     offline_audio: OfflineAudioSettings = OfflineAudioSettings()
     simplefin: SimpleFINSettings = SimpleFINSettings()
     exec_briefing: ExecBriefingSettings = ExecBriefingSettings()

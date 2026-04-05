@@ -41,65 +41,96 @@ def _fmt_temp_f(v: Optional[float]) -> Optional[str]:
     return "%d" % int(round(float(v)))
 
 
-async def _tempstick_check(settings: AppSettings, *, log, client: TempStickClient) -> dict:
-    sensor: TempStickSensor | None = None
-    if settings.tempstick.sensor_id:
-        sensor = await client.get_sensor(settings.tempstick.sensor_id)
-    if sensor is None:
-        sensors = await client.list_sensors()
-        want = (settings.tempstick.sensor_name or "").strip().lower()
-        if want:
-            for s in sensors:
-                if (s.name or "").strip().lower() == want:
-                    sensor = s
-                    break
-        if sensor is None and sensors:
-            sensor = sensors[0]
-
-    data: Dict[str, Any] = {"ok": False, "alerts": []}
-    if sensor is None or not sensor.sensor_id:
-        data["error"] = "sensor_not_found"
-        return data
-
+def _check_sensor_thresholds(
+    sensor: TempStickSensor, *, label: str,
+    temp_low_f: Optional[float] = None, temp_high_f: Optional[float] = None,
+    humidity_low: Optional[float] = None, humidity_high: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Check a single sensor against thresholds, return data + alerts."""
     temp_c = sensor.last_temp_c
     temp_f = _c_to_f(temp_c) if temp_c is not None else None
     humidity = sensor.last_humidity
-    label = (sensor.name or "").strip() or "Temp Stick"
-    data.update(
-        {
-            "ok": True,
-            "label": label,
-            "sensor_id": sensor.sensor_id,
-            "sensor_name": sensor.name or None,
-            "temp_c": temp_c,
-            "temp_f": temp_f,
-            "humidity": humidity,
-            "offline": sensor.offline,
-            "last_checkin": sensor.last_checkin,
-        }
-    )
 
+    data: Dict[str, Any] = {
+        "ok": True, "label": label,
+        "sensor_id": sensor.sensor_id, "sensor_name": sensor.name or None,
+        "temp_c": temp_c, "temp_f": temp_f, "humidity": humidity,
+        "offline": sensor.offline, "last_checkin": sensor.last_checkin,
+    }
     alerts: List[str] = []
+
     if sensor.offline:
         alerts.append("%s is offline" % label)
 
-    low_f = settings.tempstick.temp_low_f
-    high_f = settings.tempstick.temp_high_f
     if temp_f is not None:
-        if low_f is not None and temp_f < float(low_f):
-            alerts.append("Temperature is %s, below %s" % (_fmt_temp_f(temp_f), _fmt_temp_f(low_f)))
-        if high_f is not None and temp_f > float(high_f):
-            alerts.append("Temperature is %s, above %s" % (_fmt_temp_f(temp_f), _fmt_temp_f(high_f)))
+        if temp_low_f is not None and temp_f < float(temp_low_f):
+            alerts.append("%s temperature is %s, below %s" % (label, _fmt_temp_f(temp_f), _fmt_temp_f(temp_low_f)))
+        if temp_high_f is not None and temp_f > float(temp_high_f):
+            alerts.append("%s temperature is %s, above %s" % (label, _fmt_temp_f(temp_f), _fmt_temp_f(temp_high_f)))
 
-    low_h = settings.tempstick.humidity_low
-    high_h = settings.tempstick.humidity_high
     if humidity is not None:
-        if low_h is not None and float(humidity) < float(low_h):
-            alerts.append("Humidity is %d, below %d" % (int(round(humidity)), int(round(float(low_h)))))
-        if high_h is not None and float(humidity) > float(high_h):
-            alerts.append("Humidity is %d, above %d" % (int(round(humidity)), int(round(float(high_h)))))
+        if humidity_low is not None and float(humidity) < float(humidity_low):
+            alerts.append("%s humidity is %d, below %d" % (label, int(round(humidity)), int(round(float(humidity_low)))))
+        if humidity_high is not None and float(humidity) > float(humidity_high):
+            alerts.append("%s humidity is %d, above %d" % (label, int(round(humidity)), int(round(float(humidity_high)))))
 
     data["alerts"] = alerts
+    return data
+
+
+async def _tempstick_check(settings: AppSettings, *, log, client: TempStickClient) -> dict:
+    """Check primary sensor + any extra sensors defined in config."""
+    all_sensors = await client.list_sensors()
+    sensor_by_name = {(s.name or "").strip().lower(): s for s in all_sensors}
+
+    results: List[Dict[str, Any]] = []
+    all_alerts: List[str] = []
+
+    # Primary sensor
+    primary: TempStickSensor | None = None
+    if settings.tempstick.sensor_id:
+        primary = await client.get_sensor(settings.tempstick.sensor_id)
+    if primary is None:
+        want = (settings.tempstick.sensor_name or "").strip().lower()
+        primary = sensor_by_name.get(want)
+    if primary is None and all_sensors:
+        primary = all_sensors[0]
+
+    if primary is not None:
+        label = (primary.name or "").strip() or "Temp Stick"
+        r = _check_sensor_thresholds(
+            primary, label=label,
+            temp_low_f=settings.tempstick.temp_low_f,
+            temp_high_f=settings.tempstick.temp_high_f,
+            humidity_low=settings.tempstick.humidity_low,
+            humidity_high=settings.tempstick.humidity_high,
+        )
+        results.append(r)
+        all_alerts.extend(r.get("alerts") or [])
+
+    # Extra sensors (e.g., Costa Rica)
+    for extra in settings.tempstick.extra_sensors_parsed:
+        name = (extra.get("name") or "").strip()
+        sensor = sensor_by_name.get(name.lower())
+        if sensor is None:
+            log.warning("tempstick_extra_not_found", name=name)
+            continue
+        label = (sensor.name or "").strip() or name
+        r = _check_sensor_thresholds(
+            sensor, label=label,
+            temp_high_f=extra.get("temp_high_f"),
+            humidity_high=extra.get("humidity_high"),
+        )
+        results.append(r)
+        all_alerts.extend(r.get("alerts") or [])
+
+    data: Dict[str, Any] = {
+        "ok": True, "sensors": results, "alerts": all_alerts,
+        "label": "Temp Stick",
+    }
+    if not results:
+        data["ok"] = False
+        data["error"] = "no_sensors_found"
     return data
 
 
@@ -172,6 +203,32 @@ async def _ups_check(settings: AppSettings, *, log, client: UpsSnmpClient) -> di
                 )
 
     data["alerts"] = alerts
+    return data
+
+
+async def _remote_site_check(*, host: str, label: str, ping_count: int = 5, timeout: float = 10.0) -> dict:
+    """Ping a remote site (e.g., across a VPN) and report reachability."""
+    data: Dict[str, Any] = {"ok": False, "alerts": [], "label": label, "host": host}
+    try:
+        result = await asyncio.to_thread(
+            run_internet_check, host=host, duration_seconds=ping_count,
+            interval_seconds=1.0, timeout_seconds=timeout,
+        )
+        data["ok"] = True
+        data["sent"] = result.sent
+        data["received"] = result.received
+        data["loss_percent"] = result.loss_percent
+        data["avg_latency_ms"] = result.avg_latency_ms
+
+        if result.received == 0:
+            data["alerts"].append(
+                "Your attention please. %s is unreachable. "
+                "Repeating. %s is unreachable." % (label, label))
+        elif result.loss_percent >= 80:
+            data["alerts"].append("%s has significant packet loss" % label)
+    except Exception as e:
+        data["error"] = type(e).__name__
+        data["alerts"].append("%s check failed" % label)
     return data
 
 
@@ -384,6 +441,20 @@ async def run_hourly_house_check_agent() -> None:
                 except Exception as e:
                     checks["internet"] = {"ok": False, "error": type(e).__name__}
                     alerts.append("Internet check failed")
+
+            if settings.remote_site.enabled and settings.remote_site.host:
+                try:
+                    rs = await _remote_site_check(
+                        host=settings.remote_site.host,
+                        label=settings.remote_site.label,
+                        ping_count=settings.remote_site.ping_count,
+                        timeout=settings.remote_site.timeout_seconds,
+                    )
+                    checks["remote_site"] = rs
+                    alerts.extend(rs.get("alerts") or [])
+                except Exception as e:
+                    checks["remote_site"] = {"ok": False, "error": type(e).__name__}
+                    alerts.append("%s check failed" % settings.remote_site.label)
 
             report = make_event(
                 source="hourly-house-check-agent",
