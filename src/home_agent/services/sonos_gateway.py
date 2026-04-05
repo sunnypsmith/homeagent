@@ -245,11 +245,8 @@ async def run_sonos_gateway() -> None:
                     hold_active = False
                     log.info("sonos_hold_expired")
 
-                if active_players:
-                    if not hold_active:
-                        await _restore_active()
-                    else:
-                        active_players.clear()
+                if active_players and not hold_active:
+                    await _restore_active()
                     _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
                     mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
                 msg = await mqttc.next_message()
@@ -325,8 +322,8 @@ async def run_sonos_gateway() -> None:
                     hold_active = False
                     if active_players:
                         await _restore_active()
-                        _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
-                        mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
+                    _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
+                    mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
                     log.info("sonos_hold_release", id=event_id, source=source)
                 continue
 
@@ -425,13 +422,17 @@ async def run_sonos_gateway() -> None:
                 if resolved:
                     play_targets = list(resolved)
 
-            log.info("announce_request", id=event_id, trace_id=trace_id, source=source)
+            _t0 = loop.time()
+            log.info("announce_request", id=event_id, trace_id=trace_id, source=source,
+                     text_len=len(text), offline_key=offline_key or None)
 
             # Normalize text for TTS (expand abbreviations, spell out numbers)
             if not offline_key and settings.llm.api_key:
                 text = await _normalize_for_tts(
                     text, base_url=settings.llm.base_url,
                     api_key=settings.llm.api_key, model=settings.llm.model, log=log)
+
+            _t_norm = loop.time()
 
             # Notify voice service that speakers are about to play
             _pb_targets = data_targets if isinstance(data_targets, list) else list(settings.sonos.speaker_alias_map.keys())
@@ -450,6 +451,7 @@ async def run_sonos_gateway() -> None:
                         )
                         log.info("announce_offline_audio", key=offline_key, path=str(path))
 
+                _t_tts_start = loop.time()
                 if hosted is None:
                     audio = await tts.synthesize(text=text, voice_id=voice_id)
                     hosted = host.host_bytes(
@@ -458,6 +460,7 @@ async def run_sonos_gateway() -> None:
                         content_type=audio.content_type,
                         route_to_ip=play_targets[0],
                     )
+                _t_tts_done = loop.time()
                 player2 = (
                     player
                     if play_targets == targets
@@ -467,6 +470,7 @@ async def run_sonos_gateway() -> None:
                         speaker_volume_map=settings.sonos.speaker_volume_map,
                     )
                 )
+                _t_play_start = loop.time()
                 await player2.play_url(
                     url=hosted.url,
                     volume=volume,
@@ -474,9 +478,17 @@ async def run_sonos_gateway() -> None:
                     concurrency=concurrency,
                     tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
                 )
+                _t_play_done = loop.time()
                 active_players.add(player2)
                 ok_total += 1
                 last_ok_at = loop.time()
+                log.info("announce_timing",
+                         id=event_id, source=source,
+                         normalize_ms=round((_t_norm - _t0) * 1000),
+                         tts_ms=round((_t_tts_done - _t_tts_start) * 1000),
+                         sonos_play_ms=round((_t_play_done - _t_play_start) * 1000),
+                         total_ms=round((_t_play_done - _t0) * 1000),
+                         offline=bool(offline_key))
                 log.info("announce_done")
             except Exception:
                 played_fallback = False

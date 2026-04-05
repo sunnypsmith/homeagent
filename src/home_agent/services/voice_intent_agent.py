@@ -222,14 +222,16 @@ async def run_voice_intent_agent() -> None:
             conv.clear()
         return conv
 
-    def _respond(text: str, room_id: str, room_name: str, speakers: Optional[List[str]]) -> None:
+    def _respond(text: str, room_id: str, room_name: str, speakers: Optional[List[str]], _t0: Optional[float] = None) -> None:
         """Send a response via Sonos and/or MQTT response topic."""
-        # Always publish to response topic (for web chat)
+        if _t0 is not None:
+            log.info("intent_respond", room=room_name, text_len=len(text),
+                     intent_elapsed_ms=round((time.monotonic() - _t0) * 1000))
+
         evt = make_event(source="voice-intent-agent", typ="voice.response",
             data={"room_id": room_id, "room_name": room_name, "text": text})
         mqttc.publish_json(response_topic, evt)
 
-        # If room has speakers, announce on Sonos
         if speakers and speakers != ["none"]:
             data: Dict[str, Any] = {"text": text, "targets": speakers}
             announce_evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
@@ -392,6 +394,7 @@ async def run_voice_intent_agent() -> None:
 
             speakers = _speakers_for_room(room_id)
             conv = _get_conversation(room_id)
+            _timing = {"t0": time.monotonic()}
             log.info("voice_command", room=room_name, text=text, speakers=speakers)
 
             try:
@@ -415,7 +418,7 @@ async def run_voice_intent_agent() -> None:
                                 data=pa.mqtt_payload)
                             mqttc.publish_json(pa.mqtt_topic, evt)
                             confirmation = "Done. %s" % pa.description
-                            _respond(confirmation, room_id, room_name, speakers)
+                            _respond(confirmation, room_id, room_name, speakers, _t0=_timing["t0"])
                             conv.add_user(pa.original_text)
                             conv.add_assistant(confirmation)
                             # Save as learned action
@@ -429,7 +432,7 @@ async def run_voice_intent_agent() -> None:
                             continue
 
                         elif "CANCEL" in interpretation:
-                            _respond("Cancelled.", room_id, room_name, speakers)
+                            _respond("Cancelled.", room_id, room_name, speakers, _t0=_timing["t0"])
                             conv.add_assistant("Cancelled.")
                             log.info("pending_cancelled", room=room_name)
                             del pending_actions[room_id]
@@ -465,7 +468,7 @@ async def run_voice_intent_agent() -> None:
                                 data=matched.mqtt_payload)
                             mqttc.publish_json(matched.mqtt_topic, evt)
                             confirmation = "Done. %s" % matched.description
-                            _respond(confirmation, room_id, room_name, speakers)
+                            _respond(confirmation, room_id, room_name, speakers, _t0=_timing["t0"])
                             conv.add_user(text)
                             conv.add_assistant(confirmation)
                             learned.record_use(matched)
@@ -513,7 +516,7 @@ async def run_voice_intent_agent() -> None:
                                 mqtt_topic = reason_result.arguments.get("mqtt_topic", mqtt_topic)
                                 mqtt_payload = reason_result.arguments.get("mqtt_payload", mqtt_payload)
                             elif isinstance(reason_result, LLMTextResponse):
-                                _respond(reason_result.text, room_id, room_name, speakers)
+                                _respond(reason_result.text, room_id, room_name, speakers, _t0=_timing["t0"])
                                 conv.add_user(text)
                                 conv.add_assistant(reason_result.text)
                                 continue
@@ -530,19 +533,19 @@ async def run_voice_intent_agent() -> None:
                                 room_name=room_name,
                             )
                             confirm_text = "I can %s. Shall I go ahead?" % description
-                            _respond(confirm_text, room_id, room_name, speakers)
+                            _respond(confirm_text, room_id, room_name, speakers, _t0=_timing["t0"])
                             conv.add_user(text)
                             conv.add_assistant(confirm_text)
                             log.info("pending_created", room=room_name, description=description)
                         else:
-                            _respond("I'm not sure how to do that.", room_id, room_name, speakers)
+                            _respond("I'm not sure how to do that.", room_id, room_name, speakers, _t0=_timing["t0"])
                             conv.add_user(text)
                             conv.add_assistant("I'm not sure how to do that.")
                     else:
                         # Known tool — execute immediately
                         confirmation = await _execute_tool_call(result, room_id, room_name)
                         if confirmation:
-                            _respond(confirmation, room_id, room_name, speakers)
+                            _respond(confirmation, room_id, room_name, speakers, _t0=_timing["t0"])
                             conv.add_user(text)
                             conv.add_assistant(confirmation)
 
@@ -576,7 +579,7 @@ async def run_voice_intent_agent() -> None:
                         except Exception as e:
                             log.warning("perplexity_failed", error=str(e)[:100])
                     if answer:
-                        _respond(answer, room_id, room_name, speakers)
+                        _respond(answer, room_id, room_name, speakers, _t0=_timing["t0"])
                         conv.add_user(text)
                         conv.add_assistant(answer)
 
@@ -590,14 +593,14 @@ async def run_voice_intent_agent() -> None:
                                 responses.append(r)
                     if responses:
                         combined = " ".join(responses)
-                        _respond(combined, room_id, room_name, speakers)
+                        _respond(combined, room_id, room_name, speakers, _t0=_timing["t0"])
                         conv.add_user(text)
                         conv.add_assistant(combined)
 
             except Exception as e:
                 log.exception("intent_processing_failed", room=room_name, text=text)
                 reporter.report_error("intent_processing_failed", e)
-                _respond("I'm sorry, I had trouble processing that request.", room_id, room_name, speakers)
+                _respond("I'm sorry, I had trouble processing that request.", room_id, room_name, speakers, _t0=_timing["t0"])
 
     finally:
         timeout_task.cancel()

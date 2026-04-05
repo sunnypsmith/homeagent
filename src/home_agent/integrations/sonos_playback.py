@@ -61,12 +61,16 @@ class SonosPlayback:
         tail_padding_seconds: float = 3.0,
         expected_duration_seconds: Optional[float] = None,
         done_timeout_seconds: float = 300.0,
+        fire_and_forget: bool = False,
     ) -> None:
         """
         Play on each configured target (coordinator-aware), in parallel with a limit.
 
         Acquires a snapshot on first call; subsequent calls reuse the held snapshot.
         Does NOT restore — caller must invoke restore_all() when the batch is done.
+
+        If fire_and_forget=True, returns as soon as Sonos starts playing
+        (does not wait for playback to finish or add tail padding).
         """
         targets = self._resolve_targets()
         if not targets:
@@ -75,21 +79,34 @@ class SonosPlayback:
         sem = asyncio.Semaphore(max(1, int(concurrency)))
         loop = asyncio.get_running_loop()
 
-        async def run_one(item: "_ResolvedTarget") -> None:
-            async with sem:
-                member_vols = item.member_volumes if volume is None else None
-                await loop.run_in_executor(
-                    None,
-                    self._play_url_blocking,
-                    item.device,
-                    url,
-                    volume if volume is not None else item.volume,
-                    title,
-                    float(tail_padding_seconds),
-                    float(expected_duration_seconds) if expected_duration_seconds is not None else None,
-                    float(done_timeout_seconds),
-                    member_vols,
-                )
+        if fire_and_forget:
+            async def run_one(item: "_ResolvedTarget") -> None:
+                async with sem:
+                    await loop.run_in_executor(
+                        None,
+                        self._start_playback_only,
+                        item.device,
+                        url,
+                        volume if volume is not None else item.volume,
+                        title,
+                        item.member_volumes if volume is None else None,
+                    )
+        else:
+            async def run_one(item: "_ResolvedTarget") -> None:
+                async with sem:
+                    member_vols = item.member_volumes if volume is None else None
+                    await loop.run_in_executor(
+                        None,
+                        self._play_url_blocking,
+                        item.device,
+                        url,
+                        volume if volume is not None else item.volume,
+                        title,
+                        float(tail_padding_seconds),
+                        float(expected_duration_seconds) if expected_duration_seconds is not None else None,
+                        float(done_timeout_seconds),
+                        member_vols,
+                    )
 
         await asyncio.gather(*(run_one(t) for t in targets))
 
@@ -110,6 +127,38 @@ class SonosPlayback:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _start_playback_only(
+        self, spk, url: str, volume: Optional[int], title: str,
+        member_volumes: Optional[Dict[str, int]] = None,
+    ) -> None:
+        """Start playback and return immediately once Sonos begins playing."""
+        ip = getattr(spk, "ip_address", "unknown")
+        self._acquire_snapshot(spk)
+        try:
+            spk.play_uri(url, title=title, start=True)
+            if member_volumes:
+                for member_ip, member_vol in member_volumes.items():
+                    try:
+                        self._SoCo(member_ip).volume = max(0, min(100, int(member_vol)))
+                    except Exception:
+                        pass
+                coord_ip = getattr(spk, "ip_address", None)
+                if coord_ip and coord_ip not in member_volumes:
+                    try:
+                        spk.volume = max(0, min(100, int(volume if volume is not None else self._default_volume)))
+                    except Exception:
+                        pass
+            else:
+                try:
+                    spk.volume = max(0, min(100, int(volume if volume is not None else self._default_volume)))
+                except Exception:
+                    pass
+            _wait_for_playing(spk, timeout_seconds=2.0)
+            _log.info("fire_and_forget_started", speaker=ip)
+        except Exception:
+            _log.exception("fire_and_forget_failed", speaker=ip)
+            raise
 
     def _play_url_blocking(
         self,
