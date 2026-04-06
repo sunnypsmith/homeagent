@@ -299,7 +299,8 @@ async def run_voice_service() -> None:
 
     def _set_led(room_id: str, state: str) -> None:
         try:
-            mqttc.publish_json("%s/voice/%s/led" % (base, room_id), state)
+            topic = "%s/voice/%s/led" % (base, room_id)
+            mqttc._client.publish(topic, payload=state.encode("utf-8"), qos=0)
         except Exception:
             pass
 
