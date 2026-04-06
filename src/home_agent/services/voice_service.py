@@ -496,44 +496,55 @@ async def run_voice_service() -> None:
         Reads audio from room.audio_queue, assembles into Porcupine-sized
         frames, and posts wake events back to the event loop.
         """
+        thread_name = "porcupine-%s" % room.room_id
+        log.info("ww_thread_started", room=room.friendly_name, thread=thread_name)
         buf = bytearray()
-        while not _ww_stop.is_set():
-            # Skip processing when not listening or Sonos is playing
-            if room.state != RoomState.LISTENING or room.sonos_playing:
-                # Drain the queue to stay current
-                while not room.audio_queue.empty():
-                    try:
-                        room.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                buf.clear()
-                time.sleep(0.05)
-                continue
-
-            # Read audio from queue
-            try:
-                data = room.audio_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            buf.extend(data)
-
-            # Process complete frames
-            while len(buf) >= ww_frame_bytes:
-                frame_data = bytes(buf[:ww_frame_bytes])
-                del buf[:ww_frame_bytes]
-
-                # Cooldown check
-                if (time.monotonic() - room.last_wake_time) < wake_cooldown:
+        frames_processed = 0
+        try:
+            while not _ww_stop.is_set():
+                # Skip processing when not listening or Sonos is playing
+                if room.state != RoomState.LISTENING or room.sonos_playing:
+                    while not room.audio_queue.empty():
+                        try:
+                            room.audio_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    buf.clear()
+                    time.sleep(0.05)
                     continue
 
-                if room.porcupine is not None:
-                    frame_np = np.frombuffer(frame_data, dtype=np.int16)
-                    result = room.porcupine.process(frame_np.tolist())
-                    if result >= 0:
-                        # Post wake event back to the event loop
-                        loop.call_soon_threadsafe(_on_wake_detected, room)
-                        buf.clear()
-                        break
+                try:
+                    data = room.audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                buf.extend(data)
+
+                while len(buf) >= ww_frame_bytes:
+                    frame_data = bytes(buf[:ww_frame_bytes])
+                    del buf[:ww_frame_bytes]
+
+                    if (time.monotonic() - room.last_wake_time) < wake_cooldown:
+                        continue
+
+                    if room.porcupine is not None:
+                        try:
+                            frame_np = np.frombuffer(frame_data, dtype=np.int16)
+                            result = room.porcupine.process(frame_np.tolist())
+                            frames_processed += 1
+                        except Exception as e:
+                            log.warning("porcupine_error", room=room.friendly_name,
+                                        error=type(e).__name__, detail=str(e)[:100])
+                            continue
+                        if result >= 0:
+                            loop.call_soon_threadsafe(_on_wake_detected, room)
+                            buf.clear()
+                            break
+        except Exception as e:
+            log.exception("ww_thread_crashed", room=room.friendly_name,
+                          frames_processed=frames_processed)
+        finally:
+            log.warning("ww_thread_exited", room=room.friendly_name,
+                        frames_processed=frames_processed)
 
     def _on_wake_detected(room: Room) -> None:
         """Called on the event loop thread when a Porcupine thread detects a wake word."""
@@ -621,10 +632,17 @@ async def run_voice_service() -> None:
             for room_id, r in sorted(rooms.items()):
                 age = round(now - r.last_audio_at, 1) if r.last_audio_at > 0 else None
                 active = age is not None and age < 5.0
+                # Check if this room's Porcupine thread is alive
+                thread_alive = any(
+                    t.name == "porcupine-%s" % room_id and t.is_alive()
+                    for t in _ww_threads
+                )
                 log.info("room_status", room=r.friendly_name, room_id=room_id,
                          state=r.state, sonos_playing=r.sonos_playing,
                          active=active, frames=r.frames_received,
-                         wakes=r.wake_detections, stt_reqs=r.stt_requests)
+                         wakes=r.wake_detections, stt_reqs=r.stt_requests,
+                         porcupine_thread=thread_alive,
+                         queue_size=r.audio_queue.qsize())
                 mqttc.publish_json("%s/voice/room_status" % base, make_event(
                     source="voice-service", typ="voice.room_status", data={
                         "room_id": room_id, "room_name": r.friendly_name,
