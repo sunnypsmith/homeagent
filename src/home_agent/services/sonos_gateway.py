@@ -490,6 +490,12 @@ async def run_sonos_gateway() -> None:
                          total_ms=round((_t_play_done - _t0) * 1000),
                          offline=bool(offline_key))
                 log.info("announce_done")
+
+                # Publish playback_done after each announcement so voice service
+                # can clear sonos_playing and eventually trigger hold release
+                _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
+                mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
+
             except Exception as exc:
                 played_fallback = False
                 if offline_key:
