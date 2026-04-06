@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import queue
+import threading
 import time
 import wave
 from dataclasses import dataclass, field
@@ -67,8 +69,11 @@ class Room:
     wake_detections: int = 0
     stt_requests: int = 0
 
-    # Audio buffer (UDP packets append here, audio loop reads from here)
+    # Audio buffer (UDP packets append here, capture reads from here)
     raw_buffer: bytearray = field(default_factory=bytearray)
+
+    # Thread-safe queue for wake word detection (UDP handler → Porcupine thread)
+    audio_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500))
 
     # Sonos playback suppression — True while room's speakers are active
     sonos_playing: bool = False
@@ -107,6 +112,11 @@ class VoiceUDPProtocol(asyncio.DatagramProtocol):
         # Cap buffer to prevent unbounded growth during long Sonos playback
         if len(room.raw_buffer) < _MAX_RAW_BUFFER_BYTES:
             room.raw_buffer.extend(audio)
+        # Feed wake word detection thread (non-blocking, drop if full)
+        try:
+            room.audio_queue.put_nowait(audio)
+        except queue.Full:
+            pass
 
     def error_received(self, exc) -> None:
         self._log.warning("udp_error", error=str(exc))
@@ -481,37 +491,63 @@ async def run_voice_service() -> None:
             log.info("session_done", room=room.friendly_name)
 
     # ------------------------------------------------------------------
-    # Audio processing loop — only does wake word detection
+    # Per-room Porcupine threads — one thread per room for parallel wake detection
     # ------------------------------------------------------------------
 
-    async def _audio_loop() -> None:
-        while True:
-            processed = False
-            for room in rooms.values():
-                if room.state != RoomState.LISTENING or room.sonos_playing:
+    _ww_threads: List[threading.Thread] = []
+    _ww_stop = threading.Event()
+
+    def _wake_word_thread(room: Room) -> None:
+        """Dedicated thread for one room's wake word detection.
+
+        Reads audio from room.audio_queue, assembles into Porcupine-sized
+        frames, and posts wake events back to the event loop.
+        """
+        buf = bytearray()
+        while not _ww_stop.is_set():
+            # Skip processing when not listening or Sonos is playing
+            if room.state != RoomState.LISTENING or room.sonos_playing:
+                # Drain the queue to stay current
+                while not room.audio_queue.empty():
+                    try:
+                        room.audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                buf.clear()
+                time.sleep(0.05)
+                continue
+
+            # Read audio from queue
+            try:
+                data = room.audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            buf.extend(data)
+
+            # Process complete frames
+            while len(buf) >= ww_frame_bytes:
+                frame_data = bytes(buf[:ww_frame_bytes])
+                del buf[:ww_frame_bytes]
+
+                # Cooldown check
+                if (time.monotonic() - room.last_wake_time) < wake_cooldown:
                     continue
 
-                while len(room.raw_buffer) >= ww_frame_bytes:
-                    frame_data = bytes(room.raw_buffer[:ww_frame_bytes])
-                    del room.raw_buffer[:ww_frame_bytes]
+                if room.porcupine is not None:
                     frame_np = np.frombuffer(frame_data, dtype=np.int16)
+                    result = room.porcupine.process(frame_np.tolist())
+                    if result >= 0:
+                        # Post wake event back to the event loop
+                        loop.call_soon_threadsafe(_on_wake_detected, room)
+                        buf.clear()
+                        break
 
-                    if (time.monotonic() - room.last_wake_time) < wake_cooldown:
-                        continue
-
-                    if room.porcupine is not None:
-                        result = room.porcupine.process(frame_np.tolist())
-                        if result >= 0:
-                            log.info("wake_detected", room=room.friendly_name)
-                            _start_session(room)
-                            break
-
-                    processed = True
-
-            if not processed:
-                await asyncio.sleep(0.01)
-            else:
-                await asyncio.sleep(0.001)
+    def _on_wake_detected(room: Room) -> None:
+        """Called on the event loop thread when a Porcupine thread detects a wake word."""
+        if room.state != RoomState.LISTENING:
+            return
+        log.info("wake_detected", room=room.friendly_name)
+        _start_session(room)
 
     # ------------------------------------------------------------------
     # MQTT reader (button events + Sonos playback awareness)
@@ -611,17 +647,30 @@ async def run_voice_service() -> None:
     # Start
     # ------------------------------------------------------------------
 
-    audio_task = asyncio.create_task(_audio_loop())
+    # Launch one Porcupine thread per room
+    for room in rooms.values():
+        t = threading.Thread(
+            target=_wake_word_thread, args=(room,),
+            name="porcupine-%s" % room.room_id, daemon=True,
+        )
+        t.start()
+        _ww_threads.append(t)
+        log.info("porcupine_thread_started", room=room.friendly_name)
+
     mqtt_task = asyncio.create_task(_mqtt_reader())
     status_task = asyncio.create_task(_status_loop())
 
     try:
         log.info("voice_service_ready", rooms=list(room_configs.keys()),
-                 udp_port=udp_port, stt_provider=settings.voice_stt_provider)
+                 udp_port=udp_port, stt_provider=settings.voice_stt_provider,
+                 porcupine_threads=len(_ww_threads))
         await asyncio.Event().wait()
     finally:
         transport.close()
-        audio_task.cancel()
+        # Stop Porcupine threads
+        _ww_stop.set()
+        for t in _ww_threads:
+            t.join(timeout=2.0)
         mqtt_task.cancel()
         status_task.cancel()
         # Free Porcupine native instances
