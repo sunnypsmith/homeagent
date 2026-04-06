@@ -317,6 +317,7 @@ async def run_voice_service() -> None:
         room.wake_detections += 1
         room.last_wake_time = time.monotonic()
         room.raw_buffer.clear()
+        _publish_room_status(room)
         task = asyncio.create_task(_run_session(room))
         _active_tasks.add(task)
         def _on_done(t, _room=room):
@@ -494,6 +495,7 @@ async def run_voice_service() -> None:
             room.raw_buffer.clear()
             room.state = RoomState.LISTENING
             room.last_wake_time = time.monotonic()
+            _publish_room_status(room)
             log.info("session_done", room=room.friendly_name)
 
     # ------------------------------------------------------------------
@@ -603,6 +605,7 @@ async def run_voice_service() -> None:
                                     room.sonos_playing = True
                                     if room.state != RoomState.BUSY:
                                         room.raw_buffer.clear()
+                                    _publish_room_status(room)
                                     log.info("room_deaf", room=room.friendly_name,
                                              reason="sonos_playback_start")
 
@@ -624,6 +627,7 @@ async def run_voice_service() -> None:
                                         await asyncio.sleep(0.4)
                                         _set_led(_rid, "listening")
                                     asyncio.create_task(_flash_ready())
+                                _publish_room_status(room)
                                 log.info("room_undeaf", room=room.friendly_name,
                                          reason="sonos_playback_done")
                     except Exception as e:
@@ -637,34 +641,31 @@ async def run_voice_service() -> None:
     # Status loop
     # ------------------------------------------------------------------
 
+    def _publish_room_status(r: Room) -> None:
+        """Publish room status to MQTT for the dashboard."""
+        now = time.monotonic()
+        age = round(now - r.last_audio_at, 1) if r.last_audio_at > 0 else None
+        active = age is not None and age < 5.0
+        thread_alive = any(
+            t.name == "porcupine-%s" % r.room_id and t.is_alive()
+            for t in _ww_threads
+        )
+        mqttc.publish_json("%s/voice/room_status" % base, make_event(
+            source="voice-service", typ="voice.room_status", data={
+                "room_id": r.room_id, "room_name": r.friendly_name,
+                "active": active, "state": r.state,
+                "sonos_playing": r.sonos_playing,
+                "porcupine_thread": thread_alive,
+                "queue_size": r.audio_queue.qsize(),
+                "frames": r.frames_received, "wakes": r.wake_detections,
+                "stt_reqs": r.stt_requests,
+            }))
+
     async def _status_loop() -> None:
         while True:
             await asyncio.sleep(30.0)
-            now = time.monotonic()
             for room_id, r in sorted(rooms.items()):
-                age = round(now - r.last_audio_at, 1) if r.last_audio_at > 0 else None
-                active = age is not None and age < 5.0
-                # Check if this room's Porcupine thread is alive
-                thread_alive = any(
-                    t.name == "porcupine-%s" % room_id and t.is_alive()
-                    for t in _ww_threads
-                )
-                log.info("room_status", room=r.friendly_name, room_id=room_id,
-                         state=r.state, sonos_playing=r.sonos_playing,
-                         active=active, frames=r.frames_received,
-                         wakes=r.wake_detections, stt_reqs=r.stt_requests,
-                         porcupine_thread=thread_alive,
-                         queue_size=r.audio_queue.qsize())
-                mqttc.publish_json("%s/voice/room_status" % base, make_event(
-                    source="voice-service", typ="voice.room_status", data={
-                        "room_id": room_id, "room_name": r.friendly_name,
-                        "active": active, "state": r.state,
-                        "sonos_playing": r.sonos_playing,
-                        "porcupine_thread": thread_alive,
-                        "queue_size": r.audio_queue.qsize(),
-                        "frames": r.frames_received, "wakes": r.wake_detections,
-                        "stt_reqs": r.stt_requests,
-                    }))
+                _publish_room_status(r)
 
     # ------------------------------------------------------------------
     # Start
