@@ -541,7 +541,7 @@ async def run_sonos_gateway() -> None:
             # Peek for more messages to batch announcements.
             # During hold, use a longer peek (3s) to wait for the response announce
             # after the prompt. If nothing arrives, auto-release the hold.
-            peek_timeout = 3.0 if hold_active else 0.5
+            peek_timeout = 2.0 if hold_active else 0.5
             try:
                 pending_msg = await asyncio.wait_for(mqttc.next_message(), timeout=peek_timeout)
                 log.info("announce_batch_peek", queue_has_more=True)

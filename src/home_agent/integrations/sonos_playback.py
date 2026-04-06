@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import threading
 from dataclasses import dataclass
 from time import sleep
@@ -394,7 +395,44 @@ def _is_playing(soco_device) -> bool:
 
 
 def _wait_for_done_or_timeout(soco_device, timeout_seconds: float) -> None:
-    """Wait until Sonos stops playing. Tolerates transient network errors."""
+    """Wait until Sonos stops playing using UPnP event subscription.
+
+    Subscribes to avTransport events for instant notification when playback
+    stops, instead of polling. Falls back to polling if subscription fails.
+    """
+    ip = getattr(soco_device, "ip_address", "?")
+    sub = None
+    try:
+        sub = soco_device.avTransport.subscribe(auto_renew=False, requested_timeout=60)
+        _log.info("event_sub_ok", speaker=ip)
+    except Exception as e:
+        _log.warning("event_sub_failed", speaker=ip, error=type(e).__name__,
+                     detail=str(e)[:100])
+
+    if sub is not None:
+        try:
+            from queue import Empty
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                remaining = max(0.1, deadline - time.monotonic())
+                try:
+                    event = sub.events.get(timeout=min(remaining, 2.0))
+                    state = (event.variables or {}).get("transport_state", "")
+                    if str(state).upper() not in ("PLAYING", "TRANSITIONING"):
+                        _log.info("event_stopped", speaker=ip, state=state)
+                        return
+                except Empty:
+                    pass
+        except Exception as e:
+            _log.warning("event_wait_error", speaker=ip, error=type(e).__name__)
+        finally:
+            try:
+                sub.unsubscribe()
+            except Exception:
+                pass
+        return
+
+    # Fallback: poll transport state
     step = 0.5
     waited = 0.0
     consecutive_errors = 0
@@ -410,7 +448,7 @@ def _wait_for_done_or_timeout(soco_device, timeout_seconds: float) -> None:
             if consecutive_errors >= _DONE_POLL_MAX_CONSECUTIVE_ERRORS:
                 _log.warning(
                     "done_poll_abort",
-                    speaker=getattr(soco_device, "ip_address", "?"),
+                    speaker=ip,
                     consecutive_errors=consecutive_errors,
                 )
                 return
