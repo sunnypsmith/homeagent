@@ -45,6 +45,14 @@ pip install -e ".[caseta]"  # Lutron Caséta integration (+ CLI tools)
 pip install -e ".[ui]"      # Simple LAN web UI (buttons -> MQTT announce.request)
 pip install -e ".[snmp]"    # UPS monitoring via SNMP
 pip install -e ".[net]"     # Internet egress check (ping)
+pip install -e ".[voice]"  # Voice assistant (Porcupine, WebRTC VAD, noisereduce)
+pip install -e ".[llm-anthropic]"  # Anthropic Claude reasoning LLM
+```
+
+Install everything at once:
+
+```bash
+pip install -e ".[sonos,gcal,camect,caseta,ui,snmp,net,voice,llm-anthropic]"
 ```
 
 ## Quick start (Docker / recommended on Linux)
@@ -65,6 +73,7 @@ One-time DB migrations:
 docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0001_timescaledb.sql
 docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0002_events.sql
 docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0003_schedules.sql
+docker exec -i home-db psql -U homeagent -d homeagent < db/migrations/0004_events_ingested_idx.sql
 ```
 
 Seed default schedules:
@@ -83,7 +92,7 @@ docker exec -it home-time-trigger home-agent seed-schedules
 - `home-agent morning-briefing-agent`: time event -> weather + LLM (+ optional calendar ICS) -> announce.request
 - `home-agent hourly-chime-agent`: time event -> announce.request
 - `home-agent fixed-announcement-agent`: time event -> announce.request
-- `home-agent camect-agent`: Camect hub -> MQTT camera events (+ optional announcements)
+- `home-agent camect-agent`: Camect hub -> MQTT camera events (+ optional announcements). Supports `--instance 2` for multi-hub setups.
 - `home-agent caseta-agent`: Lutron Caséta bridge -> MQTT commands/events
 - `home-agent camera-lighting-agent`: camera events -> Caséta lighting automation
 - `home-agent hourly-house-check-agent`: scheduled checks (e.g., Temp Stick thresholds)
@@ -133,7 +142,7 @@ Set these in your repo-root `.env`.
 
 ### Remote site check (optional)
 
-Ping-based reachability check for a remote site (e.g., across a VPN):
+TCP reachability check for a remote site (e.g., across a VPN):
 
 ```bash
 REMOTE_SITE_CHECK_ENABLED=true
@@ -380,6 +389,30 @@ SUNSET_SCENE_ENABLED=true
 SUNSET_SCENE_NAME=Nighttime
 SUNSET_SCENE_OFFSET_MINUTES=0
 ```
+
+### Multi-hub Camect (optional)
+
+Run a second Camect agent instance for a remote hub (e.g., Costa Rica):
+
+```bash
+# In .env — add CAMECT2_* variables
+CAMECT2_ENABLED=true
+CAMECT2_HUB_LABEL=Costa Rica
+CAMECT2_HOST=10.1.4.245:443
+CAMECT2_USERNAME=admin
+CAMECT2_PASSWORD=YOUR_PASSWORD
+CAMECT2_CAMERA_RULES="Living Room:person,vehicle;Kitchen:person,vehicle"
+CAMECT2_VISION_ENABLED=true
+CAMECT2_VISION_MODEL=gpt-4.1-mini
+```
+
+Run with `--instance 2`:
+
+```bash
+home-agent camect-agent --instance 2
+```
+
+Announcements are prefixed with the hub label: "Costa Rica: person detected at Kitchen."
 
 ### Camect rules + camera → lighting (optional)
 

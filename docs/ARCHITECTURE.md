@@ -75,7 +75,7 @@ Pluggable unit of behavior. A module's `start(ctx)` typically:
 ## Integrations
 
 ### LLM
-`integrations/llm.py` is an OpenAI-compatible `/v1/chat/completions` client. Supports tool calling (used by `voice-intent-agent`).
+`integrations/llm.py` is an OpenAI-compatible `/v1/chat/completions` client. Supports tool calling (used by `voice-intent-agent`). Defaults to `temperature=0.3` and `max_tokens=1024` when callers don't specify — prevents accidental high-randomness outputs. The Anthropic client (`llm_anthropic.py`) has matching defaults.
 
 ### LLM Fallback Router
 `integrations/llm_router.py` wraps one or more LLM providers with automatic failover. If the primary provider fails (timeout, HTTP error), the router retries the request on the fallback provider. Configure with `LLM_FALLBACK_*` environment variables.
@@ -106,24 +106,34 @@ The common "true speech on Sonos" pipeline is:
 4) if more announcements are queued, play them without restoring in between
 5) restore the previous queue/state after the batch is done
 
+During voice sessions, the gateway enters **hold mode** (via `sonos.hold` events from the voice service) to skip the snapshot restore between the prompt and response — keeping the speaker ready for back-to-back announcements.
+
 Quiet hours and mute are **hard-enforced** in `sonos-gateway`.
 
 ### Camect
 Camera integration is handled by the `camect-agent` service:
 - connects to a Camect hub over websocket
 - publishes `camera.event` to MQTT for each matched detection
-- optionally enriches announcements with a vision LLM (before/after image comparison)
+- optionally enriches announcements with a vision LLM (before/after image comparison, temperature 0.2 for consistency)
 - identifies vehicle color/make/model, delivery carriers, and person descriptions
 - supports a separate vision endpoint (`CAMECT_VISION_BASE_URL`) or falls back to the main LLM
+- **multi-hub support**: run additional instances with `--instance 2` reading from `CAMECT2_*` env vars
+- each hub gets a label (e.g., "Lynchburg", "Costa Rica") prepended to announcements
 
 ### Temp Stick
-`integrations/tempstick.py` fetches sensor data via Temp Stick API (temperature + humidity).
+`integrations/tempstick.py` fetches sensor data via Temp Stick API (temperature + humidity). The house check agent supports multiple sensors with per-sensor thresholds via `TEMPSTICK_EXTRA_SENSORS` (e.g., remote locations with different climate ranges). Alerts are skipped for offline sensors to avoid false positives on stale data.
 
 ### UPS (SNMP)
 `integrations/ups_snmp.py` reads UPS input voltage/frequency via SNMP (UPS-MIB by default).
 
 ### Internet egress
 `integrations/internet_check.py` runs a ping sample to estimate latency + packet loss.
+
+### Remote site check
+`hourly_house_check_agent.py` includes a TCP-based reachability check for remote sites (e.g., across a VPN). Uses TCP connect to port 443 instead of ICMP for Docker compatibility.
+
+### API retry
+All HTTP-based integrations use a shared `api_retry` decorator (`integrations/_retry.py`): 3 attempts with exponential backoff on timeout and network errors. Covers TTS, STT, weather, TempStick, SimpleFIN, calendar, news feeds, and dashboard scrape.
 
 ### SimpleFIN
 `integrations/simplefin.py` fetches account balances via SimpleFIN API (read-only financial data).

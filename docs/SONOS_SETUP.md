@@ -182,12 +182,25 @@ When multiple announcements arrive in quick succession (e.g. several camera even
 
 This avoids the jarring start/stop/start of music between rapid-fire announcements.
 
+## TTS text normalization
+
+Before generating TTS audio, the sonos-gateway runs each announcement through a fast LLM pass to expand abbreviations (mph → miles per hour, F → Fahrenheit), spell out numbers, and fix punctuation. This ensures the TTS engine produces natural-sounding speech regardless of how the source formats text. Skipped for offline (pre-recorded) audio.
+
 ## Playback events (voice coordination)
 
 The gateway publishes events on `homeagent/sonos/playback` to coordinate with the voice service:
 
 - **`sonos.playback_start`**: published immediately before audio plays. Contains `data.targets` (speaker aliases being used). The voice service uses this to go "deaf" and avoid picking up its own announcements.
 - **`sonos.playback_done`**: published after playback ends and the prior queue/state has been restored. The voice service resumes listening.
+
+## Hold mode (voice sessions)
+
+The gateway also subscribes to `homeagent/sonos/hold` events:
+
+- **`sonos.hold` (start)**: the voice service sends this at the beginning of a voice session. The gateway skips snapshot restore between announcements (prompt + response play back-to-back without the costly restore/re-snapshot cycle).
+- **`sonos.hold` (release)**: sent when the response finishes playing. The gateway restores the original speaker state (e.g., resumes music). Hold auto-expires after 30 seconds as a safety net.
+
+When the speaker is idle (not playing music), the gateway skips the snapshot entirely — there's nothing to restore. This saves 1-2 seconds per announcement.
 
 These events are also displayed on the `/status` dashboard.
 

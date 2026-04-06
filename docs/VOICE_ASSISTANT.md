@@ -28,13 +28,17 @@ Device configs live in `esphome/`. Each Atom Echo streams 16 kHz 16-bit PCM audi
 
 ### Device configs
 
-| File | Room | Room ID | Listen Port |
-|------|------|---------|-------------|
-| `atom-echo-voice.yaml` | Office | `offi` | 9200 |
-| `atom-echo-voice-office.yaml` | Office (alt) | `offi` | 9200 |
-| `atom-echo-bedroom.yaml` | Bedroom | `bedr` | 9203 |
-| `atom-echo-kitchen.yaml` | Kitchen | `ktch` | 9201 |
-| `atom-echo-dining.yaml` | Dining | `dine` | 9202 |
+| File | Room | Room ID |
+|------|------|---------|
+| `atom-echo-voice.yaml` | Office | `offi` |
+| `atom-echo-voice-office.yaml` | Office (alt) | `offi` |
+| `atom-echo-bedroom.yaml` | Bedroom | `bedr` |
+| `atom-echo-kitchen.yaml` | Kitchen | `ktch` |
+| `atom-echo-dining.yaml` | Dining | `dinr` |
+| `atom-echo-tilly.yaml` | Tilly | `till` |
+| `atom-echo-twins.yaml` | Twins | `twin` |
+| `atom-echo-theater.yaml` | Theater | `thtr` |
+| `atom-echo-closet.yaml` | Closet | `clst` |
 
 Shared files:
 - `esphome/secrets.yaml` — WiFi, API, and OTA credentials
@@ -162,6 +166,13 @@ The voice-intent-agent subscribes to `voice.command` MQTT events and uses an LLM
 | `homeagent/voice/{room_id}/button` | ESPHome device → voice-service | Button pressed/released (push-to-talk) |
 | `homeagent/voice/{room_id}/status` | ESPHome device (retained) | Device birth (`online`) / will (`offline`) |
 | `homeagent/voice/room_status` | voice-service → UI | Periodic room status for the dashboard |
+| `homeagent/sonos/hold` | voice-service → sonos-gateway | Hold start/release for voice sessions |
+
+## Sonos Hold Mode
+
+During a voice session, the voice service publishes `sonos.hold` start/release events. The Sonos gateway uses these to skip the snapshot restore between the prompt and the response — keeping the speaker in "announcement mode" for the entire interaction. This avoids the costly snapshot/restore cycle between turns.
+
+Hold release is event-driven: the voice service marks the room for release when the session ends, and the actual release is triggered by the next `sonos.playback_done` event (when the response finishes playing). This means short answers release quickly and long answers play to completion — no fixed timer.
 
 ## DEAF State (Feedback Suppression)
 
@@ -229,17 +240,20 @@ Additionally, audio with very low RMS energy (< 50) is skipped as a likely false
 - Check audio duration: very short captures (< 0.5s) often produce poor results
 - The hallucination filter catches common Whisper artifacts, but unusual noise may still produce nonsensical transcriptions
 
-### No Sonos response after command
+### STT returning garbage (continued)
 
-- Verify `VOICE_ROOM_SPEAKERS` maps the room ID to a valid Sonos speaker alias
-- Check that `sonos-gateway` is running and processing `announce.request` events
-- Verify quiet hours are not suppressing the response
-ocessed` log: if `raw_rms` is very low (under 200), the mic is too far away or the room is too noisy for usable capture
+- Check the `audio_processed` log: if `raw_rms` is very low (under 200), the mic is too far away or the room is too noisy for usable capture
 - The noise reduction and normalization pipeline helps significantly, but audio with RMS below 50 is rejected entirely
-- The hallucination filter catches common Whisper artifacts, but unusual noise may still produce nonsensical transcriptions
 
 ### No Sonos response after command
 
 - Verify `VOICE_ROOM_SPEAKERS` maps the room ID to a valid Sonos speaker alias
 - Check that `sonos-gateway` is running and processing `announce.request` events
 - Verify quiet hours are not suppressing the response
+- Check the sonos-gateway logs for `announce_timing` — this shows normalize, TTS, and Sonos play durations
+
+### LED stuck on yellow/blue
+
+- The LED returns to green only when `sonos.playback_done` is received AND the room is in LISTENING state
+- If the LED stays yellow after a response, the Sonos hold release may not have fired — check for `sonos_hold_released` in voice-service logs
+- For rooms without speakers, the LED resets immediately after the session ends

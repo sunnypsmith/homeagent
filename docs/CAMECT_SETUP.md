@@ -104,10 +104,39 @@ Notes:
 - The model is prompted to identify vehicle color/make/model, delivery carrier branding, and person descriptions.
 - If the "before" snapshot is unavailable, the agent falls back to single-image analysis.
 
+## Multi-hub support
+
+Run multiple Camect hubs by adding `CAMECT2_*` (or `CAMECT3_*`, etc.) env vars:
+
+```bash
+CAMECT2_ENABLED=true
+CAMECT2_HUB_LABEL=Costa Rica
+CAMECT2_HOST=10.1.4.245:443
+CAMECT2_USERNAME=admin
+CAMECT2_PASSWORD=YOUR_PASSWORD
+CAMECT2_CAMERA_RULES="Living Room:person,vehicle;Kitchen:person,vehicle"
+CAMECT2_EMAIL_ALERT_PICS_TO=you@pushover-email.net
+CAMECT2_VISION_ENABLED=true
+CAMECT2_VISION_MODEL=gpt-4.1-mini
+CAMECT2_VISION_BASE_URL=https://api.openai.com/v1
+CAMECT2_VISION_API_KEY=sk-...
+```
+
+Run with the `--instance` flag:
+
+```bash
+home-agent camect-agent --instance 2
+```
+
+Each instance runs independently — if one hub's network goes down, the other continues unaffected. Announcements are prefixed with `CAMECT_HUB_LABEL` (e.g., "Costa Rica: person detected at Kitchen").
+
+Set `CAMECT_HUB_LABEL=Lynchburg` on your primary instance so its announcements are also labeled.
+
 ## Run
 
 ```bash
-home-agent camect-agent
+home-agent camect-agent              # instance 1 (CAMECT_*)
+home-agent camect-agent --instance 2 # instance 2 (CAMECT2_*)
 ```
 
 ## Troubleshooting
