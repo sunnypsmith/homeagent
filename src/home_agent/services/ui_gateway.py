@@ -503,9 +503,18 @@ if(vrk.length){{
 let vh='';
 for(const k of vrk){{
 const rm=vr[k];const act=rm.active;const st=rm.state||'?';
-const dc=st==='deaf'?'err':act?'ok':'dn';
+const deaf=rm.sonos_playing;const thr=rm.porcupine_thread;const qs=rm.queue_size||0;
+const dc=deaf?'err':!thr&&thr!==null?'err':st==='busy'?'wrn':act?'ok':'dn';
+const tm=rm.last_timing||{{}};
+const cmd=rm.last_command||'';const resp=rm.last_response||'';
 vh+=`<div class="vc"><div class="vn"><span class="dot ${{dc}}"></span>${{esc(rm.room_name||k)}}</div>`
-+`<div class="vs">${{st.toUpperCase()}}<br>Wakes: <b>${{rm.wakes||0}}</b> STT: <b>${{rm.stt_reqs||0}}</b></div></div>`;
++`<div class="vs">${{st.toUpperCase()}}${{deaf?' <b style="color:var(--err)">DEAF</b>':''}}`
++`${{thr===false?' <b style="color:var(--err)">THR DEAD</b>':''}}<br>`
++`Wakes: <b>${{rm.wakes||0}}</b> STT: <b>${{rm.stt_reqs||0}}</b> Q: <b>${{qs}}</b>`
++`${{tm.total_ms?'<br><span style="font-size:10px;color:var(--dim)">prompt:'+tm.prompt_ms+'ms cap:'+tm.capture_ms+'ms proc:'+tm.audio_process_ms+'ms stt:'+tm.stt_ms+'ms total:<b>'+tm.total_ms+'ms</b></span>':''}}`
++`${{cmd?'<br><span style="font-size:10px;color:var(--dim)">CMD: '+esc(cmd.substring(0,50))+'</span>':''}}`
++`${{resp?'<br><span style="font-size:10px;color:var(--dim)">RSP: '+esc(resp.substring(0,50))+'</span>':''}}`
++`</div></div>`;
 }}
 $('voice').innerHTML=vh;
 }}else{{$('voice').innerHTML='<div class="empty">No voice data yet</div>'}}
@@ -665,11 +674,25 @@ async def run_ui_gateway() -> None:
                             "room_name": data.get("room_name", rid),
                             "active": data.get("active", False),
                             "state": data.get("state", "unknown"),
+                            "sonos_playing": data.get("sonos_playing", False),
+                            "porcupine_thread": data.get("porcupine_thread", None),
+                            "queue_size": data.get("queue_size", 0),
                             "frames": data.get("frames", 0),
                             "wakes": data.get("wakes", 0),
                             "stt_reqs": data.get("stt_reqs", 0),
                             "ts": payload.get("ts", ""),
                         }
+                elif typ == "voice.session_timing":
+                    _voice_rooms.setdefault(data.get("room_id", ""), {}).update({
+                        "last_timing": {
+                            "prompt_ms": data.get("prompt_ms"),
+                            "capture_ms": data.get("capture_ms"),
+                            "audio_process_ms": data.get("audio_process_ms"),
+                            "stt_ms": data.get("stt_ms"),
+                            "total_ms": data.get("total_ms"),
+                        },
+                        "last_command": data.get("text", ""),
+                    })
                 elif typ == "voice.command":
                     _chat_history.appendleft({
                         "role": "user",
@@ -690,6 +713,11 @@ async def run_ui_gateway() -> None:
                         "room_name": data.get("room_name", ""),
                         "text": data.get("text", ""),
                     })
+                    rid = data.get("room_id", "")
+                    if rid:
+                        _voice_rooms.setdefault(rid, {}).update({
+                            "last_response": (data.get("text") or "")[:80],
+                        })
                     _chat_history.appendleft({
                         "role": "assistant",
                         "text": data.get("text", ""),

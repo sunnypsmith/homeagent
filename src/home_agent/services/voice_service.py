@@ -469,6 +469,19 @@ async def run_voice_service() -> None:
             log.info("session_command", room=room.friendly_name, text=text, topic=topic)
             _publish_command(room, text)
 
+            # Publish session timing for dashboard
+            t_total = time.monotonic()
+            mqttc.publish_json("%s/voice/session_timing" % base, make_event(
+                source="voice-service", typ="voice.session_timing", data={
+                    "room_id": room.room_id, "room_name": room.friendly_name,
+                    "prompt_ms": round((t1 - t0) * 1000),
+                    "capture_ms": round((t2 - t1) * 1000),
+                    "audio_process_ms": round((t3 - t2) * 1000),
+                    "stt_ms": round((t4 - t3) * 1000),
+                    "total_ms": round((t_total - t0) * 1000),
+                    "text": text[:80],
+                }))
+
         except Exception as e:
             log.exception("session_failed", room=room.friendly_name)
             reporter.report_error("voice_session_failed", e)
@@ -646,6 +659,9 @@ async def run_voice_service() -> None:
                     source="voice-service", typ="voice.room_status", data={
                         "room_id": room_id, "room_name": r.friendly_name,
                         "active": active, "state": r.state,
+                        "sonos_playing": r.sonos_playing,
+                        "porcupine_thread": thread_alive,
+                        "queue_size": r.audio_queue.qsize(),
                         "frames": r.frames_received, "wakes": r.wake_detections,
                         "stt_reqs": r.stt_requests,
                     }))
