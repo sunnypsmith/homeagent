@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from home_agent.integrations._retry import api_retry
+
 
 @dataclass(frozen=True)
 class TempStickSensor:
@@ -21,6 +23,7 @@ class TempStickClient:
         self._api_key = api_key
         self._timeout = float(timeout_seconds)
 
+    @api_retry
     async def list_sensors(self) -> List[TempStickSensor]:
         url = "https://tempstickapi.com/api/v1/sensors/all"
         headers = {"X-API-KEY": self._api_key}
@@ -37,6 +40,7 @@ class TempStickClient:
             sensors.append(_parse_sensor(item))
         return sensors
 
+    @api_retry
     async def get_sensor(self, sensor_id: str) -> Optional[TempStickSensor]:
         if not sensor_id:
             return None

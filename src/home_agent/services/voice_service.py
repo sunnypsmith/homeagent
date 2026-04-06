@@ -172,7 +172,9 @@ def _process_audio_for_stt(pcm: bytes, *, sample_rate: int = SAMPLE_RATE, log) -
 async def _transcribe_with_fallback(audio_wav: bytes, *, stt_api_key: str, stt_model: str,
                                      stt_language: str, fallback_api_key: str, log) -> Optional[str]:
     import httpx
+    from home_agent.integrations._retry import api_retry
 
+    @api_retry
     async def _call_stt(url: str, api_key: str, model: str) -> Optional[str]:
         headers = {"Authorization": "Bearer %s" % api_key}
         files = {"file": ("command.wav", audio_wav, "audio/wav")}
@@ -288,6 +290,10 @@ async def run_voice_service() -> None:
             data={"room_id": room.room_id, "room_name": room.friendly_name, "text": text})
         mqttc.publish_json("%s/voice/command" % base, evt)
 
+    def _set_led(room_id: str, state: str) -> None:
+        topic = "%s/voice/%s/led" % (base, room_id)
+        mqttc._client.publish(topic, payload=state.encode(), qos=0)
+
     async def _capture_audio(room: Room, duration_limit: float) -> bytes:
         """Capture audio from the room's buffer with VAD silence detection.
 
@@ -344,6 +350,7 @@ async def run_voice_service() -> None:
 
         try:
             t0 = time.monotonic()
+            _set_led(room.room_id, "wake")
 
             # Tell sonos gateway to hold speakers open (skip restore between announcements)
             if has_speakers:
@@ -358,6 +365,7 @@ async def run_voice_service() -> None:
 
             # Step 2: Wait for prompt to play on Sonos (~3s)
             room.raw_buffer.clear()
+            _set_led(room.room_id, "capturing")
             if has_speakers:
                 await asyncio.sleep(3.0)
             # Keep the last 1s of audio in case the user started talking
@@ -383,7 +391,7 @@ async def run_voice_service() -> None:
                 log.info("session_too_short", room=room.friendly_name, bytes=len(audio_pcm))
                 return
 
-            # "One moment" ack is now played by voice-intent-agent on receipt
+            _set_led(room.room_id, "processing")
 
             # Step 5: Check raw audio quality
             arr = np.frombuffer(audio_pcm, dtype=np.int16)
@@ -430,15 +438,8 @@ async def run_voice_service() -> None:
             log.exception("session_failed", room=room.friendly_name)
             reporter.report_error("voice_session_failed", e)
         finally:
-            # Release sonos hold after a delay so the response has time to play
-            if has_speakers:
-                async def _release_hold():
-                    await asyncio.sleep(8.0)
-                    mqttc.publish_json("%s/sonos/hold" % base, make_event(
-                        source="voice-service", typ="sonos.hold",
-                        data={"action": "release", "room_id": room.room_id}))
-                    log.info("sonos_hold_released", room=room.friendly_name)
-                asyncio.create_task(_release_hold())
+            # Mark room for hold release on next playback_done
+            room._pending_hold_release = True
 
             # Session complete — return to listening
             room.raw_buffer.clear()
@@ -555,6 +556,15 @@ async def run_voice_service() -> None:
                                     if room.state != RoomState.BUSY:
                                         room.raw_buffer.clear()
                                         room.last_wake_time = time.monotonic()
+                                    if room.state == RoomState.LISTENING:
+                                        _set_led(room.room_id, "listening")
+                                if getattr(room, "_pending_hold_release", False):
+                                    room._pending_hold_release = False
+                                    mqttc.publish_json("%s/sonos/hold" % base, make_event(
+                                        source="voice-service", typ="sonos.hold",
+                                        data={"action": "release", "room_id": room.room_id}))
+                                    log.info("sonos_hold_released", room=room.friendly_name,
+                                             reason="playback_done")
                                     log.info("room_undeaf", room=room.friendly_name,
                                              reason="sonos_playback_done",
                                              busy=room.state == RoomState.BUSY)

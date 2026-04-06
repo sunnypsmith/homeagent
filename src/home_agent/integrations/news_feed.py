@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from home_agent.integrations._retry import api_retry
+
 
 @dataclass(frozen=True)
 class NewsHeadline:
@@ -18,6 +20,7 @@ class NewsFeedResult:
     headlines: List[NewsHeadline]
 
 
+@api_retry
 async def fetch_json_feed(
     *,
     url: str,

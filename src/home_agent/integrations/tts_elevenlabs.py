@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from home_agent.integrations._retry import api_retry
 from home_agent.integrations.tts import AudioBytes, TTSClient
 
 
@@ -21,6 +22,7 @@ class ElevenLabsTTSClient(TTSClient):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
 
+    @api_retry
     async def synthesize(
         self,
         *,

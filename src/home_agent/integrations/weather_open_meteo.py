@@ -6,6 +6,8 @@ from typing import Optional
 
 import httpx
 
+from home_agent.integrations._retry import api_retry
+
 
 @dataclass(frozen=True)
 class CurrentWeather:
@@ -57,6 +59,7 @@ class OpenMeteoClient:
             }
         return {}
 
+    @api_retry
     async def current(self) -> CurrentWeather:
         params = {
             "latitude": self._lat,
@@ -89,6 +92,7 @@ class OpenMeteoClient:
             wind_unit=str(units.get("wind_speed_10m") or ""),
         )
 
+    @api_retry
     async def forecast_today(self) -> TodayForecast:
         """
         Fetch today's daily forecast: high/low, precip chance/total, max wind.

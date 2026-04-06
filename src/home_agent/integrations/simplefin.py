@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from home_agent.integrations._retry import api_retry
+
 
 @dataclass(frozen=True)
 class SimpleFINAccount:
@@ -31,6 +33,7 @@ class SimpleFINClient:
         self._access_url = access_url.rstrip("/")
         self._timeout = float(timeout_seconds)
 
+    @api_retry
     async def fetch_accounts(self) -> List[SimpleFINAccount]:
         url = "%s/accounts?balances-only=1" % self._access_url
         last_exc: Optional[Exception] = None

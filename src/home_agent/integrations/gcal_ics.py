@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from home_agent.integrations._retry import api_retry
+
 
 @dataclass(frozen=True)
 class CalendarEvent:
@@ -36,6 +38,7 @@ class GoogleCalendarIcsClient:
         self._timeout = float(timeout_seconds)
         self._ics_url = u
 
+    @api_retry
     async def fetch_events(
         self,
         *,

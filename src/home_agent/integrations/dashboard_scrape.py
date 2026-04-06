@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from home_agent.integrations._retry import api_retry
+
 
 @dataclass(frozen=True)
 class DashboardMetrics:
@@ -36,6 +38,7 @@ class DashboardScraper:
         self._wait_seconds = float(wait_seconds)
         self._timeout = float(timeout_seconds)
 
+    @api_retry
     async def fetch_metrics(self) -> DashboardMetrics:
         screenshot_bytes = await self._take_screenshot()
         raw = await self._ask_llm(screenshot_bytes)
