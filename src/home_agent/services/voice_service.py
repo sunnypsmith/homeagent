@@ -78,10 +78,6 @@ class Room:
     # Sonos playback suppression — True while room's speakers are active
     sonos_playing: bool = False
 
-    # Pending hold release (set when session ends, cleared on playback_done)
-    pending_hold_release: bool = False
-    _hold_release_task: Any = None
-
     # Timing
     last_wake_time: float = 0.0
 
@@ -477,10 +473,6 @@ async def run_voice_service() -> None:
             log.exception("session_failed", room=room.friendly_name)
             reporter.report_error("voice_session_failed", e)
         finally:
-            # Mark room for hold release on next playback_done (only if we started a hold)
-            if has_speakers:
-                room.pending_hold_release = True
-
             # Reset LED for rooms without speakers (no playback_done will come)
             if not has_speakers:
                 _set_led(room.room_id, "listening")
@@ -587,10 +579,6 @@ async def run_voice_service() -> None:
                                     room.sonos_playing = True
                                     if room.state != RoomState.BUSY:
                                         room.raw_buffer.clear()
-                                    # Cancel any pending hold release — more audio is coming
-                                    if room._hold_release_task is not None:
-                                        room._hold_release_task.cancel()
-                                        room._hold_release_task = None
                                     log.info("room_deaf", room=room.friendly_name,
                                              reason="sonos_playback_start")
 
@@ -608,21 +596,6 @@ async def run_voice_service() -> None:
                                     room.last_wake_time = time.monotonic()
                                 if room.state == RoomState.LISTENING:
                                     _set_led(room.room_id, "listening")
-                                # Defer hold release — wait 3s for more playback
-                                if room.pending_hold_release:
-                                    if room._hold_release_task is not None:
-                                        room._hold_release_task.cancel()
-                                    async def _deferred_release(_room=room):
-                                        await asyncio.sleep(3.0)
-                                        if _room.pending_hold_release:
-                                            _room.pending_hold_release = False
-                                            _room._hold_release_task = None
-                                            mqttc.publish_json("%s/sonos/hold" % base, make_event(
-                                                source="voice-service", typ="sonos.hold",
-                                                data={"action": "release", "room_id": _room.room_id}))
-                                            log.info("sonos_hold_released", room=_room.friendly_name,
-                                                     reason="playback_done_deferred")
-                                    room._hold_release_task = asyncio.create_task(_deferred_release())
                                 log.info("room_undeaf", room=room.friendly_name,
                                          reason="sonos_playback_done")
                     except Exception as e:

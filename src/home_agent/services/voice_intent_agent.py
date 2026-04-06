@@ -236,6 +236,13 @@ async def run_voice_intent_agent() -> None:
             announce_evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
             mqttc.publish_json("%s/announce/request" % base, announce_evt)
 
+    def _release_hold(room_id: str) -> None:
+        """Tell the sonos gateway to release the hold for this room."""
+        mqttc.publish_json("%s/sonos/hold" % base, make_event(
+            source="voice-intent-agent", typ="sonos.hold",
+            data={"action": "release", "room_id": room_id}))
+        log.info("sonos_hold_released", room_id=room_id)
+
     def _respond_ack(key: str, speakers: Optional[List[str]]) -> None:
         """Play a pre-recorded acknowledgment."""
         if speakers and speakers != ["none"]:
@@ -611,6 +618,8 @@ async def run_voice_intent_agent() -> None:
                     _respond("I'm sorry, I had trouble processing that request.", room_id, room_name, speakers, _t0=_timing["t0"])
                 except Exception:
                     log.warning("error_response_failed", room=room_name)
+            finally:
+                _release_hold(room_id)
 
     finally:
         timeout_task.cancel()
