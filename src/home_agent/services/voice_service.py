@@ -595,7 +595,12 @@ async def run_voice_service() -> None:
                                     room.raw_buffer.clear()
                                     room.last_wake_time = time.monotonic()
                                 if room.state == RoomState.LISTENING:
-                                    _set_led(room.room_id, "listening")
+                                    # Brief bright flash then back to dim green — visible "ready" cue
+                                    _set_led(room.room_id, "wake")
+                                    async def _flash_ready(_rid=room.room_id):
+                                        await asyncio.sleep(0.4)
+                                        _set_led(_rid, "listening")
+                                    asyncio.create_task(_flash_ready())
                                 log.info("room_undeaf", room=room.friendly_name,
                                          reason="sonos_playback_done")
                     except Exception as e:
