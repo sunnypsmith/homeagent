@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -448,7 +448,7 @@ class TempStickSettings(BaseSettings):
             return []
         out: List[Dict[str, Any]] = []
         for chunk in raw.split(";"):
-            parts = [p.strip() for p in chunk.strip().split(":")]
+            parts = [p.strip() for p in chunk.strip().split(":", maxsplit=2)]
             if len(parts) < 2:
                 continue
             entry: Dict[str, Any] = {"name": parts[0]}

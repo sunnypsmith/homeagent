@@ -8,9 +8,8 @@ and learned actions store.
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -258,13 +257,14 @@ async def run_voice_intent_agent() -> None:
         # announce (special — needs text param)
         if name == "announce":
             text = args.get("text", "")
+            if not text:
+                return "I need some text to announce."
             targets = args.get("targets")
-            if text:
-                data: Dict[str, Any] = {"text": text}
-                if targets:
-                    data["targets"] = targets
-                evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
-                mqttc.publish_json("%s/announce/request" % base, evt)
+            data: Dict[str, Any] = {"text": text}
+            if targets:
+                data["targets"] = targets
+            evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
+            mqttc.publish_json("%s/announce/request" % base, evt)
             return "Done. I've made the announcement."
 
         # mute (special — needs minutes param)
@@ -433,6 +433,7 @@ async def run_voice_intent_agent() -> None:
 
                         elif "CANCEL" in interpretation:
                             _respond("Cancelled.", room_id, room_name, speakers, _t0=_timing["t0"])
+                            conv.add_user(text)
                             conv.add_assistant("Cancelled.")
                             log.info("pending_cancelled", room=room_name)
                             del pending_actions[room_id]
@@ -555,10 +556,15 @@ async def run_voice_intent_agent() -> None:
                     # try to get a better web-searched answer — but only for general
                     # knowledge questions, not queries our local tools can handle.
                     _local_keywords = {"weather", "temperature", "forecast", "wind",
-                                       "light", "lights", "scene", "camera", "sensor",
-                                       "humidity", "ups", "battery", "briefing", "mute"}
+                                       "lights?", "scene", "camera", "sensor",
+                                       "humidity", "ups", "battery", "briefing",
+                                       "mute", "unmute", "announce", "time",
+                                       "calendar", "schedule"}
                     _text_lower = text.lower()
-                    _skip_perplexity = any(kw in _text_lower for kw in _local_keywords)
+                    _skip_perplexity = any(
+                        re.search(r"\b" + kw + r"\b", _text_lower)
+                        for kw in _local_keywords
+                    )
                     if answer and perplexity_llm and not _skip_perplexity:
                         try:
                             pplx_answer = await perplexity_llm.chat(
@@ -568,7 +574,6 @@ async def run_voice_intent_agent() -> None:
                                 temperature=0.2,
                             )
                             if pplx_answer and len(pplx_answer.strip()) > 10:
-                                import re
                                 pplx_answer = re.sub(r"\[\d+\]", "", pplx_answer)  # [1] [2] etc
                                 pplx_answer = re.sub(r"(?<=\.)(\d{2,})", "", pplx_answer)  # .12367 trailing refs
                                 pplx_answer = re.sub(r"(?<=\w)(\d{4,})", "", pplx_answer)  # word12367
@@ -600,7 +605,12 @@ async def run_voice_intent_agent() -> None:
             except Exception as e:
                 log.exception("intent_processing_failed", room=room_name, text=text)
                 reporter.report_error("intent_processing_failed", e)
-                _respond("I'm sorry, I had trouble processing that request.", room_id, room_name, speakers, _t0=_timing["t0"])
+                conv.add_user(text)
+                conv.add_assistant("I'm sorry, I had trouble processing that request.")
+                try:
+                    _respond("I'm sorry, I had trouble processing that request.", room_id, room_name, speakers, _t0=_timing["t0"])
+                except Exception:
+                    log.warning("error_response_failed", room=room_name)
 
     finally:
         timeout_task.cancel()

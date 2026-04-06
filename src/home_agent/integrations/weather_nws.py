@@ -122,7 +122,7 @@ class NWSClient:
             t_unit, w_unit = "F", "mph"
         else:
             temp, wind, gusts = temp_c, wind_kmh, gust_kmh
-            t_unit, w_unit = "C", "m/s"
+            t_unit, w_unit = "C", "km/h"
 
         result = NWSCurrentWeather(
             temperature=round(temp, 1) if temp is not None else None,

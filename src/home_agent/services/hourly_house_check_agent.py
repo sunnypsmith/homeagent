@@ -61,6 +61,8 @@ def _check_sensor_thresholds(
 
     if sensor.offline:
         alerts.append("%s is offline" % label)
+        data["alerts"] = alerts
+        return data
 
     if temp_f is not None:
         if temp_low_f is not None and temp_f < float(temp_low_f):
@@ -241,7 +243,7 @@ async def _remote_site_check(*, host: str, label: str, ping_count: int = 5, time
             latencies.append(ms)
 
     loss = 100.0 * (total - successes) / total
-    data["ok"] = True
+    data["ok"] = successes > 0
     data["sent"] = total
     data["received"] = successes
     data["loss_percent"] = round(loss, 1)
@@ -506,7 +508,7 @@ async def run_hourly_house_check_agent() -> None:
                         payload_data["offline_audio_key"] = offline_key
                 else:
                     labels: List[str] = []
-                    for key in ("tempstick", "ups", "internet"):
+                    for key in ("tempstick", "ups", "internet", "remote_site"):
                         item = checks.get(key) or {}
                         if isinstance(item, dict) and item.get("alerts"):
                             label = item.get("label")

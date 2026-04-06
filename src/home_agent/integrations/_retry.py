@@ -8,11 +8,8 @@ import httpx
 
 api_retry = retry(
     retry=retry_if_exception_type((
-        httpx.ConnectTimeout,
-        httpx.ReadTimeout,
-        httpx.WriteTimeout,
-        httpx.ConnectError,
-        httpx.ReadError,
+        httpx.TimeoutException,
+        httpx.NetworkError,
         ConnectionError,
         TimeoutError,
     )),

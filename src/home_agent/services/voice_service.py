@@ -17,7 +17,7 @@ import time
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -45,6 +45,8 @@ VAD_FRAME_MS = 30
 VAD_FRAME_SAMPLES = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
 VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * SAMPLE_WIDTH
 
+_MAX_RAW_BUFFER_BYTES = SAMPLE_RATE * SAMPLE_WIDTH * 30  # 30 seconds max
+
 
 class RoomState:
     LISTENING = "listening"
@@ -70,6 +72,9 @@ class Room:
 
     # Sonos playback suppression — True while room's speakers are active
     sonos_playing: bool = False
+
+    # Pending hold release (set when session ends, cleared on playback_done)
+    pending_hold_release: bool = False
 
     # Timing
     last_wake_time: float = 0.0
@@ -99,7 +104,9 @@ class VoiceUDPProtocol(asyncio.DatagramProtocol):
         room.frames_received += 1
         room.bytes_received += len(audio)
         room.last_audio_at = time.monotonic()
-        room.raw_buffer.extend(audio)
+        # Cap buffer to prevent unbounded growth during long Sonos playback
+        if len(room.raw_buffer) < _MAX_RAW_BUFFER_BYTES:
+            room.raw_buffer.extend(audio)
 
     def error_received(self, exc) -> None:
         self._log.warning("udp_error", error=str(exc))
@@ -128,13 +135,11 @@ def _process_audio_for_stt(pcm: bytes, *, sample_rate: int = SAMPLE_RATE, log) -
 
     raw_rms = float(np.sqrt(np.mean(arr ** 2)))
 
-    # --- Noise reduction (spectral gating) ---
     cleaned = nr.reduce_noise(
         y=arr, sr=sample_rate, stationary=True, prop_decrease=0.75,
     )
 
-    # --- Trim leading/trailing silence ---
-    frame_len = int(sample_rate * 0.03)  # 30ms frames
+    frame_len = int(sample_rate * 0.03)
     energy_threshold = 30.0
     frame_energies = np.array([
         np.sqrt(np.mean(cleaned[i:i + frame_len] ** 2))
@@ -145,12 +150,11 @@ def _process_audio_for_stt(pcm: bytes, *, sample_rate: int = SAMPLE_RATE, log) -
         log.info("audio_process_all_silence", raw_rms=round(raw_rms, 1))
         return pcm
 
-    pad_frames = 5  # ~150ms padding on each side
+    pad_frames = 5
     start_frame = max(0, voiced[0] - pad_frames)
     end_frame = min(len(frame_energies), voiced[-1] + pad_frames + 1)
     cleaned = cleaned[start_frame * frame_len : end_frame * frame_len]
 
-    # --- Peak normalization (target 80% of int16 range) ---
     peak = np.max(np.abs(cleaned))
     if peak > 0:
         target = 0.8 * 32767
@@ -261,6 +265,9 @@ async def run_voice_service() -> None:
     log.info("voice_room_ids", room_ids=list(rooms.keys()),
              ww_frame_samples=ww_frame_samples)
 
+    # Keep strong references to session tasks so they aren't GC'd
+    _active_tasks: Set[asyncio.Task] = set()
+
     # UDP listener
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
@@ -291,14 +298,35 @@ async def run_voice_service() -> None:
         mqttc.publish_json("%s/voice/command" % base, evt)
 
     def _set_led(room_id: str, state: str) -> None:
-        topic = "%s/voice/%s/led" % (base, room_id)
-        mqttc._client.publish(topic, payload=state.encode(), qos=0)
+        try:
+            mqttc.publish_json("%s/voice/%s/led" % (base, room_id), state)
+        except Exception:
+            pass
+
+    def _start_session(room: Room) -> None:
+        """Common session-start logic for wake word and push-to-talk."""
+        room.state = RoomState.BUSY
+        room.wake_detections += 1
+        room.last_wake_time = time.monotonic()
+        room.raw_buffer.clear()
+        task = asyncio.create_task(_run_session(room))
+        _active_tasks.add(task)
+        def _on_done(t, _room=room):
+            _active_tasks.discard(t)
+            try:
+                exc = t.exception()
+                if exc is not None:
+                    log.exception("session_task_failed", room=_room.friendly_name)
+                    reporter.report_error("voice_session_failed", exc)
+            except asyncio.CancelledError:
+                pass
+        task.add_done_callback(_on_done)
 
     async def _capture_audio(room: Room, duration_limit: float) -> bytes:
         """Capture audio from the room's buffer with VAD silence detection.
 
-        Runs on the event loop so only one thread touches room.raw_buffer.
-        Returns the captured PCM audio.
+        Runs on the event loop — both this and datagram_received are
+        single-threaded, so raw_buffer access is serialized.
         """
         command_buf = bytearray()
         start = time.monotonic()
@@ -320,16 +348,15 @@ async def run_voice_service() -> None:
                 del room.raw_buffer[:ww_frame_bytes]
                 command_buf.extend(frame)
 
-                # VAD check on 30ms sub-frames
                 for i in range(0, len(frame) - VAD_FRAME_BYTES + 1, VAD_FRAME_BYTES):
                     sub = frame[i:i + VAD_FRAME_BYTES]
                     if len(sub) == VAD_FRAME_BYTES:
                         try:
                             if vad.is_speech(sub, SAMPLE_RATE):
-                                last_speech = now
+                                last_speech = time.monotonic()
                                 break
                         except Exception:
-                            pass
+                            log.warning("vad_error", room=room.friendly_name)
             else:
                 await asyncio.sleep(0.005)
 
@@ -341,7 +368,7 @@ async def run_voice_service() -> None:
 
     async def _run_session(room: Room) -> None:
         """Complete voice interaction session.
-        
+
         Owns the room from wake word through response playback.
         Room is BUSY for the entire duration.
         """
@@ -378,7 +405,7 @@ async def run_voice_service() -> None:
             log.info("session_timing", room=room.friendly_name,
                      step="prompt_wait", elapsed_ms=round((t1 - t0) * 1000))
 
-            # Step 3: Capture command audio (async, same loop — no buffer race)
+            # Step 3: Capture command audio
             log.info("session_capturing", room=room.friendly_name)
             audio_pcm = await _capture_audio(room, max_command_duration)
 
@@ -393,21 +420,21 @@ async def run_voice_service() -> None:
 
             _set_led(room.room_id, "processing")
 
-            # Step 5: Check raw audio quality
+            # Step 4: Check raw audio quality
             arr = np.frombuffer(audio_pcm, dtype=np.int16)
             rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
             if rms < 50:
                 log.info("session_quiet", room=room.friendly_name, rms=round(rms, 1))
                 return
 
-            # Step 6: Noise reduce, trim silence, normalize
+            # Step 5: Noise reduce, trim silence, normalize
             audio_pcm = _process_audio_for_stt(audio_pcm, log=log)
 
             t3 = time.monotonic()
             log.info("session_timing", room=room.friendly_name,
                      step="audio_process", elapsed_ms=round((t3 - t2) * 1000))
 
-            # Step 7: STT
+            # Step 6: STT
             room.stt_requests += 1
             log.info("session_stt", room=room.friendly_name,
                      audio_seconds=round(len(audio_pcm) / (SAMPLE_RATE * SAMPLE_WIDTH), 1))
@@ -424,12 +451,12 @@ async def run_voice_service() -> None:
                 log.info("session_stt_empty", room=room.friendly_name)
                 return
 
-            # Step 8: Filter hallucinations
+            # Step 7: Filter hallucinations
             if text.lower().rstrip(".!?,") in _WHISPER_HALLUCINATIONS:
                 log.info("session_hallucination", room=room.friendly_name, text=text)
                 return
 
-            # Step 9: Publish command
+            # Step 8: Publish command
             topic = "%s/voice/command" % base
             log.info("session_command", room=room.friendly_name, text=text, topic=topic)
             _publish_command(room, text)
@@ -438,8 +465,13 @@ async def run_voice_service() -> None:
             log.exception("session_failed", room=room.friendly_name)
             reporter.report_error("voice_session_failed", e)
         finally:
-            # Mark room for hold release on next playback_done
-            room._pending_hold_release = True
+            # Mark room for hold release on next playback_done (only if we started a hold)
+            if has_speakers:
+                room.pending_hold_release = True
+
+            # Reset LED for rooms without speakers (no playback_done will come)
+            if not has_speakers:
+                _set_led(room.room_id, "listening")
 
             # Session complete — return to listening
             room.raw_buffer.clear()
@@ -463,30 +495,15 @@ async def run_voice_service() -> None:
                     del room.raw_buffer[:ww_frame_bytes]
                     frame_np = np.frombuffer(frame_data, dtype=np.int16)
 
-                    # Cooldown
                     if (time.monotonic() - room.last_wake_time) < wake_cooldown:
                         continue
 
-                    # Wake word detection
                     if room.porcupine is not None:
                         result = room.porcupine.process(frame_np.tolist())
                         if result >= 0:
                             log.info("wake_detected", room=room.friendly_name)
-                            room.state = RoomState.BUSY
-                            room.wake_detections += 1
-                            room.last_wake_time = time.monotonic()
-                            room.raw_buffer.clear()
-                            task = asyncio.create_task(_run_session(room))
-                            def _on_session_done(t, _room=room):
-                                try:
-                                    exc = t.exception()
-                                    if exc is not None:
-                                        log.exception("session_task_failed", room=_room.friendly_name)
-                                        reporter.report_error("voice_session_failed", exc)
-                                except asyncio.CancelledError:
-                                    pass
-                            task.add_done_callback(_on_session_done)
-                            break  # stop processing this room's frames
+                            _start_session(room)
+                            break
 
                     processed = True
 
@@ -512,26 +529,13 @@ async def run_voice_service() -> None:
                     room = rooms.get(room_id)
                     if room and payload == "pressed" and room.state == RoomState.LISTENING:
                         log.info("push_to_talk", room=room.friendly_name)
-                        room.state = RoomState.BUSY
-                        room.wake_detections += 1
-                        room.last_wake_time = time.monotonic()
-                        room.raw_buffer.clear()
-                        task = asyncio.create_task(_run_session(room))
-                        def _on_session_done(t, _room=room):
-                            try:
-                                exc = t.exception()
-                                if exc is not None:
-                                    log.exception("session_task_failed", room=_room.friendly_name)
-                                    reporter.report_error("voice_session_failed", exc)
-                            except asyncio.CancelledError:
-                                pass
-                        task.add_done_callback(_on_session_done)
+                        _start_session(room)
 
                 elif len(parts) >= 4 and parts[-1] == "status":
                     room_id = parts[-2]
                     log.info("device_status", room=room_id, status=payload)
 
-                elif "sonos/playback" in topic:
+                elif len(parts) >= 3 and parts[-2] == "sonos" and parts[-1] == "playback":
                     try:
                         evt = msg.json()
                         evt_type = evt.get("type", "")
@@ -546,32 +550,37 @@ async def run_voice_service() -> None:
                                     if room.state != RoomState.BUSY:
                                         room.raw_buffer.clear()
                                     log.info("room_deaf", room=room.friendly_name,
-                                             reason="sonos_playback_start",
-                                             busy=room.state == RoomState.BUSY)
+                                             reason="sonos_playback_start")
 
                         elif evt_type == "sonos.playback_done":
+                            pb_targets = evt_data.get("targets", [])
                             for room in rooms.values():
-                                if room.sonos_playing:
-                                    room.sonos_playing = False
-                                    if room.state != RoomState.BUSY:
-                                        room.raw_buffer.clear()
-                                        room.last_wake_time = time.monotonic()
-                                    if room.state == RoomState.LISTENING:
-                                        _set_led(room.room_id, "listening")
-                                if getattr(room, "_pending_hold_release", False):
-                                    room._pending_hold_release = False
+                                if not room.sonos_playing:
+                                    continue
+                                # Only un-deafen rooms whose speakers match the targets
+                                speakers = room_speakers.get(room.room_id, [])
+                                if pb_targets and not any(s in pb_targets for s in speakers):
+                                    continue
+                                room.sonos_playing = False
+                                if room.state != RoomState.BUSY:
+                                    room.raw_buffer.clear()
+                                    room.last_wake_time = time.monotonic()
+                                if room.state == RoomState.LISTENING:
+                                    _set_led(room.room_id, "listening")
+                                if room.pending_hold_release:
+                                    room.pending_hold_release = False
                                     mqttc.publish_json("%s/sonos/hold" % base, make_event(
                                         source="voice-service", typ="sonos.hold",
                                         data={"action": "release", "room_id": room.room_id}))
                                     log.info("sonos_hold_released", room=room.friendly_name,
                                              reason="playback_done")
-                                    log.info("room_undeaf", room=room.friendly_name,
-                                             reason="sonos_playback_done",
-                                             busy=room.state == RoomState.BUSY)
-                    except Exception:
-                        pass
+                                log.info("room_undeaf", room=room.friendly_name,
+                                         reason="sonos_playback_done")
+                    except Exception as e:
+                        log.warning("sonos_event_error", error=type(e).__name__)
 
-            except Exception:
+            except Exception as e:
+                log.warning("mqtt_reader_error", error=type(e).__name__)
                 await asyncio.sleep(1.0)
 
     # ------------------------------------------------------------------
@@ -614,6 +623,13 @@ async def run_voice_service() -> None:
         audio_task.cancel()
         mqtt_task.cancel()
         status_task.cancel()
+        # Free Porcupine native instances
+        for room in rooms.values():
+            if room.porcupine is not None:
+                try:
+                    room.porcupine.delete()
+                except Exception:
+                    pass
         await mqttc.close()
 
 

@@ -322,8 +322,8 @@ async def run_sonos_gateway() -> None:
                     hold_active = False
                     if active_players:
                         await _restore_active()
-                    _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
-                    mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
+                        _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
+                        mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
                     log.info("sonos_hold_release", id=event_id, source=source)
                 continue
 
@@ -490,7 +490,7 @@ async def run_sonos_gateway() -> None:
                          total_ms=round((_t_play_done - _t0) * 1000),
                          offline=bool(offline_key))
                 log.info("announce_done")
-            except Exception:
+            except Exception as exc:
                 played_fallback = False
                 if offline_key:
                     try:
@@ -526,16 +526,11 @@ async def run_sonos_gateway() -> None:
                     except Exception:
                         pass
                 if not played_fallback:
-                    try:
-                        active_players.add(player2)
-                    except UnboundLocalError:
-                        pass
                     err_total += 1
                     last_err_at = loop.time()
                     last_err_kind = "announce_failed"
-                    exc_val = sys.exc_info()[1]
                     log.exception("announce_failed")
-                    reporter.report_error("announce_failed", exc_val)
+                    reporter.report_error("announce_failed", exc)
 
             # Peek for more messages to batch announcements (avoid restoring
             # music between rapid-fire announcements, then re-snapshotting).
@@ -546,6 +541,10 @@ async def run_sonos_gateway() -> None:
                 pass
     finally:
         status_task.cancel()
+        try:
+            host.close()
+        except Exception:
+            pass
         await mqttc.close()
 
 

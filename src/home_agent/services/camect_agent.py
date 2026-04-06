@@ -652,7 +652,6 @@ async def run_camect_agent(instance: int = 1) -> None:
                 now2 = time.monotonic()
                 last2 = last_email_by_cam.get(email_key, 0.0)
                 if (not throttle) or (now2 - last2) >= float(throttle):
-                    last_email_by_cam[email_key] = now2
                     ts_ms = _extract_ts_ms(evt)
                     try:
                         jpeg = await asyncio.to_thread(
@@ -719,6 +718,8 @@ async def run_camect_agent(instance: int = 1) -> None:
                                     to=addr,
                                     error=type(e2).__name__,
                                 )
+                        if sent_ok > 0:
+                            last_email_by_cam[email_key] = time.monotonic()
                         log.info("snapshot_email_attempted", camera=spoken_camera, ok=sent_ok, total=len(email_to))
                     except Exception as e:
                         # Snapshot fetch failure (or other pre-send failure) - mark all recipients as failed.
@@ -799,8 +800,9 @@ async def run_camect_agent(instance: int = 1) -> None:
                 text = "%sYour attention please. %s detected at %s." % (location_prefix, vision_desc, spoken_camera)
             else:
                 try:
-                    text = location_prefix + (camect_cfg.announce_template or "").format(
+                    raw_text = (camect_cfg.announce_template or "").format(
                         camera=spoken_camera, kind=kind, hub=hub_label)
+                    text = location_prefix + raw_text if "{hub}" not in (camect_cfg.announce_template or "") else raw_text
                 except Exception:
                     text = "%s%s detected at %s." % (location_prefix, kind, spoken_camera)
 
