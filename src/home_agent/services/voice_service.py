@@ -604,7 +604,6 @@ async def run_voice_service() -> None:
                                 room.sonos_playing = False
                                 if room.state != RoomState.BUSY:
                                     room.raw_buffer.clear()
-                                    room.last_wake_time = time.monotonic()
                                 if room.state == RoomState.LISTENING:
                                     # Brief bright flash then back to dim green — visible "ready" cue
                                     _set_led(room.room_id, "wake")
