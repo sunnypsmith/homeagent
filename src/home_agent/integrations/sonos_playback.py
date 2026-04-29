@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 import threading
 from dataclasses import dataclass
@@ -129,6 +130,41 @@ class SonosPlayback:
     # Internal
     # ------------------------------------------------------------------
 
+    def _log_volumes(self, spk, volume: Optional[int], member_volumes: Optional[Dict[str, int]]) -> None:
+        if member_volumes:
+            for member_ip, member_vol in member_volumes.items():
+                _log.info("volume_set", speaker=member_ip, volume=max(0, min(100, int(member_vol))))
+            coord_ip = getattr(spk, "ip_address", None)
+            if coord_ip and coord_ip not in member_volumes:
+                coord_vol = max(0, min(100, int(volume if volume is not None else self._default_volume)))
+                _log.info("volume_set_coordinator", speaker=coord_ip, volume=coord_vol)
+        else:
+            target_vol = max(0, min(100, int(volume if volume is not None else self._default_volume)))
+            _log.info("volume_set", speaker=getattr(spk, "ip_address", "unknown"), volume=target_vol)
+
+    def _set_volumes(self, spk, volume: Optional[int], member_volumes: Optional[Dict[str, int]]) -> None:
+        """Set volume on coordinator first, then individual members (members win)."""
+        if member_volumes:
+            coord_ip = getattr(spk, "ip_address", None)
+            if coord_ip and coord_ip not in member_volumes:
+                coord_vol = max(0, min(100, int(volume if volume is not None else self._default_volume)))
+                try:
+                    spk.volume = coord_vol
+                except Exception:
+                    pass
+            for member_ip, member_vol in member_volumes.items():
+                clamped = max(0, min(100, int(member_vol)))
+                try:
+                    self._SoCo(member_ip).volume = clamped
+                except Exception:
+                    pass
+        else:
+            target_vol = max(0, min(100, int(volume if volume is not None else self._default_volume)))
+            try:
+                spk.volume = target_vol
+            except Exception:
+                pass
+
     def _start_playback_only(
         self, spk, url: str, volume: Optional[int], title: str,
         member_volumes: Optional[Dict[str, int]] = None,
@@ -137,24 +173,9 @@ class SonosPlayback:
         ip = getattr(spk, "ip_address", "unknown")
         self._acquire_snapshot(spk)
         try:
+            self._set_volumes(spk, volume, member_volumes)
             spk.play_uri(url, title=title, start=True)
-            if member_volumes:
-                for member_ip, member_vol in member_volumes.items():
-                    try:
-                        self._SoCo(member_ip).volume = max(0, min(100, int(member_vol)))
-                    except Exception:
-                        pass
-                coord_ip = getattr(spk, "ip_address", None)
-                if coord_ip and coord_ip not in member_volumes:
-                    try:
-                        spk.volume = max(0, min(100, int(volume if volume is not None else self._default_volume)))
-                    except Exception:
-                        pass
-            else:
-                try:
-                    spk.volume = max(0, min(100, int(volume if volume is not None else self._default_volume)))
-                except Exception:
-                    pass
+            self._set_volumes(spk, volume, member_volumes)
             _wait_for_playing(spk, timeout_seconds=2.0)
             _log.info("fire_and_forget_started", speaker=ip)
         except Exception:
@@ -175,34 +196,12 @@ class SonosPlayback:
         ip = getattr(spk, "ip_address", "unknown")
         self._acquire_snapshot(spk)
         try:
+            # Set volume BEFORE play_uri so audio never starts at the wrong level,
+            # then reinforce AFTER to handle any Sonos group normalization.
+            self._set_volumes(spk, volume, member_volumes)
             spk.play_uri(url, title=title, start=True)
-            # Set volume AFTER play_uri to avoid Sonos group volume normalization
-            # that some firmware versions trigger when starting a new transport.
-            if member_volumes:
-                for member_ip, member_vol in member_volumes.items():
-                    clamped = max(0, min(100, int(member_vol)))
-                    try:
-                        member_spk = self._SoCo(member_ip)
-                        member_spk.volume = clamped
-                        _log.info("volume_set", speaker=member_ip, volume=clamped)
-                    except Exception as e:
-                        _log.warning("member_volume_failed", speaker=member_ip, volume=clamped, error=str(e))
-                # Also set on coordinator if not already covered by member_volumes.
-                coord_ip = getattr(spk, "ip_address", None)
-                if coord_ip and coord_ip not in member_volumes:
-                    coord_vol = int(volume if volume is not None else self._default_volume)
-                    try:
-                        spk.volume = max(0, min(100, coord_vol))
-                        _log.info("volume_set_coordinator", speaker=coord_ip, volume=coord_vol)
-                    except Exception as e:
-                        _log.warning("coordinator_volume_failed", speaker=coord_ip, error=str(e))
-            else:
-                target_vol = int(volume if volume is not None else self._default_volume)
-                try:
-                    spk.volume = max(0, min(100, target_vol))
-                    _log.info("volume_set", speaker=ip, volume=target_vol)
-                except Exception as e:
-                    _log.warning("volume_set_failed", speaker=ip, volume=target_vol, error=str(e))
+            self._set_volumes(spk, volume, member_volumes)
+            self._log_volumes(spk, volume, member_volumes)
             _wait_for_playing(spk, timeout_seconds=2.0)
             if expected_duration_seconds is not None and expected_duration_seconds > 0:
                 sleep(max(0.2, float(expected_duration_seconds) + 0.75))
@@ -249,6 +248,11 @@ class SonosPlayback:
         seen: Set[str] = set()
         out: List[_ResolvedTarget] = []
         for ip in self._speaker_ips:
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                _log.warning("skipping_invalid_speaker_ip", ip=ip)
+                continue
             d = self._SoCo(ip)
             try:
                 coord = d.group.coordinator

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -32,26 +32,13 @@ from home_agent.services.voice_registrations import (
 # System prompt
 # ------------------------------------------------------------------
 
-_BASE_SYSTEM_PROMPT = """You are Higgins, a helpful home assistant for the Smith family. You manage a smart home located in Lynchburg, Virginia.
+_BASE_SYSTEM_PROMPT = """You are Higgins, a helpful home assistant for the Smith family in Lynchburg, Virginia.
 
-RULES:
-- When the user gives a COMMAND, use the appropriate tool. Do NOT respond with text after a tool call.
-- When the user asks a QUESTION, use query_system if relevant data is available, otherwise answer conversationally.
-- For actions not covered by existing tools, use custom_action and construct the MQTT topic/payload.
+Use the appropriate tool when the user asks a question or gives a command. If no tool is relevant, respond conversationally.
 
 The user message is prefixed with [Room: name] indicating which room they are in.
 
-Format ALL output for spoken text-to-speech audio:
-- Spell out ALL numbers: '3' becomes 'three', '42' becomes 'forty two'.
-- Spell out times: '2:45 PM' becomes 'two forty five P M'.
-- Spell out dates: 'March 3rd' not 'March 3'.
-- Spell out currency: '$1,500' becomes 'fifteen hundred dollars'.
-- Spell out percentages: '22%' becomes 'twenty two percent'.
-- Expand ALL abbreviations and units to spoken words: 'mph' becomes 'miles per hour', 'F' becomes 'Fahrenheit', 'ft' becomes 'feet', 'lbs' becomes 'pounds', 'min' becomes 'minutes', 'hrs' becomes 'hours', 'NW' becomes 'northwest', etc.
-- No URLs, no markdown, no bullet points, no special characters.
-- Use short, natural sentences.
-
-Be concise. You are speaking out loud to a person in their home."""
+Format output for spoken audio: spell out all numbers, times, dates, currency, percentages, and units as words. No URLs, markdown, or special characters. Be concise."""
 
 
 # ------------------------------------------------------------------
@@ -72,36 +59,6 @@ class PendingAction:
     @property
     def is_expired(self) -> bool:
         return (time.monotonic() - self.created_at) > self.timeout_seconds
-
-
-@dataclass
-class RoomConversation:
-    messages: List[Dict[str, str]] = field(default_factory=list)
-    last_activity: float = 0.0
-
-    def add_user(self, text: str) -> None:
-        self.messages.append({"role": "user", "content": text})
-        self.last_activity = time.monotonic()
-        self._trim()
-
-    def add_assistant(self, text: str) -> None:
-        self.messages.append({"role": "assistant", "content": text})
-        self.last_activity = time.monotonic()
-        self._trim()
-
-    def _trim(self, max_messages: int = 40) -> None:
-        if len(self.messages) > max_messages:
-            self.messages = self.messages[-max_messages:]
-
-    def is_stale(self, max_age_seconds: float = 1800) -> bool:
-        return self.last_activity > 0 and (time.monotonic() - self.last_activity) > max_age_seconds
-
-    def get_messages(self) -> List[Dict[str, str]]:
-        return list(self.messages)
-
-    def clear(self) -> None:
-        self.messages.clear()
-        self.last_activity = 0.0
 
 
 # ------------------------------------------------------------------
@@ -201,7 +158,6 @@ async def run_voice_intent_agent() -> None:
     # --- State ---
     room_speakers = settings.voice_room_speakers_parsed
     pending_actions: Dict[str, PendingAction] = {}
-    conversations: Dict[str, RoomConversation] = {}
     learned = LearnedActionsStore()
     log.info("ready", queries=len(ctx.query_names), actions=len(ctx.action_names),
              room_speakers=room_speakers, learned_actions=len(learned.all()))
@@ -212,14 +168,6 @@ async def run_voice_intent_agent() -> None:
     # --- Helpers ---
     def _speakers_for_room(room_id: str) -> Optional[List[str]]:
         return room_speakers.get(room_id)
-
-    def _get_conversation(room_id: str) -> RoomConversation:
-        if room_id not in conversations:
-            conversations[room_id] = RoomConversation()
-        conv = conversations[room_id]
-        if conv.is_stale():
-            conv.clear()
-        return conv
 
     def _respond(text: str, room_id: str, room_name: str, speakers: Optional[List[str]], _t0: Optional[float] = None) -> None:
         """Send a response via Sonos and/or MQTT response topic."""
@@ -232,14 +180,14 @@ async def run_voice_intent_agent() -> None:
         mqttc.publish_json(response_topic, evt)
 
         if speakers and speakers != ["none"]:
-            data: Dict[str, Any] = {"text": text, "targets": speakers}
+            data: Dict[str, Any] = {"text": text, "targets": speakers, "exempt_mute": True, "exempt_quiet_hours": True}
             announce_evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
             mqttc.publish_json("%s/announce/request" % base, announce_evt)
 
     def _respond_ack(key: str, speakers: Optional[List[str]]) -> None:
         """Play a pre-recorded acknowledgment."""
         if speakers and speakers != ["none"]:
-            data: Dict[str, Any] = {"text": key, "offline_audio_key": key, "targets": speakers}
+            data: Dict[str, Any] = {"text": key, "offline_audio_key": key, "targets": speakers, "exempt_mute": True, "exempt_quiet_hours": True}
             evt = make_event(source="voice-intent-agent", typ="announce.request", data=data)
             mqttc.publish_json("%s/announce/request" % base, evt)
 
@@ -322,29 +270,14 @@ async def run_voice_intent_agent() -> None:
                 _respond_ack("voice_cancelled", speakers)
                 log.info("pending_expired", room=pa.room_name)
 
-    async def _midnight_cleanup() -> None:
-        """Clear all conversation histories at midnight."""
-        while True:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo(settings.timezone)
-            now = datetime.now(tz=tz)
-            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            wait_seconds = (tomorrow - now).total_seconds()
-            await asyncio.sleep(wait_seconds)
-            for conv in conversations.values():
-                conv.clear()
-            log.info("midnight_cleanup", rooms=len(conversations))
-
     async def _status_loop() -> None:
         while True:
             await asyncio.sleep(60.0)
             log.info("status", mqtt_connected=mqttc.is_connected,
-                     conversations=len(conversations),
                      pending=len(pending_actions),
                      learned=len(learned.all()))
 
     timeout_task = asyncio.create_task(_timeout_loop())
-    midnight_task = asyncio.create_task(_midnight_cleanup())
     status_task = asyncio.create_task(_status_loop())
 
     # --- Main loop ---
@@ -393,7 +326,6 @@ async def run_voice_intent_agent() -> None:
                 continue
 
             speakers = _speakers_for_room(room_id)
-            conv = _get_conversation(room_id)
             _timing = {"t0": time.monotonic()}
             log.info("voice_command", room=room_name, text=text, speakers=speakers)
 
@@ -419,8 +351,6 @@ async def run_voice_intent_agent() -> None:
                             mqttc.publish_json(pa.mqtt_topic, evt)
                             confirmation = "Done. %s" % pa.description
                             _respond(confirmation, room_id, room_name, speakers, _t0=_timing["t0"])
-                            conv.add_user(pa.original_text)
-                            conv.add_assistant(confirmation)
                             # Save as learned action
                             learned.save_action(
                                 phrase=pa.original_text, room_id=room_id,
@@ -433,8 +363,6 @@ async def run_voice_intent_agent() -> None:
 
                         elif "CANCEL" in interpretation:
                             _respond("Cancelled.", room_id, room_name, speakers, _t0=_timing["t0"])
-                            conv.add_user(text)
-                            conv.add_assistant("Cancelled.")
                             log.info("pending_cancelled", room=room_name)
                             del pending_actions[room_id]
                             continue
@@ -470,16 +398,14 @@ async def run_voice_intent_agent() -> None:
                             mqttc.publish_json(matched.mqtt_topic, evt)
                             confirmation = "Done. %s" % matched.description
                             _respond(confirmation, room_id, room_name, speakers, _t0=_timing["t0"])
-                            conv.add_user(text)
-                            conv.add_assistant(confirmation)
                             learned.record_use(matched)
                             continue
                     except (ValueError, IndexError):
                         pass
 
-                # --- Build messages with conversation history ---
+                # --- Build messages (stateless — each wake word is a fresh query) ---
                 system_prompt = _BASE_SYSTEM_PROMPT + "\n\n" + ctx.build_prompt_context()
-                messages = conv.get_messages() + [
+                messages = [
                     {"role": "user", "content": "[Room: %s] %s" % (room_name, text)},
                 ]
 
@@ -518,8 +444,6 @@ async def run_voice_intent_agent() -> None:
                                 mqtt_payload = reason_result.arguments.get("mqtt_payload", mqtt_payload)
                             elif isinstance(reason_result, LLMTextResponse):
                                 _respond(reason_result.text, room_id, room_name, speakers, _t0=_timing["t0"])
-                                conv.add_user(text)
-                                conv.add_assistant(reason_result.text)
                                 continue
 
                         if mqtt_topic and mqtt_payload:
@@ -535,20 +459,14 @@ async def run_voice_intent_agent() -> None:
                             )
                             confirm_text = "I can %s. Shall I go ahead?" % description
                             _respond(confirm_text, room_id, room_name, speakers, _t0=_timing["t0"])
-                            conv.add_user(text)
-                            conv.add_assistant(confirm_text)
                             log.info("pending_created", room=room_name, description=description)
                         else:
                             _respond("I'm not sure how to do that.", room_id, room_name, speakers, _t0=_timing["t0"])
-                            conv.add_user(text)
-                            conv.add_assistant("I'm not sure how to do that.")
                     else:
                         # Known tool — execute immediately
                         confirmation = await _execute_tool_call(result, room_id, room_name)
                         if confirmation:
                             _respond(confirmation, room_id, room_name, speakers, _t0=_timing["t0"])
-                            conv.add_user(text)
-                            conv.add_assistant(confirmation)
 
                 elif isinstance(result, LLMTextResponse):
                     answer = result.text
@@ -585,8 +503,6 @@ async def run_voice_intent_agent() -> None:
                             log.warning("perplexity_failed", error=str(e)[:100])
                     if answer:
                         _respond(answer, room_id, room_name, speakers, _t0=_timing["t0"])
-                        conv.add_user(text)
-                        conv.add_assistant(answer)
 
                 elif isinstance(result, list):
                     # Multiple tool calls
@@ -599,14 +515,10 @@ async def run_voice_intent_agent() -> None:
                     if responses:
                         combined = " ".join(responses)
                         _respond(combined, room_id, room_name, speakers, _t0=_timing["t0"])
-                        conv.add_user(text)
-                        conv.add_assistant(combined)
 
             except Exception as e:
                 log.exception("intent_processing_failed", room=room_name, text=text)
                 reporter.report_error("intent_processing_failed", e)
-                conv.add_user(text)
-                conv.add_assistant("I'm sorry, I had trouble processing that request.")
                 try:
                     _respond("I'm sorry, I had trouble processing that request.", room_id, room_name, speakers, _t0=_timing["t0"])
                 except Exception:
@@ -614,7 +526,6 @@ async def run_voice_intent_agent() -> None:
 
     finally:
         timeout_task.cancel()
-        midnight_task.cancel()
         status_task.cancel()
         await mqttc.close()
 

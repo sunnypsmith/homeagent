@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ipaddress
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_log = logging.getLogger(__name__)
 
 
 def _strip_quotes(s: str) -> str:
@@ -132,9 +136,15 @@ class SonosSettings(BaseSettings):
         for item in items:
             ip = aliases.get(item, item)
             ip = _strip_volume_suffix(ip)
-            if ip and ip not in seen:
-                seen.add(ip)
-                out.append(ip)
+            if not ip or ip in seen:
+                continue
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                _log.warning("resolve_targets: skipping %r (not a valid IP, alias %r unresolved)", ip, item)
+                continue
+            seen.add(ip)
+            out.append(ip)
         return out
 
 
@@ -832,13 +842,18 @@ class CamectSettings(BaseSettings):
     # Vision analysis of snapshots before announcing.
     vision_enabled: bool = Field(default=False, alias="CAMECT_VISION_ENABLED")
     vision_model: str = Field(
-        default="meta-llama/llama-4-maverick-17b-128e-instruct",
+        default="gemini-3-pro-preview",
         alias="CAMECT_VISION_MODEL",
     )
     vision_base_url: str = Field(default="", alias="CAMECT_VISION_BASE_URL")
     vision_api_key: str = Field(default="", alias="CAMECT_VISION_API_KEY")
     vision_detail: str = Field(default="auto", alias="CAMECT_VISION_DETAIL")
     vision_timeout_seconds: float = Field(default=10.0, alias="CAMECT_VISION_TIMEOUT_SECONDS")
+    # OpenALPR / Rekor CarCheck vehicle recognition.
+    alpr_enabled: bool = Field(default=False, alias="CAMECT_ALPR_ENABLED")
+    alpr_secret_key: str = Field(default="", alias="CAMECT_ALPR_SECRET_KEY")
+    alpr_region: str = Field(default="us", alias="CAMECT_ALPR_REGION")
+    alpr_timeout_seconds: float = Field(default=8.0, alias="CAMECT_ALPR_TIMEOUT_SECONDS")
 
     @field_validator(
         "hub_label",
@@ -853,6 +868,8 @@ class CamectSettings(BaseSettings):
         "vision_base_url",
         "vision_api_key",
         "vision_detail",
+        "alpr_secret_key",
+        "alpr_region",
         mode="before",
     )
     @classmethod
@@ -1129,17 +1146,26 @@ class AppSettings(BaseSettings):
     voice_rooms: str = Field(default="", alias="VOICE_ROOMS")
     voice_wake_model: str = Field(default="models/master_higgins.onnx", alias="VOICE_WAKE_MODEL")
     voice_wake_threshold: float = Field(default=0.5, alias="VOICE_WAKE_THRESHOLD")
-    voice_wake_engine: str = Field(default="porcupine", alias="VOICE_WAKE_ENGINE")
+    # whisper = STT-based wake (no Picovoice); porcupine = Picovoice (.ppn + access key)
+    voice_wake_engine: str = Field(default="whisper", alias="VOICE_WAKE_ENGINE")
     voice_porcupine_key: str = Field(default="", alias="VOICE_PORCUPINE_KEY")
     voice_porcupine_model: str = Field(default="", alias="VOICE_PORCUPINE_MODEL")
     voice_wake_cooldown: float = Field(default=2.0, alias="VOICE_WAKE_COOLDOWN")
     voice_vad_silence_ms: int = Field(default=1000, alias="VOICE_VAD_SILENCE_MS")
     voice_vad_max_command_ms: int = Field(default=10000, alias="VOICE_VAD_MAX_COMMAND_MS")
     voice_stt_provider: str = Field(default="groq", alias="VOICE_STT_PROVIDER")
+    voice_stt_url: str = Field(default="", alias="VOICE_STT_URL")
     voice_stt_api_key: str = Field(default="", alias="VOICE_STT_API_KEY")
     voice_stt_model: str = Field(default="whisper-large-v3", alias="VOICE_STT_MODEL")
     voice_stt_language: str = Field(default="en", alias="VOICE_STT_LANGUAGE")
+    voice_stt_fallback_url: str = Field(default="", alias="VOICE_STT_FALLBACK_URL")
+    voice_stt_fallback_api_key: str = Field(default="", alias="VOICE_STT_FALLBACK_API_KEY")
+    voice_stt_fallback_model: str = Field(default="whisper-1", alias="VOICE_STT_FALLBACK_MODEL")
     voice_room_speakers: str = Field(default="", alias="VOICE_ROOM_SPEAKERS")
+    voice_live_audio_port: int = Field(default=0, alias="VOICE_LIVE_AUDIO_PORT")
+    voice_debug_audio: bool = Field(default=False, alias="VOICE_DEBUG_AUDIO")
+    voice_debug_dir: str = Field(default="/tmp/voice_debug", alias="VOICE_DEBUG_DIR")
+    voice_debug_max_files: int = Field(default=50, alias="VOICE_DEBUG_MAX_FILES")
     voice_reasoning_api_key: str = Field(default="", alias="VOICE_REASONING_API_KEY")
     voice_reasoning_model: str = Field(default="claude-sonnet-4-20250514", alias="VOICE_REASONING_MODEL")
     voice_reasoning_timeout: float = Field(default=30.0, alias="VOICE_REASONING_TIMEOUT")

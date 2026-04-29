@@ -31,6 +31,13 @@ _TTS_NORMALIZE_PROMPT = (
     "- Spell out times: 2:45 PM → two forty five P M.\n"
     "- Spell out currency: $1,500 → fifteen hundred dollars.\n"
     "- Spell out percentages: 22% → twenty two percent.\n"
+    "- Disambiguate homographs so the TTS engine picks the right pronunciation. "
+    "Replace ambiguous words with phonetically unambiguous alternatives:\n"
+    "  wind (weather) → winds (noun context) or use 'gusts' / 'breezes'\n"
+    "  lead (metal) → led (past tense) vs. lead (guide)\n"
+    "  read (past) → red (if past tense)\n"
+    "  live (adjective) → 'lyve' is wrong; rephrase if needed\n"
+    "  Example: '10 mph wind' → 'ten miles per hour winds'\n"
     "- Fix broken punctuation or grammar only if obviously wrong.\n"
     "- Do NOT add, remove, or rephrase content. Keep the meaning identical.\n"
     "- Output ONLY the rewritten text, nothing else."
@@ -117,10 +124,16 @@ def _offline_audio_path(settings: AppSettings, key: str) -> Optional[Path]:
     return None
 
 
+_GW_VERSION = "2026.04.07a"
+
 async def run_sonos_gateway() -> None:
     settings = AppSettings()
     configure_logging(settings.log_level)
     log = get_logger(service="sonos_gateway")
+    log.info("sonos_gateway_start", version=_GW_VERSION,
+             tail_padding_seconds=settings.sonos.tail_padding_seconds,
+             announce_concurrency=settings.sonos.announce_concurrency,
+             default_volume=settings.sonos.default_volume)
 
     targets = settings.sonos.announce_target_ips
     if not targets:
@@ -175,18 +188,18 @@ async def run_sonos_gateway() -> None:
     err_total = 0
     muted_until_unix = 0
     pending_msg = None
-    active_players: set = set()
+    active_player: Optional[SonosPlayback] = None
     hold_active = False
     hold_until = 0.0
 
     async def _restore_active() -> None:
-        nonlocal active_players
-        for p in list(active_players):
+        nonlocal active_player
+        if active_player is not None:
             try:
-                await p.restore_all()
+                await active_player.restore_all()
             except Exception:
                 log.exception("snapshot_restore_error")
-        active_players.clear()
+            active_player = None
 
     async def status_loop() -> None:
         nonlocal last_request_at, last_ok_at, last_err_at, last_err_kind, muted_until_unix
@@ -245,7 +258,7 @@ async def run_sonos_gateway() -> None:
                     hold_active = False
                     log.info("sonos_hold_expired")
 
-                if active_players and not hold_active:
+                if active_player is not None and not hold_active:
                     await _restore_active()
                     _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
                     mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
@@ -320,10 +333,10 @@ async def run_sonos_gateway() -> None:
                     log.info("sonos_hold_start", id=event_id, source=source)
                 elif action == "release":
                     hold_active = False
-                    if active_players:
+                    if active_player is not None:
                         await _restore_active()
-                        _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
-                        mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
+                    _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
+                    mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
                     log.info("sonos_hold_release", id=event_id, source=source)
                 continue
 
@@ -336,8 +349,8 @@ async def run_sonos_gateway() -> None:
                 log.warning("bad_event", reason="missing_text", id=event_id)
                 continue
 
-            # Hard stop: never play anything while muted.
-            if muted_until_unix:
+            # Hard stop: never play anything while muted (unless exempt).
+            if muted_until_unix and not data.get("exempt_mute"):
                 now_unix = int(datetime.now(timezone.utc).timestamp())
                 if now_unix < int(muted_until_unix):
                     suppressed_total += 1
@@ -380,7 +393,7 @@ async def run_sonos_gateway() -> None:
                     # Fail-safe: if quiet-hours config is malformed, assume quiet.
                     quiet = True
 
-                if quiet:
+                if quiet and not data.get("exempt_quiet_hours"):
                     suppressed_total += 1
                     log.warning(
                         "announce_suppressed",
@@ -476,10 +489,11 @@ async def run_sonos_gateway() -> None:
                     volume=volume,
                     title="Home Agent",
                     concurrency=concurrency,
-                    tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
+                    tail_padding_seconds=0.0,
                 )
                 _t_play_done = loop.time()
-                active_players.add(player2)
+                if active_player is None:
+                    active_player = player2
                 ok_total += 1
                 last_ok_at = loop.time()
                 log.info("announce_timing",
@@ -489,10 +503,17 @@ async def run_sonos_gateway() -> None:
                          sonos_play_ms=round((_t_play_done - _t_play_start) * 1000),
                          total_ms=round((_t_play_done - _t0) * 1000),
                          offline=bool(offline_key))
-                log.info("announce_done")
+                log.info("announce_done",
+                         play_url_ms=round((_t_play_done - _t_play_start) * 1000),
+                         hold_active=hold_active)
+                mqttc.publish_json("%s/sonos/debug" % settings.mqtt.base_topic, make_event(
+                    source="sonos-gateway", typ="sonos.debug", data={
+                        "phase": "play_url_done",
+                        "play_url_ms": round((_t_play_done - _t_play_start) * 1000),
+                        "total_ms": round((_t_play_done - _t0) * 1000),
+                        "hold_active": hold_active,
+                    }))
 
-                # During hold, don't publish playback_done — keep room deaf until
-                # the entire voice interaction is done (auto-release handles it)
                 if not hold_active:
                     _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
                     mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
@@ -523,9 +544,10 @@ async def run_sonos_gateway() -> None:
                                 volume=volume,
                                 title="Home Agent",
                                 concurrency=concurrency,
-                                tail_padding_seconds=float(settings.sonos.tail_padding_seconds),
+                                tail_padding_seconds=0.0,
                             )
-                            active_players.add(player2)
+                            if active_player is None:
+                                active_player = player2
                             ok_total += 1
                             last_ok_at = loop.time()
                             log.info("announce_done_offline_fallback", key=offline_key, path=str(path))
@@ -543,17 +565,34 @@ async def run_sonos_gateway() -> None:
             # During hold, use a longer peek (3s) to wait for the response announce
             # after the prompt. If nothing arrives, auto-release the hold.
             peek_timeout = 2.0 if hold_active else 0.5
+            _t_peek_start = loop.time()
+            log.info("peek_start", hold_active=hold_active, peek_timeout=peek_timeout)
             try:
                 pending_msg = await asyncio.wait_for(mqttc.next_message(), timeout=peek_timeout)
-                log.info("announce_batch_peek", queue_has_more=True)
+                log.info("peek_got_msg", waited_ms=round((loop.time() - _t_peek_start) * 1000))
             except asyncio.TimeoutError:
+                log.info("peek_timeout", waited_ms=round((loop.time() - _t_peek_start) * 1000),
+                         hold_active=hold_active)
+                mqttc.publish_json("%s/sonos/debug" % settings.mqtt.base_topic, make_event(
+                    source="sonos-gateway", typ="sonos.debug", data={
+                        "phase": "peek_timeout", "hold_active": hold_active,
+                    }))
                 if hold_active:
                     hold_active = False
-                    if active_players:
+                    _t_restore_start = loop.time()
+                    if active_player is not None:
                         await _restore_active()
+                    _t_restore_done = loop.time()
                     _pb_done = make_event(source="sonos-gateway", typ="sonos.playback_done", data={})
                     mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_done)
-                    log.info("sonos_hold_auto_release", reason="no_more_announcements")
+                    log.info("sonos_hold_auto_release",
+                             reason="no_more_announcements",
+                             restore_ms=round((_t_restore_done - _t_restore_start) * 1000))
+                    mqttc.publish_json("%s/sonos/debug" % settings.mqtt.base_topic, make_event(
+                        source="sonos-gateway", typ="sonos.debug", data={
+                            "phase": "auto_release_done",
+                            "restore_ms": round((_t_restore_done - _t_restore_start) * 1000),
+                        }))
     finally:
         status_task.cancel()
         try:
