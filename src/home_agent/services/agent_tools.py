@@ -299,7 +299,7 @@ class ToolExecutor:
                     interval_seconds=self._settings.internet.interval_seconds,
                     timeout_seconds=self._settings.internet.timeout_seconds,
                 )
-                parts.append("Internet: %.1f ms latency, %.1f%% packet loss" % (result.avg_latency_ms, result.packet_loss_pct))
+                parts.append("Internet: %.1f ms latency, %.1f%% packet loss" % (result.avg_latency_ms or 0, result.loss_percent))
             except Exception as e:
                 parts.append("Internet: error (%s)" % str(e)[:50])
 

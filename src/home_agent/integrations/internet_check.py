@@ -35,13 +35,11 @@ def run_internet_check(
     interval = max(0.1, float(interval_seconds))
     count = max(1, int(round(float(duration_seconds) / interval)))
 
-    responses = ping(
-        host,
-        count=count,
-        interval=interval,
-        timeout=float(timeout_seconds),
-        privileged=False,
-    )
+    import inspect
+    kwargs = dict(count=count, interval=interval, timeout=float(timeout_seconds))
+    if "privileged" in inspect.signature(ping).parameters:
+        kwargs["privileged"] = False
+    responses = ping(host, **kwargs)
 
     rtts: list[float] = []
     received = 0
