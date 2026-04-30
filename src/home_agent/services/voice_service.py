@@ -121,63 +121,90 @@ class Room:
         self._packet_times.append(now)
 
 
-class VoiceUDPProtocol(asyncio.DatagramProtocol):
+class UDPReceiverThread(threading.Thread):
+    """Dedicated thread for UDP audio packets.
+
+    Runs a tight recvfrom loop that never blocks on anything except the
+    socket read, so packets are never dropped due to event loop contention.
+    """
 
     def __init__(
         self,
+        port: int,
         rooms: Dict[str, Room],
         log,
         *,
         porcupine_mode: bool = False,
         live_listeners: Optional[Dict[str, set]] = None,
     ) -> None:
+        super().__init__(daemon=True, name="udp-recv")
+        self._port = port
         self._rooms = rooms
         self._log = log
         self._porcupine_mode = porcupine_mode
         self._live_listeners = live_listeners if live_listeners is not None else {}
         self._unknown: set = set()
+        self._stop = threading.Event()
 
-    def connection_made(self, transport) -> None:
-        self._log.info("udp_listener_ready")
+    def stop(self) -> None:
+        self._stop.set()
 
-    def datagram_received(self, data: bytes, addr) -> None:
-        if len(data) <= ROOM_HEADER_SIZE:
-            return
-        room_id = data[:ROOM_HEADER_SIZE].decode("ascii", errors="replace").rstrip("\x00")
-        audio = data[ROOM_HEADER_SIZE:]
-        room = self._rooms.get(room_id)
-        if room is None:
-            if room_id not in self._unknown:
-                self._unknown.add(room_id)
-                self._log.warning("unknown_room", room_id=room_id, addr=str(addr))
-            return
-        room.frames_received += 1
-        room.bytes_received += len(audio)
-        room.last_audio_at = time.monotonic()
-        room.last_addr = addr
-        room.record_packet()
-        if len(room.raw_buffer) < _MAX_RAW_BUFFER_BYTES:
-            room.raw_buffer.extend(audio)
-        if self._porcupine_mode:
-            room.ww_align_buf.extend(audio)
-            while len(room.ww_align_buf) >= WW_FRAME_BYTES:
-                chunk = bytes(room.ww_align_buf[:WW_FRAME_BYTES])
-                del room.ww_align_buf[:WW_FRAME_BYTES]
-                try:
-                    room.audio_queue.put_nowait(chunk)
-                except queue.Full:
-                    room._queue_drops += 1
+    def run(self) -> None:
+        import socket as _socket
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_RCVBUF, 8 * 1024 * 1024)
+        except Exception:
+            pass
+        sock.bind(("0.0.0.0", self._port))
+        sock.settimeout(1.0)
+        self._log.info("udp_thread_ready", port=self._port)
 
-        listeners = self._live_listeners.get(room_id)
-        if listeners:
-            for q in list(listeners):
-                try:
-                    q.put_nowait(audio)
-                except asyncio.QueueFull:
-                    pass
+        while not self._stop.is_set():
+            try:
+                data, addr = sock.recvfrom(4096)
+            except OSError:
+                if self._stop.is_set():
+                    break
+                continue
 
-    def error_received(self, exc) -> None:
-        self._log.warning("udp_error", error=str(exc))
+            if len(data) <= ROOM_HEADER_SIZE:
+                continue
+            room_id = data[:ROOM_HEADER_SIZE].decode("ascii", errors="replace").rstrip("\x00")
+            audio = data[ROOM_HEADER_SIZE:]
+            room = self._rooms.get(room_id)
+            if room is None:
+                if room_id not in self._unknown:
+                    self._unknown.add(room_id)
+                    self._log.warning("unknown_room", room_id=room_id, addr=str(addr))
+                continue
+            room.frames_received += 1
+            room.bytes_received += len(audio)
+            room.last_audio_at = time.monotonic()
+            room.last_addr = addr
+            room.record_packet()
+            if len(room.raw_buffer) < _MAX_RAW_BUFFER_BYTES:
+                room.raw_buffer.extend(audio)
+            if self._porcupine_mode:
+                room.ww_align_buf.extend(audio)
+                while len(room.ww_align_buf) >= WW_FRAME_BYTES:
+                    chunk = bytes(room.ww_align_buf[:WW_FRAME_BYTES])
+                    del room.ww_align_buf[:WW_FRAME_BYTES]
+                    try:
+                        room.audio_queue.put_nowait(chunk)
+                    except queue.Full:
+                        room._queue_drops += 1
+
+            listeners = self._live_listeners.get(room_id)
+            if listeners:
+                for q in list(listeners):
+                    try:
+                        q.put_nowait(audio)
+                    except asyncio.QueueFull:
+                        pass
+
+        sock.close()
 
 
 def _pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
@@ -230,10 +257,15 @@ def _porcupine_room_thread(
         _SPEECH_RMS = 300
         _LOG_INTERVAL = 60.0
 
+        _frame_samples = porcupine.frame_length
+
         while not stop_event.is_set():
             try:
                 frame_bytes = room.audio_queue.get(timeout=0.25)
             except queue.Empty:
+                continue
+
+            if len(frame_bytes) // 2 != _frame_samples:
                 continue
 
             suppressed = (
@@ -243,28 +275,18 @@ def _porcupine_room_thread(
             )
             if suppressed:
                 _skipped_state += 1
-
-            n = len(frame_bytes) // 2
-            if n != porcupine.frame_length:
                 continue
 
-            samples = struct.unpack_from("<%dh" % n, frame_bytes)
-
-            rms = 0.0
-            s = 0
-            for v in samples:
-                s += v * v
-            rms = (s / n) ** 0.5
+            arr = np.frombuffer(frame_bytes, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(arr.astype(np.int32) ** 2)))
 
             try:
-                keyword_index = porcupine.process(samples)
+                keyword_index = porcupine.process(arr)
             except Exception as e:
                 log.warning("porcupine_process_error", room=room.friendly_name, error=type(e).__name__)
                 continue
 
             _processed += 1
-            if suppressed:
-                continue
 
             if keyword_index >= 0:
                 log.info(
@@ -508,16 +530,15 @@ async def run_voice_service() -> None:
     # Live audio listeners: room_id → set of asyncio.Queue (one per WebSocket client)
     _live_listeners: Dict[str, set] = {}
 
-    # UDP listener
     loop = asyncio.get_running_loop()
-    transport, _ = await loop.create_datagram_endpoint(
-        lambda: VoiceUDPProtocol(
-            rooms, log,
-            porcupine_mode=porcupine_mode,
-            live_listeners=_live_listeners,
-        ),
-        local_addr=("0.0.0.0", udp_port),
+
+    # UDP listener — dedicated thread so packets are never dropped
+    udp_thread = UDPReceiverThread(
+        port=udp_port, rooms=rooms, log=log,
+        porcupine_mode=porcupine_mode,
+        live_listeners=_live_listeners,
     )
+    udp_thread.start()
     log.info("udp_listening", port=udp_port, rooms=len(rooms))
 
     # Flush stale startup audio
@@ -1144,7 +1165,7 @@ async def run_voice_service() -> None:
         if _ws_server is not None:
             _ws_server.close()
             await _ws_server.wait_closed()
-        transport.close()
+        udp_thread.stop()
         mqtt_task.cancel()
         status_task.cancel()
         if porcupine_mode:
