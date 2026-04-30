@@ -28,7 +28,9 @@ from home_agent.services.voice_registrations import (
     register_all, update_caseta_devices, update_caseta_scenes, update_watchdog_health,
 )
 
-_AGENT_SYSTEM = """You are Higgins, a helpful home assistant for the Smith family in Lynchburg, Virginia.
+_AGENT_SYSTEM_TEMPLATE = """You are Higgins, a helpful home assistant for the Smith family in Lynchburg, Virginia.
+
+Current date and time: {datetime}
 
 Use the available tools to answer questions and execute commands. You may call multiple tools if needed.
 
@@ -37,6 +39,15 @@ Format ALL output for spoken text-to-speech audio:
 - No URLs, markdown, bullet points, or special characters.
 - Use short, natural sentences. You are speaking out loud to a person in their home.
 - Be concise."""
+
+
+def _agent_system(tz_name: str) -> str:
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    now = datetime.now(tz=ZoneInfo(tz_name))
+    return _AGENT_SYSTEM_TEMPLATE.format(
+        datetime=now.strftime("%A, %B %d, %Y at %I:%M %p %Z"),
+    )
 
 
 @dataclass
@@ -253,7 +264,7 @@ async def run_voice_intent_agent() -> None:
                         result_text = await tool_executor.execute(match.tool_name, match.tool_args)
                         if claude:
                             formatted = await claude.chat(
-                                system=_AGENT_SYSTEM,
+                                system=_agent_system(settings.timezone),
                                 user="The user asked: '%s'. The data is: %s. Give a concise spoken response." % (text, result_text),
                                 max_tokens=256, temperature=0.2,
                             )
@@ -271,7 +282,7 @@ async def run_voice_intent_agent() -> None:
                 # ── Step 2: Claude agent ──
                 if claude:
                     result = await claude.agent_loop(
-                        system=_AGENT_SYSTEM,
+                        system=_agent_system(settings.timezone),
                         user="[Room: %s] %s" % (room_name, text),
                         tools=agent_tools,
                         execute_tool=tool_executor.execute,

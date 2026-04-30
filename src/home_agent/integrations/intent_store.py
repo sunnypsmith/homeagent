@@ -14,7 +14,7 @@ from home_agent.db import DbManager
 
 _log = get_logger(service="intent_store")
 
-_SIMILARITY_THRESHOLD = 0.4
+_SIMILARITY_THRESHOLD = 0.6
 
 
 @dataclass

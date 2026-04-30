@@ -38,9 +38,10 @@ def build_tools(settings: AppSettings) -> List[Dict[str, Any]]:
     if settings.weather.provider and settings.weather.latitude:
         tools.append(_tool(
             "get_weather",
-            "Get weather information. Use timeframe='now' for current conditions, "
-            "'today' for today's forecast, 'tomorrow' for tomorrow, or a day name like 'Wednesday'.",
-            {"timeframe": {"type": "string", "description": "now, today, tomorrow, or a day name"}},
+            "Get weather for any timeframe. Call with timeframe='now' for current temperature/conditions, "
+            "'today' for today's forecast, 'tomorrow' for tomorrow's forecast, 'this weekend' for the weekend, "
+            "or a day name like 'Wednesday'. Always use this tool for weather questions -- it covers all timeframes.",
+            {"timeframe": {"type": "string", "description": "One of: now, today, tomorrow, this weekend, or a day name like Wednesday"}},
             required=["timeframe"],
         ))
 
