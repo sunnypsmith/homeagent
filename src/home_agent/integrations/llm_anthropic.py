@@ -1,15 +1,30 @@
-"""Anthropic Claude client for reasoning tasks.
+"""Anthropic Claude client with agent loop support.
 
 Uses the Anthropic SDK directly (not OpenAI-compatible) for proper
-tool calling support. Returns the same LLMToolCall/LLMTextResponse
-types as the OpenAI client for compatibility.
+tool calling support. Includes an agent loop that cycles through
+tool_use/tool_result turns until Claude produces a final text answer.
 """
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from home_agent.integrations.llm import LLMToolCall, LLMTextResponse
+
+_log = logging.getLogger(__name__)
+
+ToolExecutor = Callable[[str, Dict[str, Any]], Awaitable[str]]
+
+
+@dataclass
+class AgentResult:
+    """Result of an agent loop run."""
+    text: str
+    tool_calls: List[LLMToolCall] = field(default_factory=list)
+    tool_results: List[Dict[str, Any]] = field(default_factory=list)
+    turns: int = 0
 
 
 class AnthropicClient:
@@ -103,6 +118,99 @@ class AnthropicClient:
         if tool_calls:
             return tool_calls if len(tool_calls) > 1 else tool_calls[0]
         return LLMTextResponse(text="\n".join(text_parts))
+
+    async def agent_loop(
+        self,
+        *,
+        system: str,
+        user: str,
+        tools: List[Dict[str, Any]],
+        execute_tool: ToolExecutor,
+        max_tokens: int = 1024,
+        temperature: Optional[float] = 0.3,
+        max_turns: int = 5,
+    ) -> AgentResult:
+        """Run a multi-turn agent loop with tool calling.
+
+        Sends the user message with tools, executes any tool_use blocks,
+        feeds results back, and loops until Claude returns a final text
+        answer or max_turns is reached.
+        """
+        anthropic_tools = [_convert_tool_openai_to_anthropic(t) for t in tools]
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": user}]
+        all_tool_calls: List[LLMToolCall] = []
+        all_tool_results: List[Dict[str, Any]] = []
+
+        for turn in range(max_turns):
+            kwargs: Dict[str, Any] = {
+                "model": self._model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": messages,
+                "tools": anthropic_tools,
+            }
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+
+            response = await self._client.messages.create(**kwargs)
+
+            tool_use_blocks = []
+            text_parts: List[str] = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_use_blocks.append(block)
+                elif block.type == "text" and block.text.strip():
+                    text_parts.append(block.text.strip())
+
+            if not tool_use_blocks:
+                return AgentResult(
+                    text="\n".join(text_parts),
+                    tool_calls=all_tool_calls,
+                    tool_results=all_tool_results,
+                    turns=turn + 1,
+                )
+
+            assistant_content = []
+            for block in response.content:
+                if block.type == "text":
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            tool_result_blocks = []
+            for block in tool_use_blocks:
+                tc = LLMToolCall(
+                    name=block.name,
+                    arguments=block.input if isinstance(block.input, dict) else {},
+                )
+                all_tool_calls.append(tc)
+                _log.info("agent_tool_call turn=%d tool=%s args=%s", turn, block.name, block.input)
+                try:
+                    result_text = await execute_tool(block.name, tc.arguments)
+                except Exception as e:
+                    result_text = "Error: %s" % str(e)[:200]
+                    _log.warning("agent_tool_error tool=%s error=%s", block.name, result_text)
+                all_tool_results.append({"tool": block.name, "args": tc.arguments, "result": result_text})
+                tool_result_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
+            messages.append({"role": "user", "content": tool_result_blocks})
+
+        final_text = "\n".join(text_parts) if text_parts else "I wasn't able to complete that request."
+        return AgentResult(
+            text=final_text,
+            tool_calls=all_tool_calls,
+            tool_results=all_tool_results,
+            turns=max_turns,
+        )
 
 
 def _convert_tool_openai_to_anthropic(tool: Dict[str, Any]) -> Dict[str, Any]:

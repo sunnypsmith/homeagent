@@ -194,6 +194,26 @@ class NWSClient:
         self._set_cached("forecast", result)
         return result
 
+    async def forecast_periods(self, max_periods: int = 14) -> List[Dict[str, Any]]:
+        """Return raw NWS forecast periods (7-day, daytime + nighttime).
+
+        Each period dict has: name, startTime, temperature, temperatureUnit,
+        windSpeed, shortForecast, detailedForecast, isDaytime, probabilityOfPrecipitation, etc.
+        Cached for 10 minutes.
+        """
+        cached = self._get_cached("periods", 600)
+        if cached:
+            return cached
+
+        await self._ensure_grid()
+        if not self._forecast_url:
+            raise RuntimeError("No NWS forecast URL found")
+
+        props = (await self._fetch_json(self._forecast_url)).get("properties", {})
+        periods = props.get("periods", [])[:max_periods]
+        self._set_cached("periods", periods)
+        return periods
+
 
 def _val(props: Dict, key: str) -> Optional[float]:
     entry = props.get(key)

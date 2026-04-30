@@ -12,14 +12,18 @@ States: LISTENING (processing wake word) or BUSY (session in progress).
 from __future__ import annotations
 
 import asyncio
+import collections
 import io
+import os
 import queue
+import struct
 import threading
 import time
 import wave
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -74,19 +78,63 @@ class Room:
 
     # Thread-safe queue for wake word detection (UDP handler → Porcupine thread)
     audio_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500))
+    # Accumulates UDP payload until we can enqueue full Porcupine frames (512 samples × 16-bit)
+    ww_align_buf: bytearray = field(default_factory=bytearray, repr=False)
 
     # Sonos playback suppression — True while room's speakers are active
     sonos_playing: bool = False
+    sonos_playing_since: float = 0.0
+
+    # Last known source address (ip, port) from UDP — for server-side keepalive
+    last_addr: Optional[Tuple[str, int]] = None
 
     # Timing
     last_wake_time: float = 0.0
 
+    # Audio health metrics
+    _packet_times: Deque[float] = field(default_factory=lambda: collections.deque(maxlen=500))
+    _max_gap_reset_at: float = 0.0
+    max_gap_seconds: float = 0.0
+    session_ok: int = 0
+    session_fail: int = 0
+    last_stt_result: str = ""
+    last_session_trigger: str = ""
+    _queue_drops: int = 0
+
+    @property
+    def packets_per_second(self) -> float:
+        now = time.monotonic()
+        while self._packet_times and (now - self._packet_times[0]) > 10.0:
+            self._packet_times.popleft()
+        elapsed = (now - self._packet_times[0]) if self._packet_times else 10.0
+        return len(self._packet_times) / max(0.1, elapsed)
+
+    def record_packet(self) -> None:
+        now = time.monotonic()
+        if self._packet_times:
+            gap = now - self._packet_times[-1]
+            if gap > self.max_gap_seconds:
+                self.max_gap_seconds = gap
+        if (now - self._max_gap_reset_at) > 60.0:
+            self.max_gap_seconds = 0.0
+            self._max_gap_reset_at = now
+        self._packet_times.append(now)
+
 
 class VoiceUDPProtocol(asyncio.DatagramProtocol):
 
-    def __init__(self, rooms: Dict[str, Room], log) -> None:
+    def __init__(
+        self,
+        rooms: Dict[str, Room],
+        log,
+        *,
+        porcupine_mode: bool = False,
+        live_listeners: Optional[Dict[str, set]] = None,
+    ) -> None:
         self._rooms = rooms
         self._log = log
+        self._porcupine_mode = porcupine_mode
+        self._live_listeners = live_listeners if live_listeners is not None else {}
         self._unknown: set = set()
 
     def connection_made(self, transport) -> None:
@@ -106,14 +154,27 @@ class VoiceUDPProtocol(asyncio.DatagramProtocol):
         room.frames_received += 1
         room.bytes_received += len(audio)
         room.last_audio_at = time.monotonic()
-        # Cap buffer to prevent unbounded growth during long Sonos playback
+        room.last_addr = addr
+        room.record_packet()
         if len(room.raw_buffer) < _MAX_RAW_BUFFER_BYTES:
             room.raw_buffer.extend(audio)
-        # Feed wake word detection thread (non-blocking, drop if full)
-        try:
-            room.audio_queue.put_nowait(audio)
-        except queue.Full:
-            pass
+        if self._porcupine_mode:
+            room.ww_align_buf.extend(audio)
+            while len(room.ww_align_buf) >= WW_FRAME_BYTES:
+                chunk = bytes(room.ww_align_buf[:WW_FRAME_BYTES])
+                del room.ww_align_buf[:WW_FRAME_BYTES]
+                try:
+                    room.audio_queue.put_nowait(chunk)
+                except queue.Full:
+                    room._queue_drops += 1
+
+        listeners = self._live_listeners.get(room_id)
+        if listeners:
+            for q in list(listeners):
+                try:
+                    q.put_nowait(audio)
+                except asyncio.QueueFull:
+                    pass
 
     def error_received(self, exc) -> None:
         self._log.warning("udp_error", error=str(exc))
@@ -127,6 +188,121 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(pcm)
     return buf.getvalue()
+
+
+def _porcupine_room_thread(
+    *,
+    room: Room,
+    access_key: str,
+    keyword_path: str,
+    wake_cooldown: float,
+    loop: asyncio.AbstractEventLoop,
+    log,
+    stop_event: threading.Event,
+    start_session,
+) -> None:
+    """One thread per room; pulls 512-sample frames from room.audio_queue for Picovoice."""
+    import pvporcupine
+
+    porcupine = None
+    try:
+        try:
+            porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path])
+        except Exception:
+            log.exception("porcupine_init_failed", room=room.friendly_name, path=keyword_path)
+            return
+
+        if porcupine.frame_length != WW_FRAME_SAMPLES:
+            log.error(
+                "porcupine_frame_length_mismatch",
+                room=room.friendly_name,
+                need=WW_FRAME_SAMPLES,
+                got=porcupine.frame_length,
+            )
+            return
+
+        log.info("porcupine_ready", room=room.friendly_name, path=keyword_path)
+        _processed = 0
+        _skipped_state = 0
+        _skipped_cooldown = 0
+        _speech_misses = 0
+        _last_log = time.monotonic()
+        _SPEECH_RMS = 300
+        _LOG_INTERVAL = 60.0
+
+        while not stop_event.is_set():
+            try:
+                frame_bytes = room.audio_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
+            suppressed = (
+                room.sonos_playing
+                or room.state != RoomState.LISTENING
+                or (time.monotonic() - room.last_wake_time) < wake_cooldown
+            )
+            if suppressed:
+                _skipped_state += 1
+
+            n = len(frame_bytes) // 2
+            if n != porcupine.frame_length:
+                continue
+
+            samples = struct.unpack_from("<%dh" % n, frame_bytes)
+
+            rms = 0.0
+            s = 0
+            for v in samples:
+                s += v * v
+            rms = (s / n) ** 0.5
+
+            try:
+                keyword_index = porcupine.process(samples)
+            except Exception as e:
+                log.warning("porcupine_process_error", room=room.friendly_name, error=type(e).__name__)
+                continue
+
+            _processed += 1
+            if suppressed:
+                continue
+
+            if keyword_index >= 0:
+                log.info(
+                    "wake_detected",
+                    room=room.friendly_name,
+                    engine="porcupine",
+                    keyword_index=keyword_index,
+                    rms=round(rms),
+                    processed=_processed,
+                    speech_misses=_speech_misses,
+                )
+                _speech_misses = 0
+                loop.call_soon_threadsafe(lambda r=room: start_session(r))
+            elif rms > _SPEECH_RMS:
+                _speech_misses += 1
+
+            now = time.monotonic()
+            if (now - _last_log) >= _LOG_INTERVAL:
+                log.info(
+                    "porcupine_stats",
+                    room=room.friendly_name,
+                    processed=_processed,
+                    skipped_state=_skipped_state,
+                    skipped_cooldown=_skipped_cooldown,
+                    speech_misses=_speech_misses,
+                )
+                _processed = 0
+                _skipped_state = 0
+                _skipped_cooldown = 0
+                _speech_misses = 0
+                _last_log = now
+    finally:
+        if porcupine is not None:
+            try:
+                porcupine.delete()
+            except Exception:
+                pass
+        log.info("porcupine_thread_stopped", room=room.friendly_name)
 
 
 def _process_audio_for_stt(pcm: bytes, *, sample_rate: int = SAMPLE_RATE, log) -> bytes:
@@ -147,7 +323,7 @@ def _process_audio_for_stt(pcm: bytes, *, sample_rate: int = SAMPLE_RATE, log) -
     )
 
     frame_len = int(sample_rate * 0.03)
-    energy_threshold = 30.0
+    energy_threshold = 200.0
     frame_energies = np.array([
         np.sqrt(np.mean(cleaned[i:i + frame_len] ** 2))
         for i in range(0, len(cleaned) - frame_len, frame_len)
@@ -180,14 +356,41 @@ def _process_audio_for_stt(pcm: bytes, *, sample_rate: int = SAMPLE_RATE, log) -
     return cleaned.tobytes()
 
 
-async def _transcribe_with_fallback(audio_wav: bytes, *, stt_api_key: str, stt_model: str,
-                                     stt_language: str, fallback_api_key: str, log) -> Optional[str]:
+def _save_debug_wav(pcm: bytes, *, debug_dir: str, room_name: str, label: str,
+                    max_files: int, sample_rate: int = SAMPLE_RATE) -> Optional[str]:
+    """Save PCM audio as a WAV file for debugging. Returns the file path or None."""
+    try:
+        room_dir = Path(debug_dir) / room_name.replace(" ", "_").lower()
+        room_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        fname = f"{ts}_{room_name}_{label}.wav"
+        fpath = room_dir / fname
+        with wave.open(str(fpath), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(SAMPLE_WIDTH)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm)
+        # Auto-prune old files
+        wavs = sorted(room_dir.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+        while len(wavs) > max_files:
+            wavs.pop(0).unlink(missing_ok=True)
+        return str(fpath)
+    except Exception:
+        return None
+
+
+async def _transcribe_with_fallback(audio_wav: bytes, *, stt_url: str, stt_api_key: str,
+                                     stt_model: str, stt_language: str,
+                                     fallback_url: str, fallback_api_key: str,
+                                     fallback_model: str, log) -> Optional[str]:
     import httpx
     from home_agent.integrations._retry import api_retry
 
     @api_retry
     async def _call_stt(url: str, api_key: str, model: str) -> Optional[str]:
-        headers = {"Authorization": "Bearer %s" % api_key}
+        headers = {}
+        if api_key:
+            headers["Authorization"] = "Bearer %s" % api_key
         files = {"file": ("command.wav", audio_wav, "audio/wav")}
         data_fields = {"model": model, "language": stt_language}
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -196,13 +399,13 @@ async def _transcribe_with_fallback(audio_wav: bytes, *, stt_api_key: str, stt_m
             return (resp.json().get("text") or "").strip() or None
 
     try:
-        return await _call_stt("https://api.groq.com/openai/v1/audio/transcriptions", stt_api_key, stt_model)
+        return await _call_stt(stt_url, stt_api_key, stt_model)
     except Exception as e:
-        log.warning("stt_primary_failed", error=type(e).__name__)
-        if fallback_api_key:
+        log.warning("stt_primary_failed", error=type(e).__name__, url=stt_url)
+        if fallback_url:
             try:
-                result = await _call_stt("https://api.openai.com/v1/audio/transcriptions", fallback_api_key, "whisper-1")
-                log.info("stt_fallback_used", provider="openai")
+                result = await _call_stt(fallback_url, fallback_api_key, fallback_model)
+                log.info("stt_fallback_used", url=fallback_url)
                 return result
             except Exception as e2:
                 log.warning("stt_fallback_failed", error=type(e2).__name__)
@@ -243,42 +446,76 @@ async def run_voice_service() -> None:
     stt_api_key = settings.voice_stt_api_key
     stt_model = settings.voice_stt_model
     stt_language = settings.voice_stt_language
-    fallback_key = settings.llm_fallback.api_key if settings.llm_fallback.enabled else ""
+    # STT URL: use configured URL, or default to Groq
+    stt_url = settings.voice_stt_url or "https://api.groq.com/openai/v1/audio/transcriptions"
+    stt_fallback_url = settings.voice_stt_fallback_url
+    stt_fallback_key = settings.voice_stt_fallback_api_key
+    stt_fallback_model = settings.voice_stt_fallback_model
     room_speakers = settings.voice_room_speakers_parsed
+    debug_audio = settings.voice_debug_audio
+    debug_dir = settings.voice_debug_dir
+    debug_max_files = settings.voice_debug_max_files
+    if debug_audio:
+        Path(debug_dir).mkdir(parents=True, exist_ok=True)
+        log.info("voice_debug_enabled", dir=debug_dir, max_files=debug_max_files)
 
-    # Wake word engine
-    import pvporcupine
-    ppn_path = str(Path(settings.voice_porcupine_model))
-    if not Path(ppn_path).is_absolute():
-        ppn_path = str(Path(__file__).resolve().parents[3] / ppn_path)
+    wake_engine = (settings.voice_wake_engine or "whisper").strip().lower()
+    if wake_engine not in ("porcupine", "whisper"):
+        log.warning("unknown_wake_engine", configured=wake_engine, using="whisper")
+        wake_engine = "whisper"
+    porcupine_mode = wake_engine == "porcupine"
+
+    porcupine_key = (settings.voice_porcupine_key or "").strip()
+    porcupine_model_path: Optional[Path] = None
+    if porcupine_mode:
+        if not porcupine_key:
+            log.error("porcupine_requires_key", hint="Set VOICE_PORCUPINE_KEY in .env")
+            return
+        model_rel = (settings.voice_porcupine_model or "").strip()
+        if not model_rel:
+            log.error("porcupine_requires_model", hint="Set VOICE_PORCUPINE_MODEL (.ppn path)")
+            return
+        mp = Path(model_rel)
+        if not mp.is_absolute():
+            mp = Path.cwd() / mp
+        if not mp.is_file():
+            log.error("porcupine_model_not_found", path=str(mp))
+            return
+        porcupine_model_path = mp
 
     # VAD
     import webrtcvad
     vad = webrtcvad.Vad(2)
 
-    # Rooms — each gets its own Porcupine instance (they carry internal state)
+    # Whisper-only wake phrase detection (when VOICE_WAKE_ENGINE=whisper)
+    _WAKE_PHRASES = {"master higgins", "hey higgins"}
+    _WW_CHUNK_S = 2.5  # seconds of audio per wake word check
+    _WW_POLL_S = 1.5   # how often to check each room
+    _WW_CHUNK_BYTES = int(SAMPLE_RATE * SAMPLE_WIDTH * _WW_CHUNK_S)
+    ww_frame_bytes = WW_FRAME_BYTES  # kept for capture phase compatibility
+
     rooms: Dict[str, Room] = {}
     for name, room_id in room_configs.items():
-        p = pvporcupine.create(
-            access_key=settings.voice_porcupine_key,
-            keyword_paths=[ppn_path],
-        )
-        rooms[room_id] = Room(room_id=room_id, friendly_name=name, porcupine=p)
-        log.info("room_registered", name=name, room_id=room_id, frame_length=p.frame_length)
+        rooms[room_id] = Room(room_id=room_id, friendly_name=name)
+        log.info("room_registered", name=name, room_id=room_id)
 
-    # Frame sizes derived from the engine (all instances share the same model)
-    ww_frame_samples = next(iter(rooms.values())).porcupine.frame_length
-    ww_frame_bytes = ww_frame_samples * SAMPLE_WIDTH
     log.info("voice_room_ids", room_ids=list(rooms.keys()),
-             ww_frame_samples=ww_frame_samples)
+             wake_engine=wake_engine, stt_url=stt_url)
 
     # Keep strong references to session tasks so they aren't GC'd
     _active_tasks: Set[asyncio.Task] = set()
 
+    # Live audio listeners: room_id → set of asyncio.Queue (one per WebSocket client)
+    _live_listeners: Dict[str, set] = {}
+
     # UDP listener
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: VoiceUDPProtocol(rooms, log),
+        lambda: VoiceUDPProtocol(
+            rooms, log,
+            porcupine_mode=porcupine_mode,
+            live_listeners=_live_listeners,
+        ),
         local_addr=("0.0.0.0", udp_port),
     )
     log.info("udp_listening", port=udp_port, rooms=len(rooms))
@@ -293,7 +530,7 @@ async def run_voice_service() -> None:
     # ------------------------------------------------------------------
 
     def _announce(text: str, speakers: List[str], offline_key: Optional[str] = None) -> None:
-        data: Dict[str, Any] = {"text": text, "targets": speakers}
+        data: Dict[str, Any] = {"text": text, "targets": speakers, "exempt_mute": True, "exempt_quiet_hours": True}
         if offline_key:
             data["offline_audio_key"] = offline_key
         mqttc.publish_json("%s/announce/request" % base, make_event(
@@ -311,11 +548,12 @@ async def run_voice_service() -> None:
         except Exception:
             pass
 
-    def _start_session(room: Room) -> None:
+    def _start_session(room: Room, trigger: str = "wake") -> None:
         """Common session-start logic for wake word and push-to-talk."""
         room.state = RoomState.BUSY
         room.wake_detections += 1
         room.last_wake_time = time.monotonic()
+        room.last_session_trigger = trigger
         room.raw_buffer.clear()
         _publish_room_status(room)
         task = asyncio.create_task(_run_session(room))
@@ -375,6 +613,43 @@ async def run_voice_service() -> None:
     # Voice session — one async task per interaction
     # ------------------------------------------------------------------
 
+    def _publish_session_debug(room: Room, *, trigger: str, outcome: str,
+                               raw_pcm: bytes = b"", processed_pcm: bytes = b"",
+                               text: str = "", timings: Optional[Dict[str, Any]] = None,
+                               raw_wav_path: str = "", proc_wav_path: str = "") -> None:
+        """Publish a voice.session_debug event with full diagnostics."""
+        raw_arr = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) if raw_pcm else np.array([])
+        proc_arr = np.frombuffer(processed_pcm, dtype=np.int16).astype(np.float32) if processed_pcm else np.array([])
+        raw_rms = float(np.sqrt(np.mean(raw_arr ** 2))) if len(raw_arr) > 0 else 0.0
+        raw_peak = float(np.max(np.abs(raw_arr))) if len(raw_arr) > 0 else 0.0
+        proc_rms = float(np.sqrt(np.mean(proc_arr ** 2))) if len(proc_arr) > 0 else 0.0
+        proc_peak = float(np.max(np.abs(proc_arr))) if len(proc_arr) > 0 else 0.0
+        raw_dur = len(raw_arr) / SAMPLE_RATE if len(raw_arr) > 0 else 0.0
+        proc_dur = len(proc_arr) / SAMPLE_RATE if len(proc_arr) > 0 else 0.0
+        snr_est = round(raw_rms / 50.0, 1) if raw_rms > 0 else 0.0
+
+        data: Dict[str, Any] = {
+            "room_id": room.room_id, "room_name": room.friendly_name,
+            "trigger": trigger, "outcome": outcome,
+            "raw_rms": round(raw_rms, 1), "raw_peak": round(raw_peak, 0),
+            "raw_duration_s": round(raw_dur, 2),
+            "proc_rms": round(proc_rms, 1), "proc_peak": round(proc_peak, 0),
+            "proc_duration_s": round(proc_dur, 2),
+            "silence_trimmed_s": round(raw_dur - proc_dur, 2) if proc_dur > 0 else 0,
+            "snr_estimate": snr_est,
+            "stt_text": text[:120],
+            "pps": round(room.packets_per_second, 1),
+            "queue_drops": room._queue_drops,
+        }
+        if raw_wav_path:
+            data["raw_wav"] = raw_wav_path
+        if proc_wav_path:
+            data["proc_wav"] = proc_wav_path
+        if timings:
+            data.update(timings)
+        mqttc.publish_json("%s/voice/session_debug" % base, make_event(
+            source="voice-service", typ="voice.session_debug", data=data))
+
     async def _run_session(room: Room) -> None:
         """Complete voice interaction session.
 
@@ -383,190 +658,233 @@ async def run_voice_service() -> None:
         """
         speakers = room_speakers.get(room.room_id, [])
         has_speakers = speakers and speakers != ["none"]
+        trigger = room.last_session_trigger or "wake"
+        raw_capture = b""
+        processed_capture = b""
+        outcome = "unknown"
+        stt_text = ""
+        raw_wav_path = ""
+        proc_wav_path = ""
+        timings: Dict[str, Any] = {}
 
         try:
             t0 = time.monotonic()
             _set_led(room.room_id, "wake")
 
-            # Tell sonos gateway to hold speakers open (skip restore between announcements)
             if has_speakers:
                 mqttc.publish_json("%s/sonos/hold" % base, make_event(
                     source="voice-service", typ="sonos.hold",
                     data={"action": "start", "room_id": room.room_id}))
 
-            # Step 1: Play "How may I assist you?"
             if has_speakers:
                 _announce("How may I assist you?", speakers, offline_key="voice_prompt")
                 log.info("session_prompt", room=room.friendly_name)
 
-            # Step 2: Wait for prompt to play on Sonos (~3s)
             room.raw_buffer.clear()
             _set_led(room.room_id, "capturing")
             if has_speakers:
                 await asyncio.sleep(3.0)
-            # Keep the last 1s of audio in case the user started talking
-            # during or right after the prompt — avoids clipping the first word.
             pre_capture_bytes = int(SAMPLE_RATE * SAMPLE_WIDTH * 1.0)
             if len(room.raw_buffer) > pre_capture_bytes:
                 del room.raw_buffer[:len(room.raw_buffer) - pre_capture_bytes]
 
             t1 = time.monotonic()
-            log.info("session_timing", room=room.friendly_name,
-                     step="prompt_wait", elapsed_ms=round((t1 - t0) * 1000))
+            timings["prompt_ms"] = round((t1 - t0) * 1000)
 
-            # Step 3: Capture command audio
             log.info("session_capturing", room=room.friendly_name)
             audio_pcm = await _capture_audio(room, max_command_duration)
+            raw_capture = audio_pcm
 
             t2 = time.monotonic()
+            timings["capture_ms"] = round((t2 - t1) * 1000)
             log.info("session_timing", room=room.friendly_name,
-                     step="capture", elapsed_ms=round((t2 - t1) * 1000),
+                     step="capture", elapsed_ms=timings["capture_ms"],
                      audio_bytes=len(audio_pcm))
+
+            if debug_audio:
+                raw_wav_path = _save_debug_wav(
+                    audio_pcm, debug_dir=debug_dir, room_name=room.friendly_name,
+                    label="raw", max_files=debug_max_files) or ""
 
             if len(audio_pcm) < ww_frame_bytes * 2:
                 log.info("session_too_short", room=room.friendly_name, bytes=len(audio_pcm))
+                outcome = "too_short"
                 return
 
             _set_led(room.room_id, "processing")
 
-            # Step 4: Check raw audio quality
             arr = np.frombuffer(audio_pcm, dtype=np.int16)
             rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
             if rms < 50:
                 log.info("session_quiet", room=room.friendly_name, rms=round(rms, 1))
+                outcome = "too_quiet"
                 return
 
-            # Step 5: Noise reduce, trim silence, normalize
             audio_pcm = _process_audio_for_stt(audio_pcm, log=log)
+            processed_capture = audio_pcm
 
             t3 = time.monotonic()
-            log.info("session_timing", room=room.friendly_name,
-                     step="audio_process", elapsed_ms=round((t3 - t2) * 1000))
+            timings["audio_process_ms"] = round((t3 - t2) * 1000)
 
-            # Step 6: STT
+            if debug_audio:
+                proc_wav_path = _save_debug_wav(
+                    audio_pcm, debug_dir=debug_dir, room_name=room.friendly_name,
+                    label="processed", max_files=debug_max_files) or ""
+
             room.stt_requests += 1
             log.info("session_stt", room=room.friendly_name,
                      audio_seconds=round(len(audio_pcm) / (SAMPLE_RATE * SAMPLE_WIDTH), 1))
             wav = _pcm_to_wav(audio_pcm)
             text = await _transcribe_with_fallback(
-                wav, stt_api_key=stt_api_key, stt_model=stt_model,
-                stt_language=stt_language, fallback_api_key=fallback_key, log=log)
+                wav, stt_url=stt_url, stt_api_key=stt_api_key, stt_model=stt_model,
+                stt_language=stt_language, fallback_url=stt_fallback_url,
+                fallback_api_key=stt_fallback_key, fallback_model=stt_fallback_model,
+                log=log)
 
             t4 = time.monotonic()
-            log.info("session_timing", room=room.friendly_name,
-                     step="stt", elapsed_ms=round((t4 - t3) * 1000))
+            timings["stt_ms"] = round((t4 - t3) * 1000)
+            stt_text = text or ""
 
             if not text:
                 log.info("session_stt_empty", room=room.friendly_name)
+                outcome = "stt_empty"
                 return
 
-            # Step 7: Filter hallucinations
             if text.lower().rstrip(".!?,") in _WHISPER_HALLUCINATIONS:
                 log.info("session_hallucination", room=room.friendly_name, text=text)
+                outcome = "hallucination"
                 return
 
-            # Step 8: Publish command
             topic = "%s/voice/command" % base
             log.info("session_command", room=room.friendly_name, text=text, topic=topic)
             _publish_command(room, text)
+            speakers = room_speakers.get(room.room_id, [])
+            if speakers and speakers != ["none"]:
+                _announce("", speakers, offline_key="voice_typing")
+            outcome = "ok"
 
-            # Publish session timing for dashboard
             t_total = time.monotonic()
+            timings["total_ms"] = round((t_total - t0) * 1000)
             mqttc.publish_json("%s/voice/session_timing" % base, make_event(
                 source="voice-service", typ="voice.session_timing", data={
                     "room_id": room.room_id, "room_name": room.friendly_name,
-                    "prompt_ms": round((t1 - t0) * 1000),
-                    "capture_ms": round((t2 - t1) * 1000),
-                    "audio_process_ms": round((t3 - t2) * 1000),
-                    "stt_ms": round((t4 - t3) * 1000),
-                    "total_ms": round((t_total - t0) * 1000),
+                    "prompt_ms": timings.get("prompt_ms", 0),
+                    "capture_ms": timings.get("capture_ms", 0),
+                    "audio_process_ms": timings.get("audio_process_ms", 0),
+                    "stt_ms": timings.get("stt_ms", 0),
+                    "total_ms": timings["total_ms"],
                     "text": text[:80],
                 }))
 
         except Exception as e:
             log.exception("session_failed", room=room.friendly_name)
             reporter.report_error("voice_session_failed", e)
+            outcome = "error"
         finally:
-            # Reset LED for rooms without speakers (no playback_done will come)
-            if not has_speakers:
-                _set_led(room.room_id, "listening")
+            if outcome == "ok":
+                room.session_ok += 1
+            else:
+                room.session_fail += 1
+            room.last_stt_result = stt_text[:80] if stt_text else outcome
 
-            # Session complete — return to listening
+            _publish_session_debug(
+                room, trigger=trigger, outcome=outcome,
+                raw_pcm=raw_capture, processed_pcm=processed_capture,
+                text=stt_text, timings=timings,
+                raw_wav_path=raw_wav_path, proc_wav_path=proc_wav_path)
+
+            _set_led(room.room_id, "listening")
+
             room.raw_buffer.clear()
             room.state = RoomState.LISTENING
             room.last_wake_time = time.monotonic()
             _publish_room_status(room)
-            log.info("session_done", room=room.friendly_name)
+            log.info("session_done", room=room.friendly_name, outcome=outcome)
 
     # ------------------------------------------------------------------
-    # Per-room Porcupine threads — one thread per room for parallel wake detection
+    # Whisper-based wake word detection — one async task per room
     # ------------------------------------------------------------------
 
-    _ww_threads: List[threading.Thread] = []
-    _ww_stop = threading.Event()
+    async def _wake_word_loop(room: Room) -> None:
+        """Continuously send audio chunks to Whisper and look for wake phrase."""
+        import httpx
 
-    def _wake_word_thread(room: Room) -> None:
-        """Dedicated thread for one room's wake word detection.
+        log.info("ww_loop_started", room=room.friendly_name, engine="whisper")
+        _poll_count = 0
+        while True:
+            try:
+                await asyncio.sleep(_WW_POLL_S)
+                _poll_count += 1
 
-        Reads audio from room.audio_queue, assembles into Porcupine-sized
-        frames, and posts wake events back to the event loop.
-        """
-        thread_name = "porcupine-%s" % room.room_id
-        log.info("ww_thread_started", room=room.friendly_name, thread=thread_name)
-        buf = bytearray()
-        frames_processed = 0
-        try:
-            while not _ww_stop.is_set():
-                # Skip processing when not listening or Sonos is playing
-                if room.state != RoomState.LISTENING or room.sonos_playing:
-                    while not room.audio_queue.empty():
-                        try:
-                            room.audio_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    buf.clear()
-                    time.sleep(0.05)
-                    continue
-
-                try:
-                    data = room.audio_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                buf.extend(data)
-
-                while len(buf) >= ww_frame_bytes:
-                    frame_data = bytes(buf[:ww_frame_bytes])
-                    del buf[:ww_frame_bytes]
-
-                    if (time.monotonic() - room.last_wake_time) < wake_cooldown:
+                if room.sonos_playing:
+                    if room.sonos_playing_since and (time.monotonic() - room.sonos_playing_since) > 90.0:
+                        room.sonos_playing = False
+                        room.sonos_playing_since = 0.0
+                        log.warning("room_undeaf_timeout", room=room.friendly_name, reason="90s_safety")
+                    else:
                         continue
+                if room.state != RoomState.LISTENING:
+                    continue
+                if (time.monotonic() - room.last_wake_time) < wake_cooldown:
+                    continue
 
-                    if room.porcupine is not None:
-                        try:
-                            frame_np = np.frombuffer(frame_data, dtype=np.int16)
-                            result = room.porcupine.process(frame_np.tolist())
-                            frames_processed += 1
-                        except Exception as e:
-                            log.warning("porcupine_error", room=room.friendly_name,
-                                        error=type(e).__name__, detail=str(e)[:100])
-                            continue
-                        if result >= 0:
-                            loop.call_soon_threadsafe(_on_wake_detected, room)
-                            buf.clear()
+                buf_len = len(room.raw_buffer)
+                if buf_len < _WW_CHUNK_BYTES:
+                    if _poll_count % 20 == 0:
+                        log.info("ww_buf_low", room=room.friendly_name,
+                                 buf_bytes=buf_len, need=_WW_CHUNK_BYTES)
+                    continue
+
+                chunk = bytes(room.raw_buffer[-_WW_CHUNK_BYTES:])
+
+                arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+                rms = float(np.sqrt(np.mean(arr ** 2)))
+
+                # Log every 10th poll for the office to see what's happening
+                if _poll_count % 10 == 0 and room.room_id == "offi":
+                    log.info("ww_poll", room=room.friendly_name, rms=round(rms, 0),
+                             buf=buf_len, polls=_poll_count)
+
+                if rms < 300:
+                    continue
+
+                log.info("ww_sending", room=room.friendly_name, rms=round(rms, 0))
+                wav_data = _pcm_to_wav(chunk)
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.post(
+                            stt_url,
+                            files={"file": ("ww.wav", wav_data, "audio/wav")},
+                            data={"model": stt_model, "language": stt_language},
+                        )
+                        resp.raise_for_status()
+                        text = (resp.json().get("text") or "").strip().lower()
+                except Exception as e:
+                    log.warning("ww_stt_error", room=room.friendly_name,
+                                error=type(e).__name__)
+                    continue
+
+                log.info("ww_transcript", room=room.friendly_name,
+                         text=text[:60], rms=round(rms, 0))
+
+                if not text:
+                    continue
+
+                text_clean = text.lower().rstrip(".!?,")
+                for phrase in _WAKE_PHRASES:
+                    if phrase in text_clean:
+                        if room.state != RoomState.LISTENING:
                             break
-        except Exception as e:
-            log.exception("ww_thread_crashed", room=room.friendly_name,
-                          frames_processed=frames_processed)
-        finally:
-            log.warning("ww_thread_exited", room=room.friendly_name,
-                        frames_processed=frames_processed)
+                        log.info("wake_detected", room=room.friendly_name,
+                                 phrase=phrase, transcript=text[:60])
+                        _start_session(room)
+                        break
 
-    def _on_wake_detected(room: Room) -> None:
-        """Called on the event loop thread when a Porcupine thread detects a wake word."""
-        if room.state != RoomState.LISTENING:
-            return
-        log.info("wake_detected", room=room.friendly_name)
-        _start_session(room)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.exception("ww_loop_error", room=room.friendly_name)
+                await asyncio.sleep(5.0)
 
     # ------------------------------------------------------------------
     # MQTT reader (button events + Sonos playback awareness)
@@ -585,7 +903,7 @@ async def run_voice_service() -> None:
                     room = rooms.get(room_id)
                     if room and payload == "pressed" and room.state == RoomState.LISTENING:
                         log.info("push_to_talk", room=room.friendly_name)
-                        _start_session(room)
+                        _start_session(room, trigger="button")
 
                 elif len(parts) >= 4 and parts[-1] == "status":
                     room_id = parts[-2]
@@ -603,6 +921,7 @@ async def run_voice_service() -> None:
                                 speakers = room_speakers.get(room.room_id, [])
                                 if any(s in pb_targets for s in speakers) or not pb_targets:
                                     room.sonos_playing = True
+                                    room.sonos_playing_since = time.monotonic()
                                     if room.state != RoomState.BUSY:
                                         room.raw_buffer.clear()
                                     _publish_room_status(room)
@@ -641,69 +960,200 @@ async def run_voice_service() -> None:
     # Status loop
     # ------------------------------------------------------------------
 
+    _ww_tasks: Dict[str, asyncio.Task] = {}
+    _porcupine_threads: Dict[str, threading.Thread] = {}
+    _porcupine_stop = threading.Event()
+
     def _publish_room_status(r: Room) -> None:
         """Publish room status to MQTT for the dashboard."""
         now = time.monotonic()
         age = round(now - r.last_audio_at, 1) if r.last_audio_at > 0 else None
         active = age is not None and age < 5.0
-        thread_alive = any(
-            t.name == "porcupine-%s" % r.room_id and t.is_alive()
-            for t in _ww_threads
-        )
+        if porcupine_mode:
+            pt = _porcupine_threads.get(r.room_id)
+            ww_task_alive = pt is not None and pt.is_alive()
+        else:
+            ww_task_alive = r.room_id in _ww_tasks and not _ww_tasks[r.room_id].done()
         mqttc.publish_json("%s/voice/room_status" % base, make_event(
             source="voice-service", typ="voice.room_status", data={
                 "room_id": r.room_id, "room_name": r.friendly_name,
                 "active": active, "state": r.state,
                 "sonos_playing": r.sonos_playing,
-                "porcupine_thread": thread_alive,
+                "porcupine_thread": ww_task_alive,
                 "queue_size": r.audio_queue.qsize(),
                 "frames": r.frames_received, "wakes": r.wake_detections,
                 "stt_reqs": r.stt_requests,
+                "pps": round(r.packets_per_second, 1),
+                "max_gap_s": round(r.max_gap_seconds, 2),
+                "queue_drops": r._queue_drops,
+                "session_ok": r.session_ok,
+                "session_fail": r.session_fail,
+                "last_stt": r.last_stt_result[:60],
             }))
 
     async def _status_loop() -> None:
         while True:
             await asyncio.sleep(30.0)
-            for room_id, r in sorted(rooms.items()):
+            for _room_id, r in sorted(rooms.items()):
+                if porcupine_mode:
+                    t = _porcupine_threads.get(r.room_id)
+                    if t is None or not t.is_alive():
+                        log.warning("porcupine_thread_restart", room=r.friendly_name)
+                        nt = threading.Thread(
+                            target=_porcupine_room_thread,
+                            kwargs={
+                                "room": r,
+                                "access_key": porcupine_key,
+                                "keyword_path": str(porcupine_model_path),
+                                "wake_cooldown": wake_cooldown,
+                                "loop": loop,
+                                "log": log,
+                                "stop_event": _porcupine_stop,
+                                "start_session": _start_session,
+                            },
+                            name="porcupine-%s" % r.room_id,
+                            daemon=True,
+                        )
+                        nt.start()
+                        _porcupine_threads[r.room_id] = nt
+                else:
+                    task = _ww_tasks.get(r.room_id)
+                    if task is None or task.done():
+                        log.warning("ww_task_restart", room=r.friendly_name)
+                        _ww_tasks[r.room_id] = asyncio.create_task(_wake_word_loop(r))
                 _publish_room_status(r)
+
+    # ------------------------------------------------------------------
+    # UDP keepalive — send periodic pings back to each device to keep
+    # AP/switch associations active and reduce gaps in the audio stream.
+    # ------------------------------------------------------------------
+
+    _KEEPALIVE_INTERVAL = 5.0
+    _KEEPALIVE_PAYLOAD = b"\x00"
+
+    async def _keepalive_loop() -> None:
+        while True:
+            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+            for r in rooms.values():
+                addr = r.last_addr
+                if addr is None:
+                    continue
+                try:
+                    transport.sendto(_KEEPALIVE_PAYLOAD, addr)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Start
     # ------------------------------------------------------------------
 
-    # Launch one Porcupine thread per room
+    # Reset all LEDs to listening on startup
     for room in rooms.values():
-        t = threading.Thread(
-            target=_wake_word_thread, args=(room,),
-            name="porcupine-%s" % room.room_id, daemon=True,
-        )
-        t.start()
-        _ww_threads.append(t)
-        log.info("porcupine_thread_started", room=room.friendly_name)
+        _set_led(room.room_id, "listening")
+
+    if porcupine_mode:
+        assert porcupine_model_path is not None
+        for room in rooms.values():
+            t = threading.Thread(
+                target=_porcupine_room_thread,
+                kwargs={
+                    "room": room,
+                    "access_key": porcupine_key,
+                    "keyword_path": str(porcupine_model_path),
+                    "wake_cooldown": wake_cooldown,
+                    "loop": loop,
+                    "log": log,
+                    "stop_event": _porcupine_stop,
+                    "start_session": _start_session,
+                },
+                name="porcupine-%s" % room.room_id,
+                daemon=True,
+            )
+            t.start()
+            _porcupine_threads[room.room_id] = t
+            log.info("porcupine_thread_started", room=room.friendly_name)
+    else:
+        for room in rooms.values():
+            _ww_tasks[room.room_id] = asyncio.create_task(_wake_word_loop(room))
+            log.info("ww_task_started", room=room.friendly_name)
 
     mqtt_task = asyncio.create_task(_mqtt_reader())
     status_task = asyncio.create_task(_status_loop())
+    keepalive_task = asyncio.create_task(_keepalive_loop())
 
-    try:
-        log.info("voice_service_ready", rooms=list(room_configs.keys()),
-                 udp_port=udp_port, stt_provider=settings.voice_stt_provider,
-                 porcupine_threads=len(_ww_threads))
-        await asyncio.Event().wait()
-    finally:
-        transport.close()
-        # Stop Porcupine threads
-        _ww_stop.set()
-        for t in _ww_threads:
-            t.join(timeout=2.0)
-        mqtt_task.cancel()
-        status_task.cancel()
-        # Free Porcupine native instances
-        for room in rooms.values():
-            if room.porcupine is not None:
+    # ------------------------------------------------------------------
+    # Live audio WebSocket server (diagnostic)
+    # ------------------------------------------------------------------
+
+    _ws_server = None
+    live_audio_port = settings.voice_live_audio_port
+
+    if live_audio_port:
+        try:
+            import websockets
+            import websockets.server
+
+            async def _ws_handler(websocket) -> None:
+                path = websocket.request.path if hasattr(websocket, 'request') else (websocket.path if hasattr(websocket, 'path') else '')
+                parts = path.strip("/").split("/")
+                if len(parts) != 2 or parts[0] != "live":
+                    await websocket.close(4000, "use /live/{room_id}")
+                    return
+                room_id = parts[1]
+                if room_id not in rooms:
+                    await websocket.close(4001, "unknown room")
+                    return
+                q: asyncio.Queue = asyncio.Queue(maxsize=200)
+                _live_listeners.setdefault(room_id, set()).add(q)
+                log.info("live_client_connected", room=room_id)
                 try:
-                    room.porcupine.delete()
+                    while True:
+                        audio = await q.get()
+                        await websocket.send(audio)
                 except Exception:
                     pass
+                finally:
+                    _live_listeners.get(room_id, set()).discard(q)
+                    if not _live_listeners.get(room_id):
+                        _live_listeners.pop(room_id, None)
+                    log.info("live_client_disconnected", room=room_id)
+
+            _ws_server = await websockets.serve(
+                _ws_handler, "0.0.0.0", live_audio_port,
+            )
+            log.info("live_audio_ws_started", port=live_audio_port)
+        except ImportError:
+            log.warning("live_audio_ws_unavailable", hint="pip install websockets")
+        except Exception:
+            log.exception("live_audio_ws_failed")
+
+    try:
+        log.info(
+            "voice_service_ready",
+            rooms=list(room_configs.keys()),
+            udp_port=udp_port,
+            stt_url=stt_url,
+            wake_engine=wake_engine,
+            ww_tasks=len(_ww_tasks),
+            porcupine_threads=len(_porcupine_threads),
+            live_audio_port=live_audio_port or None,
+        )
+        await asyncio.Event().wait()
+    finally:
+        keepalive_task.cancel()
+        if _ws_server is not None:
+            _ws_server.close()
+            await _ws_server.wait_closed()
+        transport.close()
+        mqtt_task.cancel()
+        status_task.cancel()
+        if porcupine_mode:
+            _porcupine_stop.set()
+            for t in list(_porcupine_threads.values()):
+                t.join(timeout=3.0)
+        else:
+            for task in _ww_tasks.values():
+                task.cancel()
         await mqttc.close()
 
 

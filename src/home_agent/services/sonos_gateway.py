@@ -345,7 +345,8 @@ async def run_sonos_gateway() -> None:
                 continue
 
             text = str(data.get("text") or "").strip()
-            if not text:
+            offline_key = data.get("offline_audio_key") if isinstance(data.get("offline_audio_key"), str) else None
+            if not text and not offline_key:
                 log.warning("bad_event", reason="missing_text", id=event_id)
                 continue
 
@@ -426,8 +427,6 @@ async def run_sonos_gateway() -> None:
             elif isinstance(concurrency_raw, str) and concurrency_raw.isdigit():
                 concurrency = int(concurrency_raw)
 
-            offline_key = data.get("offline_audio_key") if isinstance(data.get("offline_audio_key"), str) else None
-
             data_targets = data.get("targets")
             play_targets = targets
             if isinstance(data_targets, list) and all(isinstance(x, str) for x in data_targets) and data_targets:
@@ -448,18 +447,22 @@ async def run_sonos_gateway() -> None:
             _t_norm = loop.time()
 
             # Notify voice service that speakers are about to play
-            _pb_targets = data_targets if isinstance(data_targets, list) else list(settings.sonos.speaker_alias_map.keys())
-            _pb_start = make_event(source="sonos-gateway", typ="sonos.playback_start", data={"targets": _pb_targets})
-            mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_start)
+            # Skip for typing sound -- it's a brief effect that shouldn't deaf rooms
+            _is_typing = offline_key == "voice_typing"
+            if not _is_typing:
+                _pb_targets = data_targets if isinstance(data_targets, list) else list(settings.sonos.speaker_alias_map.keys())
+                _pb_start = make_event(source="sonos-gateway", typ="sonos.playback_start", data={"targets": _pb_targets})
+                mqttc.publish_json("%s/sonos/playback" % settings.mqtt.base_topic, _pb_start)
             try:
                 hosted = None
                 if offline_key:
                     path = _offline_audio_path(settings, offline_key)
                     if path and path.exists():
+                        ct = "audio/mpeg" if path.suffix.lower() == ".mp3" else "audio/wav"
                         hosted = host.host_bytes(
                             data=path.read_bytes(),
                             filename=path.name,
-                            content_type="audio/wav",
+                            content_type=ct,
                             route_to_ip=play_targets[0],
                         )
                         log.info("announce_offline_audio", key=offline_key, path=str(path))
@@ -484,12 +487,14 @@ async def run_sonos_gateway() -> None:
                     )
                 )
                 _t_play_start = loop.time()
+                _is_typing = offline_key == "voice_typing"
                 await player2.play_url(
                     url=hosted.url,
                     volume=volume,
                     title="Home Agent",
                     concurrency=concurrency,
                     tail_padding_seconds=0.0,
+                    fire_and_forget=_is_typing,
                 )
                 _t_play_done = loop.time()
                 if active_player is None:
@@ -524,10 +529,11 @@ async def run_sonos_gateway() -> None:
                     try:
                         path = _offline_audio_path(settings, offline_key)
                         if path and path.exists():
+                            ct = "audio/mpeg" if path.suffix.lower() == ".mp3" else "audio/wav"
                             hosted = host.host_bytes(
                                 data=path.read_bytes(),
                                 filename=path.name,
-                                content_type="audio/wav",
+                                content_type=ct,
                                 route_to_ip=play_targets[0],
                             )
                             player2 = (

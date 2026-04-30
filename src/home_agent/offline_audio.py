@@ -69,4 +69,9 @@ OFFLINE_AUDIO_ITEMS: List[OfflineAudioItem] = [
         "filename": "voice_error.wav",
         "text": "I'm sorry, I had trouble with that request.",
     },
+    {
+        "key": "voice_typing",
+        "filename": "typing.mp3",
+        "text": "",
+    },
 ]
