@@ -222,6 +222,7 @@ def _porcupine_room_thread(
     room: Room,
     access_key: str,
     keyword_path: str,
+    sensitivity: float,
     wake_cooldown: float,
     loop: asyncio.AbstractEventLoop,
     log,
@@ -234,7 +235,11 @@ def _porcupine_room_thread(
     porcupine = None
     try:
         try:
-            porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path])
+            porcupine = pvporcupine.create(
+                access_key=access_key,
+                keyword_paths=[keyword_path],
+                sensitivities=[max(0.0, min(1.0, sensitivity))],
+            )
         except Exception:
             log.exception("porcupine_init_failed", room=room.friendly_name, path=keyword_path)
             return
@@ -268,16 +273,7 @@ def _porcupine_room_thread(
             if len(frame_bytes) // 2 != _frame_samples:
                 continue
 
-            suppressed = (
-                room.state != RoomState.LISTENING
-                or (time.monotonic() - room.last_wake_time) < wake_cooldown
-            )
-            if suppressed:
-                _skipped_state += 1
-                continue
-
             arr = np.frombuffer(frame_bytes, dtype=np.int16)
-            rms = float(np.sqrt(np.mean(arr.astype(np.int32) ** 2)))
 
             try:
                 keyword_index = porcupine.process(arr)
@@ -286,6 +282,16 @@ def _porcupine_room_thread(
                 continue
 
             _processed += 1
+
+            suppressed = (
+                room.state != RoomState.LISTENING
+                or (time.monotonic() - room.last_wake_time) < wake_cooldown
+            )
+            if suppressed:
+                _skipped_state += 1
+                continue
+
+            rms = float(np.sqrt(np.mean(arr.astype(np.int32) ** 2)))
 
             if keyword_index >= 0:
                 log.info(
@@ -1007,6 +1013,7 @@ async def run_voice_service() -> None:
                                 "room": r,
                                 "access_key": porcupine_key,
                                 "keyword_path": str(porcupine_model_path),
+                                "sensitivity": settings.voice_wake_threshold,
                                 "wake_cooldown": wake_cooldown,
                                 "loop": loop,
                                 "log": log,
@@ -1062,6 +1069,7 @@ async def run_voice_service() -> None:
                     "room": room,
                     "access_key": porcupine_key,
                     "keyword_path": str(porcupine_model_path),
+                    "sensitivity": settings.voice_wake_threshold,
                     "wake_cooldown": wake_cooldown,
                     "loop": loop,
                     "log": log,
