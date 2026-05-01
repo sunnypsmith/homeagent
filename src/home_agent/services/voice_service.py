@@ -269,8 +269,7 @@ def _porcupine_room_thread(
                 continue
 
             suppressed = (
-                room.sonos_playing
-                or room.state != RoomState.LISTENING
+                room.state != RoomState.LISTENING
                 or (time.monotonic() - room.last_wake_time) < wake_cooldown
             )
             if suppressed:
@@ -781,6 +780,8 @@ async def run_voice_service() -> None:
             _publish_command(room, text)
             speakers = room_speakers.get(room.room_id, [])
             if speakers and speakers != ["none"]:
+                mqttc.publish_json("%s/sonos/hold" % base,
+                    make_event(source="voice-service", typ="sonos.hold", data={"action": "start"}))
                 _announce("", speakers, offline_key="voice_typing")
             outcome = "ok"
 
@@ -837,13 +838,6 @@ async def run_voice_service() -> None:
                 await asyncio.sleep(_WW_POLL_S)
                 _poll_count += 1
 
-                if room.sonos_playing:
-                    if room.sonos_playing_since and (time.monotonic() - room.sonos_playing_since) > 90.0:
-                        room.sonos_playing = False
-                        room.sonos_playing_since = 0.0
-                        log.warning("room_undeaf_timeout", room=room.friendly_name, reason="90s_safety")
-                    else:
-                        continue
                 if room.state != RoomState.LISTENING:
                     continue
                 if (time.monotonic() - room.last_wake_time) < wake_cooldown:
@@ -943,11 +937,8 @@ async def run_voice_service() -> None:
                                 if any(s in pb_targets for s in speakers) or not pb_targets:
                                     room.sonos_playing = True
                                     room.sonos_playing_since = time.monotonic()
-                                    if room.state != RoomState.BUSY:
-                                        room.raw_buffer.clear()
                                     _publish_room_status(room)
-                                    log.info("room_deaf", room=room.friendly_name,
-                                             reason="sonos_playback_start")
+                                    log.info("sonos_playback_active", room=room.friendly_name)
 
                         elif evt_type == "sonos.playback_done":
                             pb_targets = evt_data.get("targets", [])
@@ -958,18 +949,8 @@ async def run_voice_service() -> None:
                                 if pb_targets and not any(s in pb_targets for s in speakers):
                                     continue
                                 room.sonos_playing = False
-                                if room.state != RoomState.BUSY:
-                                    room.raw_buffer.clear()
-                                if room.state == RoomState.LISTENING:
-                                    # Brief bright flash then back to dim green — visible "ready" cue
-                                    _set_led(room.room_id, "wake")
-                                    async def _flash_ready(_rid=room.room_id):
-                                        await asyncio.sleep(0.4)
-                                        _set_led(_rid, "listening")
-                                    asyncio.create_task(_flash_ready())
                                 _publish_room_status(room)
-                                log.info("room_undeaf", room=room.friendly_name,
-                                         reason="sonos_playback_done")
+                                log.info("sonos_playback_ended", room=room.friendly_name)
                     except Exception as e:
                         log.warning("sonos_event_error", error=type(e).__name__)
 

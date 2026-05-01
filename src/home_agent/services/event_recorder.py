@@ -81,31 +81,39 @@ async def run_event_recorder() -> None:
     last_insert_err_at = 0.0
     last_insert_err_kind: Optional[str] = None
 
-    def insert_row(
-        ts: datetime,
-        mqtt_topic: str,
-        source: Optional[str],
-        typ: Optional[str],
-        event_id: Optional[str],
-        trace_id: Optional[str],
-        payload_json: str,
-    ) -> None:
+    _BATCH_MAX = 100
+    _FLUSH_INTERVAL_S = 1.0
+    batch: list[tuple] = []
+
+    async def _flush_batch() -> None:
+        nonlocal last_insert_ok_at, last_insert_err_at, last_insert_err_kind
+        if not batch:
+            return
+        to_flush = list(batch)
+        batch.clear()
+
         def _do(conn) -> None:
             with conn.cursor() as cur:
-                cur.execute(
-                    insert_sql,
-                    (
-                        ts,
-                        mqtt_topic,
-                        source,
-                        typ,
-                        event_id,
-                        trace_id,
-                        payload_json,
-                    ),
-                )
+                cur.executemany(insert_sql, to_flush)
 
-        db.run(_do, retries=1)
+        try:
+            await loop.run_in_executor(None, lambda: db.run(_do, retries=1))
+            stats["insert_ok"] += len(to_flush)
+            last_insert_ok_at = loop.time()
+        except Exception as exc:
+            stats["insert_err"] += len(to_flush)
+            last_insert_err_at = loop.time()
+            last_insert_err_kind = "batch_insert_failed"
+            log.exception("batch_insert_failed", batch_size=len(to_flush))
+            reporter.report_error("batch_insert_failed", exc)
+
+    async def _flush_loop() -> None:
+        while True:
+            await asyncio.sleep(_FLUSH_INTERVAL_S)
+            try:
+                await _flush_batch()
+            except Exception:
+                pass
 
     async def stats_reporter() -> None:
         while True:
@@ -156,12 +164,17 @@ async def run_event_recorder() -> None:
 
     reporter_task = asyncio.create_task(stats_reporter())
     status_task = asyncio.create_task(status_loop())
+    flush_task = asyncio.create_task(_flush_loop())
 
     try:
         while True:
             msg = await mqttc.next_message()
             stats["seen"] += 1
             stats["last_topic"] = msg.topic
+
+            # Skip ESPHome diagnostic sensor state messages (high-frequency, low-value)
+            if "/sensor/" in msg.topic and msg.topic.endswith("/state"):
+                continue
 
             now = datetime.now(timezone.utc)
             payload_obj: Dict[str, Any]
@@ -183,24 +196,21 @@ async def run_event_recorder() -> None:
                 trace_id = payload_obj.get("trace_id") if isinstance(payload_obj.get("trace_id"), str) else None
             except Exception:
                 stats["json_err"] += 1
-                # Store non-JSON payloads too.
                 payload_obj = {"ts": now.isoformat(), "type": "raw", "data": {"raw": msg.payload.decode("utf-8", "replace")}}
                 typ = "raw"
 
             stats["last_type"] = typ
             payload_json = json.dumps(payload_obj, separators=(",", ":"))
 
-            try:
-                await loop.run_in_executor(None, insert_row, ts, msg.topic, source, typ, event_id, trace_id, payload_json)
-                stats["insert_ok"] += 1
-                last_insert_ok_at = loop.time()
-            except Exception as exc:
-                stats["insert_err"] += 1
-                last_insert_err_at = loop.time()
-                last_insert_err_kind = "insert_failed"
-                log.exception("insert_failed", topic=msg.topic)
-                reporter.report_error("insert_failed", exc)
+            batch.append((ts, msg.topic, source, typ, event_id, trace_id, payload_json))
+            if len(batch) >= _BATCH_MAX:
+                await _flush_batch()
     finally:
+        flush_task.cancel()
+        try:
+            await _flush_batch()
+        except Exception:
+            pass
         reporter_task.cancel()
         status_task.cancel()
         db.close()

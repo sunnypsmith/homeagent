@@ -66,24 +66,60 @@ def _top_topics(limit: int = 10) -> List[Dict[str, Any]]:
     return [{"topic": t, "count": c, "rate": round(c / 60.0, 2)} for t, c in top]
 
 
+_ui_db_conn: Any = None
+
+
+def _get_ui_db(conninfo: str) -> Any:
+    """Return a persistent DB connection for the UI dashboard polls."""
+    global _ui_db_conn
+    try:
+        import psycopg
+    except ImportError:
+        return None
+    if _ui_db_conn is not None:
+        try:
+            if not _ui_db_conn.closed:
+                return _ui_db_conn
+        except Exception:
+            pass
+        try:
+            _ui_db_conn.close()
+        except Exception:
+            pass
+    try:
+        _ui_db_conn = psycopg.connect(conninfo, autocommit=True)
+        return _ui_db_conn
+    except Exception:
+        _ui_db_conn = None
+        return None
+
+
+def _reset_ui_db() -> None:
+    global _ui_db_conn
+    if _ui_db_conn is not None:
+        try:
+            _ui_db_conn.close()
+        except Exception:
+            pass
+        _ui_db_conn = None
+
+
 def _fetch_db_activity_cached(settings: Any) -> Dict[str, Any]:
     cached = _db_activity.get("_cached_at", 0.0)
     if (time.time() - cached) < 5.0 and _db_activity.get("rows") is not None:
         return _db_activity
+    conn = _get_ui_db(settings.db.conninfo)
+    if conn is None:
+        return _db_activity
     try:
-        import psycopg
-        conn = psycopg.connect(settings.db.conninfo, autocommit=True)
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT now(), (SELECT max(ingested_at) FROM events),
-                           (SELECT count(*) FROM events WHERE ingested_at > now() - interval '60 seconds')
-                """)
-                now_utc, last_at, last_60 = cur.fetchone()
-                cur.execute("SELECT ingested_at, topic, source, type FROM events WHERE ingested_at > now() - interval '1 hour' AND type NOT IN ('service.heartbeat', 'voice.room_status', 'watchdog.health', 'service.error', 'raw') ORDER BY ingested_at DESC LIMIT 8")
-                rows = cur.fetchall()
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT now(), (SELECT max(ingested_at) FROM events),
+                       (SELECT count(*) FROM events WHERE ingested_at > now() - interval '60 seconds')
+            """)
+            now_utc, last_at, last_60 = cur.fetchone()
+            cur.execute("SELECT ingested_at, topic, source, type FROM events WHERE ingested_at > now() - interval '1 hour' AND type NOT IN ('service.heartbeat', 'voice.room_status', 'watchdog.health', 'service.error', 'raw') ORDER BY ingested_at DESC LIMIT 8")
+            rows = cur.fetchall()
         age_s = None
         if last_at and now_utc:
             age_s = round(max(0.0, (now_utc - last_at).total_seconds()), 1)
@@ -98,6 +134,7 @@ def _fetch_db_activity_cached(settings: Any) -> Dict[str, Any]:
         _db_activity.update(result)
         return _db_activity
     except Exception:
+        _reset_ui_db()
         return _db_activity
 
 
@@ -406,7 +443,7 @@ summary:hover{{color:var(--text)}}
 <div class="w">
 <header>
 <h1><span class="pulse" id="pulse"></span>System Status</h1>
-<div class="nav"><a href="/chat">Chat</a> &middot; <a href="/">Controls</a></div>
+<div class="nav"><a href="/chat">Chat</a> &middot; <a href="/live-audio">Live</a> &middot; <a href="/audio-debug">Audio</a> &middot; <a href="/">Controls</a></div>
 </header>
 <div class="vitals" id="vitals">Loading...</div>
 
@@ -426,8 +463,8 @@ summary:hover{{color:var(--text)}}
 </div>
 
 <div class="section">
-<div class="sh">Recent Commands</div>
-<div class="pan" id="cmds"><div class="empty">No commands yet</div></div>
+<div class="sh">Voice Transcript</div>
+<div class="pan" id="cmds" style="max-height:300px;overflow-y:auto"><div class="empty">No voice activity yet</div></div>
 </div>
 
 <div class="cols">
@@ -503,27 +540,51 @@ if(vrk.length){{
 let vh='';
 for(const k of vrk){{
 const rm=vr[k];const act=rm.active;const st=rm.state||'?';
-const deaf=rm.sonos_playing;const thr=rm.porcupine_thread;const qs=rm.queue_size||0;
-const dc=deaf?'err':!thr&&thr!==null?'err':st==='busy'?'wrn':act?'ok':'dn';
+const spk=rm.sonos_playing;const thr=rm.porcupine_thread;const qs=rm.queue_size||0;
+const pps=rm.pps||0;const gap=rm.max_gap_s||0;const qd=rm.queue_drops||0;
+const sok=rm.session_ok||0;const sfail=rm.session_fail||0;
+const srate=sok+sfail>0?Math.round(100*sok/(sok+sfail)):0;
+const lstt=rm.last_stt||'';
+const dc=!thr&&thr!==null?'err':st==='busy'?'wrn':act?'ok':'dn';
+const ppsc=pps>30?'g':pps>10?'y':'r';
 const tm=rm.last_timing||{{}};
 const cmd=rm.last_command||'';const resp=rm.last_response||'';
 vh+=`<div class="vc"><div class="vn"><span class="dot ${{dc}}"></span>${{esc(rm.room_name||k)}}</div>`
-+`<div class="vs">${{st.toUpperCase()}}${{deaf?' <b style="color:var(--err)">DEAF</b>':''}}`
-+`${{thr===false?' <b style="color:var(--err)">THR DEAD</b>':''}}<br>`
-+`Wakes: <b>${{rm.wakes||0}}</b> STT: <b>${{rm.stt_reqs||0}}</b> Q: <b>${{qs}}</b>`
++`<div class="vs">${{st.toUpperCase()}}${{spk?' <b style="color:var(--cyan)">PLAYING</b>':''}}`
++`${{thr===false?' <b style="color:var(--red)">WW DEAD</b>':''}}<br>`
++`<b class="${{ppsc}}">${{pps}} pps</b>`
++`${{act?'':' <span style="color:var(--dim)">no audio</span>'}}`
++`${{gap>1?' gap:<b class="r">'+gap.toFixed(1)+'s</b>':''}}`
++`${{qd?' drops:<b class="y">'+qd+'</b>':''}}`
++`<br>Wakes: <b>${{rm.wakes||0}}</b> STT: <b>${{rm.stt_reqs||0}}</b>`
++` OK: <b class="g">${{sok}}</b> Fail: <b class="${{sfail?'r':''}}">${{sfail}}</b>`
++`${{lstt?' <span style="color:var(--dim)">'+esc(lstt.substring(0,40))+'</span>':''}}`
 +`${{tm.total_ms?'<br><span style="font-size:10px;color:var(--dim)">prompt:'+tm.prompt_ms+'ms cap:'+tm.capture_ms+'ms proc:'+tm.audio_process_ms+'ms stt:'+tm.stt_ms+'ms total:<b>'+tm.total_ms+'ms</b></span>':''}}`
-+`${{cmd?'<br><span style="font-size:10px;color:var(--dim)">CMD: '+esc(cmd.substring(0,50))+'</span>':''}}`
-+`${{resp?'<br><span style="font-size:10px;color:var(--dim)">RSP: '+esc(resp.substring(0,50))+'</span>':''}}`
++`${{cmd?'<br><span style="font-size:11px;color:var(--cyan)">&#x1f399; '+esc(cmd.substring(0,80))+'</span>':''}}`
++`${{resp?'<br><span style="font-size:11px;color:var(--green)">&#x1f50a; '+esc(resp.substring(0,80))+'</span>':''}}`
 +`</div></div>`;
 }}
 $('voice').innerHTML=vh;
 }}else{{$('voice').innerHTML='<div class="empty">No voice data yet</div>'}}
 
-// commands
-if(vc.length){{
-let ch='<table><tr><th>Time</th><th>Room</th><th>Command</th></tr>';
-for(const c of vc.slice(0,8))ch+=`<tr><td>${{ts(c.ts)}}</td><td><b>${{esc(c.room_name||c.room_id)}}</b></td><td>${{esc(c.text)}}</td></tr>`;
-$('cmds').innerHTML=ch+'</table>';
+// voice transcript
+const vresp=d.voice_responses||[];
+if(vc.length||vresp.length){{
+let items=[];
+for(const c of vc)items.push({{ts:c.ts,room:c.room_name||c.room_id,text:c.text,dir:'in'}});
+for(const r of vresp)items.push({{ts:r.ts,room:r.room_name||r.room_id,text:r.text,dir:'out'}});
+items.sort((a,b)=>(b.ts||'').localeCompare(a.ts||''));
+let ch='';
+for(const m of items.slice(0,20)){{
+const icon=m.dir==='in'?'&#x1f399;':'&#x1f50a;';
+const col=m.dir==='in'?'var(--cyan)':'var(--green)';
+ch+=`<div style="padding:6px 12px;border-bottom:1px solid var(--border);font-size:12px;display:flex;gap:8px;align-items:baseline">`
++`<span style="color:var(--dim);font-family:var(--mono);font-size:10px;flex-shrink:0">${{ts(m.ts)}}</span>`
++`<span style="color:${{col}};flex-shrink:0">${{icon}}</span>`
++`<b style="color:var(--text);flex-shrink:0;min-width:60px">${{esc(m.room)}}</b>`
++`<span style="color:${{col}}">${{esc(m.text)}}</span></div>`;
+}}
+$('cmds').innerHTML=ch;
 }}
 
 // feed
@@ -557,6 +618,240 @@ $('pulse').style.background='var(--green)';
 }}catch(e){{$('pulse').style.background='var(--red)';$('vitals').innerHTML='Connection error'}}
 }}
 refresh();setInterval(refresh,5000);
+}})();
+</script>
+</body>
+</html>"""
+
+
+def _audio_debug_html(*, title: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0a0e1a"/>
+<title>{title} — Audio Debug</title>
+<style>
+{_CSS_VARS}
+.w{{max-width:900px;margin:0 auto;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(20px + env(safe-area-inset-bottom))}}
+header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}}
+h1{{font-size:17px;font-weight:700}}
+.nav a{{color:var(--blue);font-size:12px;text-decoration:none}}
+.room{{margin-bottom:20px}}
+.rh{{font-size:14px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:6px}}
+.rh .ct{{font-size:10px;font-weight:700;font-family:var(--mono);padding:1px 6px;border-radius:7px;background:rgba(52,211,153,.12);color:var(--green)}}
+.pan{{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}}
+.af{{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,.03);font-size:11px;font-family:var(--mono)}}
+.af:last-child{{border-bottom:none}}
+.af .fn{{color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.af .dur{{color:var(--dim);width:50px;text-align:right}}
+.af .typ{{font-size:9px;font-weight:700;padding:1px 5px;border-radius:4px;flex-shrink:0}}
+.typ.raw{{background:rgba(248,113,113,.15);color:#f87171}}
+.typ.proc{{background:rgba(52,211,153,.12);color:var(--green)}}
+.af audio{{height:28px;flex-shrink:0}}
+.empty{{color:var(--dim);font-size:12px;padding:14px;text-align:center}}
+.refresh{{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 14px;border-radius:8px;font-size:12px;cursor:pointer}}
+</style>
+</head>
+<body>
+<div class="w">
+<header>
+<h1>Audio Debug</h1>
+<div class="nav"><a href="/status">Status</a> &middot; <a href="/live-audio">Live</a> &middot; <a href="/chat">Chat</a> &middot; <a href="/">Controls</a> &middot; <button class="refresh" onclick="load()">Refresh</button></div>
+</header>
+<div id="content"><div class="empty">Loading...</div></div>
+</div>
+<script>
+(function(){{
+function esc(s){{const d=document.createElement('div');d.textContent=s;return d.innerHTML}}
+
+window.load=async function(){{
+try{{
+const r=await fetch('/api/debug-audio');
+const d=await r.json();
+const rooms=d.rooms||{{}};
+const rk=Object.keys(rooms).sort();
+if(!rk.length){{document.getElementById('content').innerHTML='<div class="empty">No debug audio files yet. Trigger a voice session first.</div>';return}}
+let h='';
+for(const room of rk){{
+const files=rooms[room];
+h+=`<div class="room"><div class="rh">${{esc(room)}} <span class="ct">${{files.length}} files</span></div><div class="pan">`;
+for(const f of files){{
+const isRaw=f.name.includes('_raw');
+const typCls=isRaw?'raw':'proc';
+const typLbl=isRaw?'RAW':'PROC';
+h+=`<div class="af">`
++`<span class="typ ${{typCls}}">${{typLbl}}</span>`
++`<span class="fn">${{esc(f.name)}}</span>`
++`<span class="dur">${{f.duration_s}}s</span>`
++`<audio controls preload="none" src="${{f.url}}"></audio>`
++`</div>`;
+}}
+h+=`</div></div>`;
+}}
+document.getElementById('content').innerHTML=h;
+}}catch(e){{document.getElementById('content').innerHTML='<div class="empty">Error loading audio files</div>'}}
+}};
+load();
+}})();
+</script>
+</body>
+</html>"""
+
+
+def _live_audio_html(*, title: str, ws_port: int) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0a0e1a"/>
+<title>{title} — Live Audio</title>
+<style>
+{_CSS_VARS}
+.w{{max-width:900px;margin:0 auto;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(20px + env(safe-area-inset-bottom))}}
+header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}}
+h1{{font-size:17px;font-weight:700}}
+.nav a{{color:var(--blue);font-size:12px;text-decoration:none}}
+.rgrid{{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}}
+@media(min-width:600px){{.rgrid{{grid-template-columns:repeat(3,1fr)}}}}
+@media(min-width:800px){{.rgrid{{grid-template-columns:repeat(4,1fr)}}}}
+.rc{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;text-align:center}}
+.rc .rn{{font-size:14px;font-weight:600;margin-bottom:8px}}
+.rc .vu{{height:6px;background:rgba(255,255,255,.08);border-radius:3px;margin:8px 0;overflow:hidden}}
+.rc .vu-bar{{height:100%;width:0%;border-radius:3px;background:var(--green);transition:width 80ms linear}}
+.rc .lvl{{font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:6px}}
+.btn-play{{background:var(--surface2);border:1px solid var(--border2);color:var(--text);padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all 100ms}}
+.btn-play:hover{{border-color:var(--green);color:var(--green)}}
+.btn-play.active{{background:rgba(248,113,113,.15);border-color:rgba(248,113,113,.4);color:#f87171}}
+.empty{{color:var(--dim);font-size:12px;padding:14px;text-align:center}}
+.hint{{color:var(--dim);font-size:11px;margin-top:14px;text-align:center}}
+</style>
+</head>
+<body>
+<div class="w">
+<header>
+<h1>Live Audio Monitor</h1>
+<div class="nav"><a href="/status">Status</a> &middot; <a href="/audio-debug">Debug</a> &middot; <a href="/">Controls</a></div>
+</header>
+<div class="rgrid" id="rooms"></div>
+<div class="hint">Tap a room to listen to its live mic audio. Requires VOICE_LIVE_AUDIO_PORT in .env.</div>
+</div>
+<script>
+(function(){{
+const WS_PORT={ws_port};
+const SAMPLE_RATE=16000;
+const esc=s=>{{const d=document.createElement('div');d.textContent=s;return d.innerHTML}};
+const state={{}};
+
+async function loadRooms(){{
+  try{{
+    const r=await fetch('/api/health');
+    const d=await r.json();
+    const vr=d.voice_rooms||{{}};
+    const el=document.getElementById('rooms');
+    const rk=Object.keys(vr).sort();
+    if(!rk.length){{el.innerHTML='<div class="empty">No voice rooms found</div>';return}}
+    let h='';
+    for(const k of rk){{
+      const rm=vr[k];
+      const name=rm.room_name||k;
+      h+=`<div class="rc" id="rc-${{k}}">`;
+      h+=`<div class="rn">${{esc(name)}}</div>`;
+      h+=`<div class="vu"><div class="vu-bar" id="vu-${{k}}"></div></div>`;
+      h+=`<div class="lvl" id="lvl-${{k}}">—</div>`;
+      h+=`<button class="btn-play" id="btn-${{k}}" onclick="toggle('${{k}}')">`
+        +`&#x1f50a; Listen</button>`;
+      h+=`</div>`;
+    }}
+    el.innerHTML=h;
+  }}catch(e){{}}
+}}
+
+window.toggle=function(roomId){{
+  if(state[roomId]){{stopRoom(roomId);return}}
+  if(!WS_PORT){{alert('VOICE_LIVE_AUDIO_PORT not configured');return}}
+  startRoom(roomId);
+}};
+
+function startRoom(roomId){{
+  const wsHost=location.hostname;
+  const ws=new WebSocket(`ws://${{wsHost}}:${{WS_PORT}}/live/${{roomId}}`);
+  ws.binaryType='arraybuffer';
+  const ctx=new AudioContext({{sampleRate:SAMPLE_RATE}});
+  const bufSize=4096;
+  const node=ctx.createScriptProcessor(bufSize,0,1);
+  const queue=[];
+  let leftover=new Float32Array(0);
+
+  ws.onmessage=(e)=>{{
+    const pcm=new Int16Array(e.data);
+    const f32=new Float32Array(pcm.length);
+    let sum=0;
+    for(let i=0;i<pcm.length;i++){{
+      f32[i]=pcm[i]/32768.0;
+      sum+=f32[i]*f32[i];
+    }}
+    queue.push(f32);
+    const rms=Math.sqrt(sum/pcm.length);
+    const pct=Math.min(100,Math.round(rms*400));
+    const bar=document.getElementById('vu-'+roomId);
+    const lvl=document.getElementById('lvl-'+roomId);
+    if(bar)bar.style.width=pct+'%';
+    if(bar)bar.style.background=pct>60?'#f87171':pct>25?'#fbbf24':'var(--green)';
+    if(lvl)lvl.textContent='RMS: '+rms.toFixed(3);
+  }};
+
+  node.onaudioprocess=(e)=>{{
+    const out=e.outputBuffer.getChannelData(0);
+    let src;
+    if(leftover.length>0){{
+      let total=leftover.length;
+      for(const c of queue)total+=c.length;
+      src=new Float32Array(total);
+      src.set(leftover);let off=leftover.length;
+      while(queue.length){{const c=queue.shift();src.set(c,off);off+=c.length}}
+    }}else{{
+      let total=0;for(const c of queue)total+=c.length;
+      src=new Float32Array(total);let off=0;
+      while(queue.length){{const c=queue.shift();src.set(c,off);off+=c.length}}
+    }}
+    if(src.length>=out.length){{
+      out.set(src.subarray(0,out.length));
+      leftover=src.subarray(out.length);
+    }}else{{
+      out.set(src);
+      for(let i=src.length;i<out.length;i++)out[i]=0;
+      leftover=new Float32Array(0);
+    }}
+  }};
+  node.connect(ctx.destination);
+
+  ws.onclose=()=>stopRoom(roomId);
+  ws.onerror=()=>stopRoom(roomId);
+
+  const btn=document.getElementById('btn-'+roomId);
+  if(btn){{btn.textContent='\\u23f9 Stop';btn.classList.add('active')}}
+  state[roomId]={{ws,ctx,node,queue}};
+}}
+
+function stopRoom(roomId){{
+  const s=state[roomId];
+  if(!s)return;
+  try{{s.ws.close()}}catch(e){{}}
+  try{{s.node.disconnect()}}catch(e){{}}
+  try{{s.ctx.close()}}catch(e){{}}
+  delete state[roomId];
+  const btn=document.getElementById('btn-'+roomId);
+  if(btn){{btn.textContent='\\u1f50a Listen';btn.classList.remove('active')}}
+  const bar=document.getElementById('vu-'+roomId);
+  if(bar)bar.style.width='0%';
+  const lvl=document.getElementById('lvl-'+roomId);
+  if(lvl)lvl.textContent='\\u2014';
+}}
+
+loadRooms();
 }})();
 </script>
 </body>
@@ -680,6 +975,12 @@ async def run_ui_gateway() -> None:
                             "frames": data.get("frames", 0),
                             "wakes": data.get("wakes", 0),
                             "stt_reqs": data.get("stt_reqs", 0),
+                            "pps": data.get("pps", 0),
+                            "max_gap_s": data.get("max_gap_s", 0),
+                            "queue_drops": data.get("queue_drops", 0),
+                            "session_ok": data.get("session_ok", 0),
+                            "session_fail": data.get("session_fail", 0),
+                            "last_stt": data.get("last_stt", ""),
                             "ts": payload.get("ts", ""),
                         }
                 elif typ == "voice.session_timing":
@@ -830,6 +1131,7 @@ async def run_ui_gateway() -> None:
             },
             "voice_rooms": dict(_voice_rooms),
             "voice_commands": list(_voice_commands),
+            "voice_responses": list(_voice_responses),
             "chat_history": list(_chat_history),
             "system": _get_system_stats(),
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -857,6 +1159,58 @@ async def run_ui_gateway() -> None:
             data={"room_id": "web", "room_name": "Web Chat", "text": text})
         mqttc.publish_json("%s/voice/command" % settings.mqtt.base_topic, evt)
         return {"status": "ok"}
+
+    @app.get("/api/debug-audio")
+    async def api_debug_audio() -> Dict[str, Any]:
+        """List available debug WAV files grouped by room."""
+        import os
+        debug_dir = getattr(settings, "voice_debug_dir", "/tmp/voice_debug")
+        if not os.path.isdir(debug_dir):
+            return {"rooms": {}}
+        rooms_out: Dict[str, list] = {}
+        for room_name in sorted(os.listdir(debug_dir)):
+            room_path = os.path.join(debug_dir, room_name)
+            if not os.path.isdir(room_path):
+                continue
+            files = []
+            for f in sorted(os.listdir(room_path), reverse=True):
+                if not f.endswith(".wav"):
+                    continue
+                fpath = os.path.join(room_path, f)
+                try:
+                    sz = os.path.getsize(fpath)
+                except Exception:
+                    sz = 0
+                dur = round(max(0, sz - 44) / (16000 * 2), 1)
+                files.append({"name": f, "size": sz, "duration_s": dur,
+                              "url": f"/api/debug-audio/{room_name}/{f}"})
+            if files:
+                rooms_out[room_name] = files[:50]
+        return {"rooms": rooms_out}
+
+    @app.get("/api/debug-audio/{room}/{filename}")
+    async def api_debug_audio_file(room: str, filename: str):
+        import os
+        from fastapi.responses import FileResponse
+        debug_dir = getattr(settings, "voice_debug_dir", "/tmp/voice_debug")
+        safe_room = os.path.basename(room)
+        safe_file = os.path.basename(filename)
+        fpath = os.path.join(debug_dir, safe_room, safe_file)
+        if not os.path.isfile(fpath) or not safe_file.endswith(".wav"):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return FileResponse(fpath, media_type="audio/wav", filename=safe_file)
+
+    @app.get("/audio-debug", response_class=HTMLResponse)
+    async def audio_debug_page() -> str:
+        return _audio_debug_html(title=settings.ui.title)
+
+    @app.get("/live-audio", response_class=HTMLResponse)
+    async def live_audio_page() -> str:
+        return _live_audio_html(
+            title=settings.ui.title,
+            ws_port=settings.voice_live_audio_port,
+        )
 
     @app.post("/tone-test")
     async def tone_test() -> RedirectResponse:
