@@ -7,7 +7,7 @@ The voice assistant provides hands-free voice control via M5Stack Atom Echo devi
 ```
 Atom Echo mics (ESPHome, UDP PCM)
   → voice-service (UDP listener)
-    → Wake word detection (Porcupine)
+    → Wake word detection (Picovoice Porcupine when `VOICE_WAKE_ENGINE=porcupine`, else Whisper on short audio chunks)
       → Prompt ("How may I assist you?" on Sonos)
         → WebRTC VAD (speech capture with 1s pre-buffer)
           → Audio processing (noise reduction → silence trim → peak normalize)
@@ -99,8 +99,9 @@ All config is set via environment variables in `.env`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VOICE_PORCUPINE_KEY` | — | Picovoice access key (required) |
-| `VOICE_PORCUPINE_MODEL` | — | Path to `.ppn` keyword model file |
+| `VOICE_WAKE_ENGINE` | `whisper` | `porcupine` for Picovoice (needs key + `.ppn`), or `whisper` to detect wake phrases via STT on rolling audio |
+| `VOICE_PORCUPINE_KEY` | — | Picovoice access key (**required** when engine is `porcupine`) |
+| `VOICE_PORCUPINE_MODEL` | — | Path to `.ppn` keyword model (Linux ARM/x86 must match the container/host) |
 | `VOICE_WAKE_COOLDOWN` | `2.0` | Seconds to ignore wake word after a detection (prevents double-triggers) |
 
 ### VAD settings

@@ -15,6 +15,7 @@ dependencies = [
   "typer>=0.12",
   "paho-mqtt>=2.0",
   "psycopg[binary]>=3.2",
+  "astral>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -23,9 +24,10 @@ camect = ["camect-py>=0.2.1"]
 caseta = ["pylutron-caseta>=0.26.0", "pylutron-caseta[cli]>=0.26.0"]
 gcal = ["icalendar>=6.0.0", "recurring-ical-events>=2.3.0"]
 ui = ["fastapi>=0.110", "uvicorn>=0.27"]
+dashboard = ["playwright>=1.40"]
 snmp = ["pysnmp"]
 net = ["pythonping>=1.1.4"]
-voice = ["pvporcupine>=3.0", "webrtcvad>=2.0.10", "noisereduce>=3.0", "numpy>=1.24"]
+voice = ["pvporcupine>=3.0", "webrtcvad>=2.0.10", "noisereduce>=3.0", "numpy>=1.24", "websockets>=12.0"]
 llm-anthropic = ["anthropic>=0.40"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.8"]
 

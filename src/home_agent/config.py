@@ -962,6 +962,48 @@ class CamectSettings(BaseSettings):
         return [p for p in parts if p]
 
 
+class CamectNightModeSettings(BaseSettings):
+    """
+    Night security mode: override camect behavior during a nightly window.
+    When active, only person detections (on any camera) trigger alerts,
+    announcements target a specific room and bypass quiet hours, and
+    both front/back floodlights are activated.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, alias="CAMECT_NIGHT_MODE_ENABLED")
+    start: str = Field(default="23:00", alias="CAMECT_NIGHT_MODE_START")
+    end: str = Field(default="05:00", alias="CAMECT_NIGHT_MODE_END")
+    filter: str = Field(default="person", alias="CAMECT_NIGHT_MODE_FILTER")
+    announce_targets: str = Field(default="master_bedroom", alias="CAMECT_NIGHT_MODE_ANNOUNCE_TARGETS")
+    lighting_devices: str = Field(default="10,33", alias="CAMECT_NIGHT_MODE_LIGHTING_DEVICES")
+
+    @field_validator("start", "end", "filter", "announce_targets", "lighting_devices", mode="before")
+    @classmethod
+    def _norm_str(cls, v: object) -> str:
+        return _strip_quotes(str(v)).strip()
+
+    @property
+    def announce_target_list(self) -> List[str]:
+        s = (self.announce_targets or "").strip()
+        if not s:
+            return []
+        return [p.strip() for p in s.split(",") if p.strip()]
+
+    @property
+    def lighting_device_list(self) -> List[str]:
+        s = (self.lighting_devices or "").strip()
+        if not s:
+            return []
+        return [p.strip() for p in s.split(",") if p.strip()]
+
+
 class CasetaSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="",
@@ -1137,6 +1179,7 @@ class AppSettings(BaseSettings):
     smtp: SmtpSettings = SmtpSettings()
     sunset_scene: SunsetSceneSettings = SunsetSceneSettings()
     camect: CamectSettings = CamectSettings()
+    camect_night_mode: CamectNightModeSettings = CamectNightModeSettings()
     caseta: CasetaSettings = CasetaSettings()
     camera_lighting: CameraLightingSettings = CameraLightingSettings()
     ui: UiSettings = UiSettings()

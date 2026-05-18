@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
 from home_agent.integrations._retry import api_retry
+
+_USER_AGENT = "HomeAgent/1.0 (github.com/home-agent)"
+
+_cache: Dict[str, Tuple[float, Any]] = {}
+_CACHE_TTL_S = 600.0  # 10 minutes
+
+
+def _get_cached(key: str) -> Any:
+    entry = _cache.get(key)
+    if entry is None:
+        return None
+    ts, val = entry
+    if (time.monotonic() - ts) > _CACHE_TTL_S:
+        _cache.pop(key, None)
+        return None
+    return val
+
+
+def _set_cached(key: str, val: Any) -> None:
+    _cache[key] = (time.monotonic(), val)
 
 
 @dataclass(frozen=True)
@@ -59,8 +80,15 @@ class OpenMeteoClient:
             }
         return {}
 
+    def _headers(self) -> dict:
+        return {"User-Agent": _USER_AGENT}
+
     @api_retry
     async def current(self) -> CurrentWeather:
+        cached = _get_cached("current")
+        if cached is not None:
+            return cached
+
         params = {
             "latitude": self._lat,
             "longitude": self._lon,
@@ -69,7 +97,7 @@ class OpenMeteoClient:
         }
         params.update(self._unit_params())
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers()) as client:
             resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
             resp.raise_for_status()
             data = resp.json()
@@ -84,19 +112,22 @@ class OpenMeteoClient:
             except Exception:
                 return None
 
-        return CurrentWeather(
+        result = CurrentWeather(
             temperature=f("temperature_2m"),
             wind_speed=f("wind_speed_10m"),
             wind_gusts=f("wind_gusts_10m"),
             temperature_unit=str(units.get("temperature_2m") or ""),
             wind_unit=str(units.get("wind_speed_10m") or ""),
         )
+        _set_cached("current", result)
+        return result
 
     @api_retry
     async def forecast_today(self) -> TodayForecast:
-        """
-        Fetch today's daily forecast: high/low, precip chance/total, max wind.
-        """
+        cached = _get_cached("forecast")
+        if cached is not None:
+            return cached
+
         params = {
             "latitude": self._lat,
             "longitude": self._lon,
@@ -105,7 +136,7 @@ class OpenMeteoClient:
         }
         params.update(self._unit_params())
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers()) as client:
             resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
             resp.raise_for_status()
             data = resp.json()
@@ -122,7 +153,7 @@ class OpenMeteoClient:
             except Exception:
                 return None
 
-        return TodayForecast(
+        result = TodayForecast(
             temp_max=f0("temperature_2m_max"),
             temp_min=f0("temperature_2m_min"),
             precip_probability_max=f0("precipitation_probability_max"),
@@ -132,40 +163,27 @@ class OpenMeteoClient:
             precip_unit=str(units.get("precipitation_sum") or ""),
             wind_unit=str(units.get("wind_speed_10m_max") or ""),
         )
+        _set_cached("forecast", result)
+        return result
 
-    async def sun_times_today(self) -> SunTimes:
+    async def sun_times_today(self, *, tz: Optional[str] = None) -> SunTimes:
         """
-        Fetch today's sunrise/sunset times.
-        Returned datetimes are parsed from Open-Meteo's ISO strings (may be timezone-naive).
+        Calculate today's sunrise/sunset locally using the astral library.
+        No API call needed — sun position is purely mathematical.
+
+        A local timezone (e.g. "America/New_York") MUST be provided — astral
+        fails for many date/location combos when called with bare UTC.
         """
-        params = {
-            "latitude": self._lat,
-            "longitude": self._lon,
-            "daily": "sunrise,sunset",
-            "timezone": "auto",
-        }
+        from astral import LocationInfo
+        from astral.sun import sun
+        from zoneinfo import ZoneInfo
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-        tzname = str(data.get("timezone") or "UTC")
-        daily = data.get("daily") or {}
-
-        def dt0(key: str) -> Optional[datetime]:
-            arr = daily.get(key)
-            if not isinstance(arr, list) or not arr:
-                return None
-            v = arr[0]
-            if not isinstance(v, str) or not v.strip():
-                return None
-            s = v.strip()
-            # Open-Meteo returns local timestamps, often without offset.
-            try:
-                return datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                return None
-
-        return SunTimes(sunrise=dt0("sunrise"), sunset=dt0("sunset"), timezone=tzname)
-
+        tzinfo = ZoneInfo(tz) if tz else ZoneInfo("UTC")
+        loc = LocationInfo(latitude=self._lat, longitude=self._lon)
+        today = datetime.now(tzinfo).date()
+        s = sun(loc.observer, date=today, tzinfo=tzinfo)
+        return SunTimes(
+            sunrise=s["sunrise"],
+            sunset=s["sunset"],
+            timezone=tz or "UTC",
+        )

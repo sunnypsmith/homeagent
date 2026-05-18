@@ -24,6 +24,43 @@ from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 
+_monitor_db_conn: Any = None
+
+
+def _get_monitor_db(conninfo: str) -> Any:
+    """Return a persistent DB connection, creating or reconnecting as needed."""
+    global _monitor_db_conn
+    try:
+        import psycopg
+    except ImportError:
+        return None
+    if _monitor_db_conn is not None:
+        try:
+            if not _monitor_db_conn.closed:
+                return _monitor_db_conn
+        except Exception:
+            pass
+        try:
+            _monitor_db_conn.close()
+        except Exception:
+            pass
+    try:
+        _monitor_db_conn = psycopg.connect(conninfo, autocommit=True)
+        return _monitor_db_conn
+    except Exception:
+        _monitor_db_conn = None
+        return None
+
+
+def _reset_monitor_db() -> None:
+    global _monitor_db_conn
+    if _monitor_db_conn is not None:
+        try:
+            _monitor_db_conn.close()
+        except Exception:
+            pass
+        _monitor_db_conn = None
+
 
 def _parse_rfc3339(s: str) -> Optional[datetime]:
     """
@@ -298,15 +335,9 @@ def _build_db_panel(settings: AppSettings) -> Panel:
     """
     Best-effort DB activity view using Postgres (Timescale) `events` table.
     """
-    try:
-        import psycopg  # type: ignore
-    except Exception:
-        return Panel(Text("psycopg not available", style="dim"), title="DB", border_style="dim")
-
-    try:
-        conn = psycopg.connect(settings.db.conninfo, autocommit=True)
-    except Exception:
-        return Panel(Text("DB connect failed", style="dim"), title="DB", border_style="dim")
+    conn = _get_monitor_db(settings.db.conninfo)
+    if conn is None:
+        return Panel(Text("DB unavailable", style="dim"), title="DB", border_style="dim")
 
     try:
         with conn.cursor() as cur:
@@ -330,12 +361,8 @@ def _build_db_panel(settings: AppSettings) -> Panel:
             )
             rows = cur.fetchall()
     except Exception:
+        _reset_monitor_db()
         return Panel(Text("DB query failed", style="dim"), title="DB", border_style="dim")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
     # Header stats
     header = Text()
@@ -375,14 +402,8 @@ def _fetch_db_activity(settings: AppSettings) -> Optional[dict[str, Any]]:
     """
     Returns DB activity summary or None if DB unavailable.
     """
-    try:
-        import psycopg  # type: ignore
-    except Exception:
-        return None
-
-    try:
-        conn = psycopg.connect(settings.db.conninfo, autocommit=True)
-    except Exception:
+    conn = _get_monitor_db(settings.db.conninfo)
+    if conn is None:
         return None
 
     try:
@@ -407,28 +428,23 @@ def _fetch_db_activity(settings: AppSettings) -> Optional[dict[str, Any]]:
             )
             rows = cur.fetchall()
 
-            # Error-ish events (best-effort patterns).
             cur.execute(
                 """
                 SELECT ingested_at, topic, source, type
                 FROM events
                 WHERE
-                  type ILIKE '%%.failed%%'
-                  OR type ILIKE '%%.error%%'
-                  OR type ILIKE '%%.exception%%'
-                  OR type ILIKE '%%.err%%'
+                  ingested_at > now() - interval '24 hours'
+                  AND (type LIKE '%%.failed%%'
+                       OR type LIKE '%%.error%%'
+                       OR type LIKE '%%.exception%%')
                 ORDER BY ingested_at DESC
                 LIMIT 6
                 """
             )
             err_rows = cur.fetchall()
     except Exception:
+        _reset_monitor_db()
         return None
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
     last_ingest_age_s: Optional[float] = None
     if last_ingested_at is not None:
@@ -608,14 +624,8 @@ def _bootstrap_from_db(
     """
     Seed the top panels from the DB so the UI isn't empty on startup.
     """
-    try:
-        import psycopg  # type: ignore
-    except Exception:
-        return
-
-    try:
-        conn = psycopg.connect(settings.db.conninfo, autocommit=True)
-    except Exception:
+    conn = _get_monitor_db(settings.db.conninfo)
+    if conn is None:
         return
 
     try:
@@ -631,12 +641,8 @@ def _bootstrap_from_db(
             )
             rows = cur.fetchall()
     except Exception:
+        _reset_monitor_db()
         return
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
     now_utc = datetime.now(timezone.utc)
     # Oldest-first so the feed ends up in correct order.

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -11,12 +12,15 @@ import base64
 
 import httpx
 
+from zoneinfo import ZoneInfo
+
 from home_agent.bus.envelope import make_event
 from home_agent.bus.mqtt_client import MqttClient
 from home_agent.config import AppSettings
 from home_agent.core.logging import configure_logging, get_logger
 from home_agent.bus.error_reporter import ErrorReporter
 from home_agent.integrations.smtp_mailer import EmailAttachment, SmtpMailer
+from home_agent.integrations.alpr_openalpr import recognize as alpr_recognize
 
 
 def _iter_strings(obj: Any, *, _depth: int = 0, _max_depth: int = 6) -> Iterable[str]:
@@ -132,15 +136,15 @@ def _matches_filter(evt: Dict[str, Any], token: str) -> bool:
     if dets:
         return any(d in expanded for d in dets)
 
+    # No explicit detected_obj — fall back to word-boundary matching across
+    # all string fields so that substring fragments (e.g. "van" inside
+    # "evanescent", "car" inside "discard") don't cause false positives.
     hay = " ".join(_iter_strings(evt))
     if not hay:
         return False
 
-    # Otherwise: any token substring.
-    for t in expanded:
-        if t and t in hay:
-            return True
-    return False
+    hay_words = set(hay.split())
+    return bool(hay_words & expanded)
 
 
 def _spoken_kind(token: str) -> str:
@@ -207,10 +211,14 @@ def _extract_ts_ms(evt: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+_SNAPSHOT_WIDTH = 3840
+_SNAPSHOT_HEIGHT = 2160
+
+
 def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]) -> bytes:
     """
     Try multiple call signatures for camect-py snapshot APIs.
-    Returns raw JPEG bytes.
+    Returns raw JPEG bytes at up to 3840×2160 resolution.
     """
     if not cam_id:
         raise ValueError("missing_cam_id")
@@ -219,44 +227,63 @@ def _fetch_snapshot_jpeg_bytes(hub: object, *, cam_id: str, ts_ms: Optional[int]
     if snap is None:
         raise RuntimeError("camect_snapshot_not_supported")
 
+    w, h = _SNAPSHOT_WIDTH, _SNAPSHOT_HEIGHT
+
     # Try with timestamp if present, otherwise fall back to latest snapshot.
     # Camect API: snapshot_camera(cam_id, width=0, height=0, ts_ms=0)
     if ts_ms is not None and int(ts_ms) > 0:
         try:
-            return snap(cam_id, 0, 0, int(ts_ms))  # type: ignore[misc]
+            return snap(cam_id, w, h, int(ts_ms))  # type: ignore[misc]
         except TypeError:
             pass
         try:
-            return snap(cam_id, ts_ms=int(ts_ms))  # type: ignore[misc]
+            return snap(cam_id, width=w, height=h, ts_ms=int(ts_ms))  # type: ignore[misc]
         except TypeError:
             pass
         try:
-            return snap(cam_id=cam_id, ts_ms=int(ts_ms))  # type: ignore[misc]
+            return snap(cam_id=cam_id, width=w, height=h, ts_ms=int(ts_ms))  # type: ignore[misc]
         except TypeError:
             pass
 
     # Fallback: no timestamp
     try:
-        return snap(cam_id)  # type: ignore[misc]
+        return snap(cam_id, w, h)  # type: ignore[misc]
     except TypeError:
         pass
-    return snap(cam_id=cam_id)  # type: ignore[misc]
+    return snap(cam_id=cam_id, width=w, height=h)  # type: ignore[misc]
 
 
 _VISION_SYSTEM_PROMPT = (
-    "You compare two security camera images from a home in Lynchburg, Virginia. "
+    "You are a vehicle identification expert analyzing security camera images "
+    "from a home in Lynchburg, Virginia.\n\n"
     "Image 1 is the scene 60 seconds ago. Image 2 is the scene right now. "
-    "A {kind} was just detected. Describe what is NEW in a concise phrase.\n\n"
-    "ALWAYS include every detail you can identify:\n"
-    "- Vehicles: color, make, model, type (sedan/SUV/truck/van). "
-    "If a delivery carrier is visible (FedEx, UPS, USPS, Amazon, DHL), name it.\n"
-    "- People: clothing colors, carried items, uniforms, branding, direction of movement.\n"
-    "- Animals: species, color, size.\n\n"
-    "Format: a descriptive noun phrase, e.g. \"white Toyota RAV4 in driveway\", "
-    "\"brown UPS truck at mailbox\", \"person in red jacket carrying package toward front door\", "
-    "\"Amazon driver with gray Mercedes Sprinter van\". "
+    "A {kind} was just detected.\n\n"
+    "{alpr_context}"
+    "YOUR TASK: Describe what is NEW in a concise phrase. Focus on:\n"
+    "1. Vehicle identity (color, make, model, body type)\n"
+    "2. Delivery carrier if visible (FedEx, UPS, USPS, Amazon, DHL) — "
+    "look for logos, uniform colors, and vehicle livery\n"
+    "3. What is happening (arriving, departing, parked, passing on street, at mailbox)\n"
+    "4. License plate ONLY if you can clearly read it and no ALPR data was provided\n\n"
+    "Format: a concise descriptive phrase, e.g.:\n"
+    "  \"silver Toyota RAV4 arriving in driveway\"\n"
+    "  \"brown UPS delivery truck at mailbox\"\n"
+    "  \"blue Amazon Rivian van parked at front door, plate ABC-1234\"\n"
+    "  \"black Ford F-150 passing on street\"\n\n"
+    "Be CONFIDENT but HONEST — never fabricate details you cannot see.\n"
     "No preamble, no narration, no full sentences — just the phrase.\n"
-    "If nothing new is visible, reply: UNKNOWN"
+    "If no new vehicle is visible, reply: UNKNOWN"
+)
+
+_ALPR_CONTEXT_TEMPLATE = (
+    "LICENSE PLATE DATA (from an automated plate reader — treat as ground truth):\n"
+    "{alpr_summary}\n"
+    "Include this plate number in your description.\n\n"
+)
+
+_NO_ALPR_CONTEXT = (
+    "No automated vehicle identification data is available. "
+    "Use your own visual analysis for make, model, and color.\n\n"
 )
 
 
@@ -271,14 +298,20 @@ async def _vision_describe(
     vision_model: str,
     detail: str = "auto",
     timeout_seconds: float = 10.0,
+    alpr_summary: str = "",
 ) -> Optional[str]:
     """
     Send before/after snapshots to a vision LLM and get a description of what's new.
+    Optionally includes ALPR vehicle identification data for the LLM to use as ground truth.
     Returns None on failure or UNKNOWN.
     """
     b64_after = base64.b64encode(jpeg_after).decode("utf-8")
 
-    system = _VISION_SYSTEM_PROMPT.replace("{kind}", kind)
+    if alpr_summary:
+        alpr_context = _ALPR_CONTEXT_TEMPLATE.format(alpr_summary=alpr_summary)
+    else:
+        alpr_context = _NO_ALPR_CONTEXT
+    system = _VISION_SYSTEM_PROMPT.replace("{kind}", kind).replace("{alpr_context}", alpr_context)
 
     img_detail = detail if detail in ("low", "high", "auto") else "auto"
 
@@ -363,6 +396,27 @@ def _build_camera_map(cameras: List[Dict[str, Any]]) -> CameraMap:
     return CameraMap(id_to_name=id_to_name, name_to_id=name_to_id)
 
 
+def _is_in_night_mode(tz: ZoneInfo, start_hhmm: str, end_hhmm: str) -> bool:
+    """Return True if the current local time is within the night mode window."""
+    now = datetime.now(tz=tz)
+    minute = now.hour * 60 + now.minute
+    parts_s = (start_hhmm or "").strip().split(":")
+    parts_e = (end_hhmm or "").strip().split(":")
+    if len(parts_s) != 2 or len(parts_e) != 2:
+        return False
+    try:
+        start = int(parts_s[0]) * 60 + int(parts_s[1])
+        end = int(parts_e[0]) * 60 + int(parts_e[1])
+    except ValueError:
+        return False
+    if start == end:
+        return False
+    if start < end:
+        return start <= minute < end
+    # Window crosses midnight (e.g. 23:00 -> 05:00).
+    return minute >= start or minute < end
+
+
 def _load_camect_settings(prefix: str = "CAMECT"):
     """Load CamectSettings from env vars with a custom prefix (e.g., CAMECT2)."""
     import os
@@ -398,6 +452,8 @@ async def run_camect_agent(instance: int = 1) -> None:
     configure_logging(settings.log_level)
     prefix = "CAMECT" if instance <= 1 else "CAMECT%d" % instance
     camect_cfg = _load_camect_settings(prefix)
+    night_cfg = settings.camect_night_mode
+    tz = ZoneInfo(settings.timezone)
     service_name = "camect_agent" if instance <= 1 else "camect_agent_%d" % instance
     log = get_logger(service=service_name)
 
@@ -478,6 +534,15 @@ async def run_camect_agent(instance: int = 1) -> None:
         rules=len(rules_map),
         throttle_seconds=camect_cfg.throttle_seconds,
     )
+    if night_cfg.enabled:
+        log.info(
+            "night_mode_configured",
+            start=night_cfg.start,
+            end=night_cfg.end,
+            filter=night_cfg.filter,
+            announce_targets=night_cfg.announce_target_list,
+            lighting_devices=night_cfg.lighting_device_list,
+        )
 
     mqttc = MqttClient(
         host=settings.mqtt.host,
@@ -597,34 +662,50 @@ async def run_camect_agent(instance: int = 1) -> None:
             if cam_name and not cam_id:
                 cam_id = cmap.name_to_id.get(cam_name, "")
 
-            # If rules are configured, we must be able to attribute the event to a camera in rules.
-            if rules_map:
-                if cam_name:
-                    if cam_name not in rules_map:
-                        if camect_cfg.debug:
-                            log.debug("ignored_event", reason="camera_not_in_rules", camera=cam_name)
-                        continue
-                else:
-                    # Can't attribute to a camera name; ignore.
-                    if camect_cfg.debug:
-                        log.debug("ignored_event", reason="no_camera_name_in_event")
-                    continue
-            else:
-                if cam_name and cam_name not in wanted_names:
-                    continue
-                if cam_id and wanted_ids and cam_id not in wanted_ids:
-                    continue
+            # Night mode: override camera and filter rules during the configured window.
+            night_active = (
+                night_cfg.enabled
+                and _is_in_night_mode(tz, night_cfg.start, night_cfg.end)
+            )
+
+            if night_active:
+                # Accept any camera, but require a camera identity.
                 if (not cam_name) and (not cam_id):
-                    # Can't attribute; ignore to avoid cross-camera noise.
                     if camect_cfg.debug:
                         log.debug("ignored_event", reason="no_camera_in_event")
                     continue
+                token = night_cfg.filter
+                if not _matches_filter(evt, token):
+                    if camect_cfg.debug:
+                        log.debug("ignored_event", reason="night_filter_no_match", camera=cam_name, token=token)
+                    continue
+            else:
+                # Normal mode: apply camera rules and filter.
+                if rules_map:
+                    if cam_name:
+                        if cam_name not in rules_map:
+                            if camect_cfg.debug:
+                                log.debug("ignored_event", reason="camera_not_in_rules", camera=cam_name)
+                            continue
+                    else:
+                        if camect_cfg.debug:
+                            log.debug("ignored_event", reason="no_camera_name_in_event")
+                        continue
+                else:
+                    if cam_name and cam_name not in wanted_names:
+                        continue
+                    if cam_id and wanted_ids and cam_id not in wanted_ids:
+                        continue
+                    if (not cam_name) and (not cam_id):
+                        if camect_cfg.debug:
+                            log.debug("ignored_event", reason="no_camera_in_event")
+                        continue
 
-            token = rules_map.get(cam_name) if cam_name and rules_map else camect_cfg.event_filter
-            if not _matches_filter(evt, token):
-                if camect_cfg.debug:
-                    log.debug("ignored_event", reason="filter_no_match", camera=cam_name, token=token)
-                continue
+                token = rules_map.get(cam_name) if cam_name and rules_map else camect_cfg.event_filter
+                if not _matches_filter(evt, token):
+                    if camect_cfg.debug:
+                        log.debug("ignored_event", reason="filter_no_match", camera=cam_name, token=token)
+                    continue
             matched_total += 1
 
             # Record every matched event.
@@ -637,6 +718,7 @@ async def run_camect_agent(instance: int = 1) -> None:
                     "camera_id": cam_id or None,
                     "camera_name": cam_name or None,
                     "filter": token,
+                    "night_mode": night_active,
                     "event": evt,
                 },
             )
@@ -774,6 +856,27 @@ async def run_camect_agent(instance: int = 1) -> None:
                     except Exception as e_before:
                         log.warning("vision_before_snapshot_failed", camera=spoken_camera, error=type(e_before).__name__, detail=str(e_before)[:200])
 
+                    # Run ALPR on the "after" snapshot for hard vehicle data.
+                    alpr_summary = ""
+                    if camect_cfg.alpr_enabled and camect_cfg.alpr_secret_key:
+                        try:
+                            alpr_result = await asyncio.wait_for(
+                                alpr_recognize(
+                                    jpeg_after,
+                                    secret_key=camect_cfg.alpr_secret_key,
+                                    region=camect_cfg.alpr_region,
+                                    timeout_seconds=camect_cfg.alpr_timeout_seconds,
+                                ),
+                                timeout=float(camect_cfg.alpr_timeout_seconds) + 2.0,
+                            )
+                            alpr_summary = alpr_result.summary()
+                            if alpr_summary:
+                                log.info("alpr_ok", camera=spoken_camera, summary=alpr_summary[:120])
+                            elif alpr_result.error:
+                                log.warning("alpr_error", camera=spoken_camera, error=alpr_result.error)
+                        except Exception as e_alpr:
+                            log.warning("alpr_failed", camera=spoken_camera, error=type(e_alpr).__name__)
+
                     v_base = camect_cfg.vision_base_url or settings.llm.base_url
                     v_key = camect_cfg.vision_api_key or settings.llm.api_key
                     vision_desc = await asyncio.wait_for(
@@ -787,13 +890,15 @@ async def run_camect_agent(instance: int = 1) -> None:
                             vision_model=camect_cfg.vision_model,
                             detail=camect_cfg.vision_detail,
                             timeout_seconds=camect_cfg.vision_timeout_seconds,
+                            alpr_summary=alpr_summary,
                         ),
-                        timeout=float(camect_cfg.vision_timeout_seconds),
+                        timeout=float(camect_cfg.vision_timeout_seconds) + 5.0,
                     )
                     if vision_desc:
-                        log.info("vision_ok", camera=spoken_camera, desc=vision_desc[:100])
+                        log.info("vision_ok", camera=spoken_camera, desc=vision_desc[:100],
+                                 alpr=bool(alpr_summary))
                 except Exception as e:
-                    log.warning("vision_failed", camera=spoken_camera, error=type(e).__name__)
+                    log.warning("vision_failed", camera=spoken_camera, error=type(e).__name__, detail=str(e)[:300])
 
             location_prefix = "%s: " % hub_label if hub_label else ""
             if vision_desc:
@@ -806,13 +911,17 @@ async def run_camect_agent(instance: int = 1) -> None:
                 except Exception:
                     text = "%s%s detected at %s." % (location_prefix, kind, spoken_camera)
 
+            announce_data: Dict[str, Any] = {"text": text}
+            if night_active:
+                announce_data["exempt_quiet_hours"] = True
+                announce_data["targets"] = night_cfg.announce_target_list
             announce = make_event(
                 source="camect-agent",
                 typ="announce.request",
-                data={"text": text},
+                data=announce_data,
             )
             mqttc.publish_json(announce_topic, announce)
-            log.info("announce_published", camera=spoken_camera, vision=bool(vision_desc))
+            log.info("announce_published", camera=spoken_camera, vision=bool(vision_desc), night_mode=night_active)
             announced_total += 1
     except Exception as exc:
         log.exception("event_loop_crashed")

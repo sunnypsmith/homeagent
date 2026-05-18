@@ -1,4 +1,15 @@
+x-ha-service: &ha-service
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  network_mode: host
+  volumes:
+    - ../.env:/workspace/.env:ro
+  depends_on: [mqtt, db]
+
 services:
+  # ── Infrastructure ─────────────────────────────────────────────
   mqtt:
     image: eclipse-mosquitto:2
     container_name: home-mqtt
@@ -15,155 +26,134 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      # Keep DB settings in sync with your repo-root .env
       POSTGRES_DB: ${DB_NAME:-homeagent}
       POSTGRES_USER: ${DB_USER:-homeagent}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me}
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - max_connections=50
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - random_page_cost=1.1
 
-  # One container per process (recommended).
+  # ── Core services ──────────────────────────────────────────────
   sonos-gateway:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    <<: *ha-service
     container_name: home-sonos-gateway
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
     command: ["home-agent", "sonos-gateway"]
-    depends_on: [mqtt, db]
 
   time-trigger:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    <<: *ha-service
     container_name: home-time-trigger
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
     command: ["home-agent", "time-trigger"]
-    depends_on: [mqtt, db]
 
   event-recorder:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    <<: *ha-service
     container_name: home-event-recorder
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
     command: ["home-agent", "event-recorder"]
-    depends_on: [mqtt, db]
 
-  wakeup-agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: home-wakeup-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
-    command: ["home-agent", "wakeup-agent"]
-    depends_on: [mqtt, db]
+  watchdog:
+    <<: *ha-service
+    container_name: home-watchdog
+    command: ["home-agent", "watchdog"]
 
-  morning-briefing-agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: home-morning-briefing-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
-    command: ["home-agent", "morning-briefing-agent"]
-    depends_on: [mqtt, db]
-
-  hourly-chime-agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: home-hourly-chime-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
-    command: ["home-agent", "hourly-chime-agent"]
-    depends_on: [mqtt, db]
-
-  fixed-announcement-agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: home-fixed-announcement-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
-    command: ["home-agent", "fixed-announcement-agent"]
-    depends_on: [mqtt, db]
-
-  camect-agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: home-camect-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
-    command: ["home-agent", "camect-agent"]
-    depends_on: [mqtt, db]
-
-  # Optional: Lutron Caséta (requires pairing certs; see docs/CASETA_SETUP.md)
-  caseta-agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: home-caseta-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
-      # Mount your `lap-pair` cert directory into the container (read-only),
-      # then set CASETA_*_PATH in `.env` to point at /certs/*.crt|*.key.
-      # Example (host path): CASETA_CERTS_DIR=/seaside/homeagent/caseta-certs
-      - ${CASETA_CERTS_DIR:-./caseta-certs}:/certs:ro
-    command: ["home-agent", "caseta-agent"]
-    depends_on: [mqtt, db]
-
-  # Optional: camera -> lighting automation (requires camect-agent + caseta-agent)
-  camera-lighting-agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: home-camera-lighting-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
-    command: ["home-agent", "camera-lighting-agent"]
-    depends_on: [mqtt, db]
-
-  # Optional: simple LAN web UI (buttons -> MQTT announce.request)
   ui-gateway:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    <<: *ha-service
     container_name: home-ui-gateway
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../.env:/workspace/.env:ro
     command: ["home-agent", "ui-gateway"]
     depends_on: [mqtt]
+    volumes:
+      - ../.env:/workspace/.env:ro
+      - voice_debug:/tmp/voice_debug:ro
+
+  # ── Voice ──────────────────────────────────────────────────────
+  voice-service:
+    <<: *ha-service
+    container_name: home-voice-service
+    command: ["home-agent", "voice-service"]
+    volumes:
+      - ../.env:/workspace/.env:ro
+      - voice_debug:/tmp/voice_debug
+      # Picovoice writes activation cache under /root/.pv — persist across recreates (see docs/DOCKER_DEPLOY.md)
+      - picovoice_activation:/root/.pv
+
+  voice-intent-agent:
+    <<: *ha-service
+    container_name: home-voice-intent-agent
+    command: ["home-agent", "voice-intent-agent"]
+
+  # ── Scheduled agents ───────────────────────────────────────────
+  wakeup-agent:
+    <<: *ha-service
+    container_name: home-wakeup-agent
+    command: ["home-agent", "wakeup-agent"]
+
+  morning-briefing-agent:
+    <<: *ha-service
+    container_name: home-morning-briefing-agent
+    command: ["home-agent", "morning-briefing-agent"]
+
+  hourly-chime-agent:
+    <<: *ha-service
+    container_name: home-hourly-chime-agent
+    command: ["home-agent", "hourly-chime-agent"]
+
+  fixed-announcement-agent:
+    <<: *ha-service
+    container_name: home-fixed-announcement-agent
+    command: ["home-agent", "fixed-announcement-agent"]
+
+  hourly-house-check-agent:
+    <<: *ha-service
+    container_name: home-hourly-house-check-agent
+    command: ["home-agent", "hourly-house-check-agent"]
+
+  exec-briefing-agent:
+    <<: *ha-service
+    container_name: home-exec-briefing-agent
+    command: ["home-agent", "exec-briefing-agent"]
+
+  # ── Integration agents ─────────────────────────────────────────
+  camect-agent:
+    <<: *ha-service
+    container_name: home-camect-agent
+    command: ["home-agent", "camect-agent"]
+
+  camect-agent-cr:
+    <<: *ha-service
+    container_name: home-camect-agent-cr
+    command: ["home-agent", "camect-agent", "--instance", "2"]
+
+  caseta-agent:
+    <<: *ha-service
+    container_name: home-caseta-agent
+    command: ["home-agent", "caseta-agent"]
+    volumes:
+      - ../.env:/workspace/.env:ro
+      - ../caseta-certs:/certs:ro
+
+  camera-lighting-agent:
+    <<: *ha-service
+    container_name: home-camera-lighting-agent
+    command: ["home-agent", "camera-lighting-agent"]
 
 volumes:
   mosquitto_data:
   mosquitto_log:
   timescaledb_data:
-
+  voice_debug:
+  picovoice_activation:

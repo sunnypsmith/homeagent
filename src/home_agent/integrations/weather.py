@@ -65,14 +65,13 @@ class _NWSAdapter:
             temp_unit=r.temp_unit, wind_unit=r.wind_unit,
         )
 
-    async def sun_times_today(self):
+    async def sun_times_today(self, *, tz: Optional[str] = None):
         from home_agent.integrations.weather_open_meteo import OpenMeteoClient
-        # NWS doesn't provide sun times; fall back to Open-Meteo for this
         om = OpenMeteoClient(
             latitude=self._c._lat, longitude=self._c._lon,
             units="imperial", timeout_seconds=10.0,
         )
-        return await om.sun_times_today()
+        return await om.sun_times_today(tz=tz)
 
 
 class _OpenMeteoAdapter:
@@ -97,5 +96,5 @@ class _OpenMeteoAdapter:
             wind_unit=r.wind_unit,
         )
 
-    async def sun_times_today(self):
-        return await self._c.sun_times_today()
+    async def sun_times_today(self, *, tz: Optional[str] = None):
+        return await self._c.sun_times_today(tz=tz)

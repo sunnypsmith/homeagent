@@ -92,6 +92,18 @@ docker compose -f deploy/docker-compose.yml logs -f --tail=100 sonos-gateway
 
 If you run voice services via Docker, the container needs UDP port access (`VOICE_UDP_PORT`, default `9100`) and the wake-word model file. With `network_mode: host`, no extra port mapping is needed.
 
+The Compose file mounts a named volume at **`/root/.pv`** for Picovoice’s on-disk activation cache so a successful activation survives `docker compose up` recreates.
+
+### Picovoice / Porcupine in Docker (`PorcupineActivationLimitError`)
+
+If `voice-service` logs **`PorcupineActivationLimitError`** but the **same access key** worked in an older “all-in-one” container (e.g. a dev container with the repo bind-mounted), this is usually **not** a bad key or missing `.env`. Typical causes:
+
+1. **Picovoice device / activation limits** on your plan — each new image or long-lived container can count as a separate device. Open the [Picovoice Console](https://console.picovoice.ai/), review **active devices**, remove stale ones, or upgrade if you need more.
+2. **Stale dev container still “using” a slot** — if you keep an old `homeAgent` container around that previously activated Porcupine, retire it or free the device in the console so the dedicated `voice-service` container can activate.
+3. After the console shows a free slot, **`docker compose up -d --build voice-service`** again; the **`picovoice_activation`** volume stores `/root/.pv` so you are not re-activating from scratch on every restart once it succeeds.
+
+If you need voice **without** Picovoice activation in Docker, set **`VOICE_WAKE_ENGINE=whisper`** in `.env` (no `.ppn` license path for wake; wake phrase is detected via STT on short audio chunks).
+
 For tmux-based deployments (recommended for voice), run the voice services in the tmux layout provided by `scripts/tmux_homeagent.sh` instead of Docker — this simplifies access to the Atom Echo UDP stream and the watchdog's restart capability.
 
 ## Database retention

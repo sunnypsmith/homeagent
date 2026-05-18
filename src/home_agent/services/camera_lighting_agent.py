@@ -16,6 +16,14 @@ from home_agent.core.logging import configure_logging, get_logger
 from home_agent.integrations.weather import create_weather_client
 
 
+def _parse_night_mode_devices(settings: AppSettings) -> list[str]:
+    """Get device IDs that should activate during night mode from config."""
+    s = (settings.camect_night_mode.lighting_devices or "").strip()
+    if not s:
+        return []
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+
 def _require_str(payload: Dict[str, Any], key: str) -> str:
     v = payload.get(key)
     if not isinstance(v, str) or not v.strip():
@@ -161,7 +169,7 @@ async def run_camera_lighting_agent() -> None:
     async def refresh_sun_times() -> None:
         nonlocal sunrise, sunset, sun_day
         try:
-            st = await weather.sun_times_today()
+            st = await weather.sun_times_today(tz=str(tz))
             sunrise = _as_tz(st.sunrise, tz)
             sunset = _as_tz(st.sunset, tz)
             sun_day = datetime.now(tz=tz).date().isoformat()
@@ -228,6 +236,10 @@ async def run_camera_lighting_agent() -> None:
     log.info("rules_ready", count=len(rules), devices=sorted(all_device_ids))
     duration = max(1, int(settings.camera_lighting.duration_seconds))
     min_retrigger = max(0, int(settings.camera_lighting.min_retrigger_seconds))
+
+    night_mode_devices = _parse_night_mode_devices(settings)
+    if night_mode_devices:
+        log.info("night_mode_lighting_devices", devices=night_mode_devices)
 
     timers: Dict[str, _LightTimer] = {}
 
@@ -315,23 +327,32 @@ async def run_camera_lighting_agent() -> None:
             if isinstance(evt_payload, dict):
                 evt_obj = _normalize_detected_obj(evt_payload.get("detected_obj"))
 
-            # Check which rules match this event
-            matched_devices = []
-            for rule in rules:
-                if rule["cameras"] and cam_name.lower() not in rule["cameras"]:
+            is_night_mode = bool(data.get("night_mode"))
+
+            if is_night_mode and night_mode_devices:
+                # Night mode: trigger all configured night devices regardless of rules.
+                if not is_dark_now():
+                    log.info("ignored", reason="not_dark", camera=cam_name, detected_obj=evt_obj, night_mode=True)
                     continue
-                if rule["objects"] and evt_obj not in rule["objects"]:
+                trigger_lights(reason=f"night:{cam_name}:{evt_obj or 'event'}", trigger_device_ids=night_mode_devices)
+            else:
+                # Normal mode: apply configured rules.
+                matched_devices = []
+                for rule in rules:
+                    if rule["cameras"] and cam_name.lower() not in rule["cameras"]:
+                        continue
+                    if rule["objects"] and evt_obj not in rule["objects"]:
+                        continue
+                    matched_devices.extend(rule["devices"])
+
+                if not matched_devices:
                     continue
-                matched_devices.extend(rule["devices"])
 
-            if not matched_devices:
-                continue
+                if not is_dark_now():
+                    log.info("ignored", reason="not_dark", camera=cam_name, detected_obj=evt_obj)
+                    continue
 
-            if not is_dark_now():
-                log.info("ignored", reason="not_dark", camera=cam_name, detected_obj=evt_obj)
-                continue
-
-            trigger_lights(reason=f"{cam_name}:{evt_obj or 'event'}", trigger_device_ids=matched_devices)
+                trigger_lights(reason=f"{cam_name}:{evt_obj or 'event'}", trigger_device_ids=matched_devices)
     finally:
         await mqttc.close()
 

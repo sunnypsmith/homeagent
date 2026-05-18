@@ -346,7 +346,7 @@ async def run_time_trigger() -> None:
             units=settings.weather.units,
             timeout_seconds=settings.weather.timeout_seconds,
         )
-        sun = await client.sun_times_today()
+        sun = await client.sun_times_today(tz=settings.timezone)
         if sun.sunset is None:
             log.warning("sunset_unavailable")
             return None

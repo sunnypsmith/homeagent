@@ -25,3 +25,4 @@ esphome/
 
 # Wake word models (binary, device-specific)
 models/
+caseta-certs/
